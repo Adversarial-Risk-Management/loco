@@ -50,6 +50,9 @@ pub use server::*;
 
 use crate::{environment::Environment, scheduler, Error, Result};
 
+#[cfg(feature = "encryption")]
+use crate::encryption::config::EncryptionConfig;
+
 static DEFAULT_FOLDER: OnceLock<PathBuf> = OnceLock::new();
 
 fn get_default_folder() -> &'static PathBuf {
@@ -90,6 +93,21 @@ pub struct Config {
     pub settings: Option<serde_json::Value>,
 
     pub scheduler: Option<scheduler::Config>,
+
+    /// Encryption configuration for model field encryption
+    ///
+    /// Example:
+    /// ```yaml
+    /// encryption:
+    ///   primary_key: {{ get_env(name="LOCO_ENCRYPTION_PRIMARY_KEY") }}
+    ///   previous_keys:
+    ///     - {{ get_env(name="LOCO_ENCRYPTION_KEY_2024_01", default="") }}
+    ///   key_derivation:
+    ///     enabled: true
+    ///     salt: {{ get_env(name="LOCO_ENCRYPTION_SALT") }}
+    /// ```
+    #[cfg(feature = "encryption")]
+    pub encryption: Option<EncryptionConfig>,
 }
 
 /// Initializers configuration

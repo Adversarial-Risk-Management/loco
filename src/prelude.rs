@@ -54,5 +54,9 @@ pub use validator::Validate;
 pub mod model {
     pub use crate::model::query;
 }
+#[cfg(feature = "encryption")]
+pub use crate::encryption::{
+    ConfigKeyProvider, Encryptable, EncryptionConfig, KeyProvider, ModelDecryption,
+};
 #[cfg(feature = "testing")]
 pub use crate::testing::prelude::*;

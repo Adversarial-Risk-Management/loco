@@ -59,6 +59,8 @@ pub fn test_config() -> Config {
         // If cache_inmem is not enabled, use null cache
         #[cfg(not(feature = "cache_inmem"))]
         cache: config::CacheConfig::Null,
+        #[cfg(feature = "encryption")]
+        encryption: None,
     }
 }
 
