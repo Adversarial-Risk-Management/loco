@@ -521,6 +521,122 @@ impl Queue {
         }
     }
 
+    /// Retrieves a single job by its ID.
+    ///
+    /// # Errors
+    /// - If no queue provider is configured, it will return an error indicating
+    ///   the lack of configuration.
+    /// - Any error in the underlying provider's job retrieval logic will
+    ///   propagate from the respective function.
+    pub async fn get_job(&self, job_id: &str) -> Result<Option<serde_json::Value>> {
+        tracing::info!(job_id = job_id, "Retrieving job by ID");
+        match self {
+            #[cfg(feature = "bg_pg")]
+            Self::Postgres(pool, _, _, _) => {
+                let job = pg::get_job(pool, job_id).await.map_err(Box::from)?;
+                match job {
+                    Some(j) => Ok(Some(serde_json::to_value(j)?)),
+                    None => Ok(None),
+                }
+            }
+            #[cfg(feature = "bg_sqlt")]
+            Self::Sqlite(pool, _, _, _) => {
+                let job = sqlt::get_job(pool, job_id).await.map_err(Box::from)?;
+                match job {
+                    Some(j) => Ok(Some(serde_json::to_value(j)?)),
+                    None => Ok(None),
+                }
+            }
+            #[cfg(feature = "bg_redis")]
+            Self::Redis(pool, _, _, _) => {
+                let job = redis::get_job(pool, job_id).await?;
+                match job {
+                    Some(j) => Ok(Some(serde_json::to_value(j)?)),
+                    None => Ok(None),
+                }
+            }
+            Self::None => {
+                tracing::error!(
+                    "No queue provider is configured: compile with at least one queue provider \
+                     feature"
+                );
+                Err(Error::string("provider not configured"))
+            }
+        }
+    }
+
+    /// Retrieves jobs by worker name, optionally filtered by status.
+    ///
+    /// # Errors
+    /// - If no queue provider is configured, it will return an error indicating
+    ///   the lack of configuration.
+    /// - Any error in the underlying provider's job retrieval logic will
+    ///   propagate from the respective function.
+    pub async fn get_jobs_by_name(
+        &self,
+        worker_name: &str,
+        status: Option<&Vec<JobStatus>>,
+    ) -> Result<serde_json::Value> {
+        tracing::info!(worker_name = worker_name, status = ?status, "Retrieving jobs by worker name");
+        match self {
+            #[cfg(feature = "bg_pg")]
+            Self::Postgres(pool, _, _, _) => {
+                let jobs = pg::get_jobs_by_name(pool, worker_name, status)
+                    .await
+                    .map_err(Box::from)?;
+                Ok(serde_json::to_value(jobs)?)
+            }
+            #[cfg(feature = "bg_sqlt")]
+            Self::Sqlite(pool, _, _, _) => {
+                let jobs = sqlt::get_jobs_by_name(pool, worker_name, status)
+                    .await
+                    .map_err(Box::from)?;
+                Ok(serde_json::to_value(jobs)?)
+            }
+            #[cfg(feature = "bg_redis")]
+            Self::Redis(pool, _, _, _) => {
+                let jobs = redis::get_jobs_by_name(pool, worker_name, status).await?;
+                Ok(serde_json::to_value(jobs)?)
+            }
+            Self::None => {
+                tracing::error!(
+                    "No queue provider is configured: compile with at least one queue provider \
+                     feature"
+                );
+                Err(Error::string("provider not configured"))
+            }
+        }
+    }
+
+    /// Cancels a specific job by its ID.
+    ///
+    /// Returns `true` if the job was cancelled, `false` if the job was not found
+    /// or was not in a cancellable state (only queued jobs can be cancelled).
+    ///
+    /// # Errors
+    /// - If no queue provider is configured, it will return an error indicating
+    ///   the lack of configuration.
+    /// - Any error in the underlying provider's cancellation logic will
+    ///   propagate from the respective function.
+    pub async fn cancel_job(&self, job_id: &str) -> Result<bool> {
+        tracing::info!(job_id = job_id, "Cancelling job by ID");
+        match self {
+            #[cfg(feature = "bg_pg")]
+            Self::Postgres(pool, _, _, _) => pg::cancel_job(pool, job_id).await,
+            #[cfg(feature = "bg_sqlt")]
+            Self::Sqlite(pool, _, _, _) => sqlt::cancel_job(pool, job_id).await,
+            #[cfg(feature = "bg_redis")]
+            Self::Redis(pool, _, _, _) => redis::cancel_job(pool, job_id).await,
+            Self::None => {
+                tracing::error!(
+                    "No queue provider is configured: compile with at least one queue provider \
+                     feature"
+                );
+                Err(Error::string("provider not configured"))
+            }
+        }
+    }
+
     /// Dumps the list of jobs to a YAML file at the specified path.
     ///
     /// This function retrieves jobs from the queue, optionally filtered by
@@ -916,5 +1032,113 @@ mod tests {
             .unwrap();
 
         assert_eq!(count, 14);
+    }
+
+    #[tokio::test]
+    async fn queue_get_job_returns_job() {
+        let tree_fs = tree_fs::TreeBuilder::default()
+            .drop(true)
+            .create()
+            .expect("create temp folder");
+        let qcfg = sqlite_config(tree_fs.root.as_path());
+        let queue = sqlt::create_provider(&qcfg)
+            .await
+            .expect("create sqlite queue");
+
+        let pool = sqlx::SqlitePool::connect(&qcfg.uri)
+            .await
+            .expect("connect to sqlite db");
+
+        queue.setup().await.expect("setup sqlite db");
+        tests_cfg::queue::sqlite_seed_data(&pool).await;
+
+        // Test getting an existing job
+        let job = queue
+            .get_job("01JDM0X8EVAM823JZBGKYNBA99")
+            .await
+            .expect("get job");
+        assert!(job.is_some());
+        let job = job.unwrap();
+        assert_eq!(job["id"], "01JDM0X8EVAM823JZBGKYNBA99");
+
+        // Test getting a non-existent job
+        let job = queue.get_job("nonexistent").await.expect("get job");
+        assert!(job.is_none());
+    }
+
+    #[tokio::test]
+    async fn queue_get_jobs_by_name() {
+        let tree_fs = tree_fs::TreeBuilder::default()
+            .drop(true)
+            .create()
+            .expect("create temp folder");
+        let qcfg = sqlite_config(tree_fs.root.as_path());
+        let queue = sqlt::create_provider(&qcfg)
+            .await
+            .expect("create sqlite queue");
+
+        let pool = sqlx::SqlitePool::connect(&qcfg.uri)
+            .await
+            .expect("connect to sqlite db");
+
+        queue.setup().await.expect("setup sqlite db");
+        tests_cfg::queue::sqlite_seed_data(&pool).await;
+
+        // Test getting jobs by name (UserAccountActivation has 2 jobs in fixture)
+        let jobs = queue
+            .get_jobs_by_name("UserAccountActivation", None)
+            .await
+            .expect("get jobs by name");
+        let jobs = jobs.as_array().expect("jobs should be array");
+        assert_eq!(jobs.len(), 2);
+
+        // Test getting jobs by name with status filter
+        let jobs = queue
+            .get_jobs_by_name("UserAccountActivation", Some(&vec![JobStatus::Queued]))
+            .await
+            .expect("get jobs by name with status");
+        let jobs = jobs.as_array().expect("jobs should be array");
+        assert_eq!(jobs.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn queue_cancel_job_by_id() {
+        let tree_fs = tree_fs::TreeBuilder::default()
+            .drop(true)
+            .create()
+            .expect("create temp folder");
+        let qcfg = sqlite_config(tree_fs.root.as_path());
+        let queue = sqlt::create_provider(&qcfg)
+            .await
+            .expect("create sqlite queue");
+
+        let pool = sqlx::SqlitePool::connect(&qcfg.uri)
+            .await
+            .expect("connect to sqlite db");
+
+        queue.setup().await.expect("setup sqlite db");
+        tests_cfg::queue::sqlite_seed_data(&pool).await;
+
+        // Cancel a queued job
+        let cancelled = queue
+            .cancel_job("01JDM0X8EVAM823JZBGKYNBA99")
+            .await
+            .expect("cancel job");
+        assert!(cancelled);
+
+        // Verify job is cancelled
+        let job = queue
+            .get_job("01JDM0X8EVAM823JZBGKYNBA99")
+            .await
+            .expect("get job")
+            .unwrap();
+        assert_eq!(job["status"], "cancelled");
+
+        // Try to cancel again - should return false
+        let cancelled_again = queue
+            .cancel_job("01JDM0X8EVAM823JZBGKYNBA99")
+            .await
+            .expect("cancel job");
+        assert!(!cancelled_again);
     }
 }

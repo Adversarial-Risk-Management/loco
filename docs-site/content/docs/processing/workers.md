@@ -148,10 +148,8 @@ To use a worker, we mainly think about adding a job to the queue, so you `use` t
     .await?;
     
     // The job ID can be used for tracking job status
-    if let Some(id) = job_id {
-        println!("Job queued with ID: {}", id);
-        // You can store this ID to check job status later
-    }
+    println!("Job queued with ID: {}", job_id);
+    // You can store this ID to check job status later
 ```
 
 Unlike Rails and Ruby, with Rust you can enjoy _strongly typed_ job arguments which gets serialized and pushed into the queue.
@@ -237,7 +235,7 @@ The `BackgroundWorker` trait is the core interface for defining background worke
 - `queue() -> Option<String>`: Optional method to specify a custom queue for the worker (returns `None` by default).
 - `tags() -> Vec<String>`: Optional method to specify tags for this worker (returns an empty vector by default).
 - `class_name() -> String`: Returns the worker's class name (automatically derived from the struct name).
-- `perform_later(ctx: &AppContext, args: A) -> Result<Option<String>>`: Static method to enqueue a job to be performed later. Returns `Some(job_id)` when using background queue mode with a provider, `None` otherwise.
+- `perform_later(ctx: &AppContext, args: A) -> Result<String>`: Static method to enqueue a job to be performed later. Returns the job ID for all worker modes.
 
 ### Generate a Worker
 

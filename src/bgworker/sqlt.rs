@@ -662,6 +662,83 @@ pub async fn get_jobs(
     Ok(jobs)
 }
 
+/// Retrieves a single job by its ID from the `sqlt_loco_queue` table.
+///
+/// # Errors
+///
+/// This function will return an error if it fails
+pub async fn get_job(pool: &SqlitePool, id: &str) -> Result<Option<Job>> {
+    debug!(job_id = %id, "Retrieving job by ID");
+    let row = sqlx::query("SELECT * FROM sqlt_loco_queue WHERE id = $1")
+        .bind(id)
+        .fetch_optional(pool)
+        .await?;
+
+    match row {
+        Some(row) => Ok(to_job(&row).ok()),
+        None => Ok(None),
+    }
+}
+
+/// Retrieves jobs by worker name from the `sqlt_loco_queue` table.
+///
+/// This function queries the database for jobs with the specified worker name,
+/// optionally filtering by status.
+///
+/// # Errors
+///
+/// This function will return an error if it fails
+pub async fn get_jobs_by_name(
+    pool: &SqlitePool,
+    name: &str,
+    status: Option<&Vec<JobStatus>>,
+) -> Result<Vec<Job>> {
+    let mut query = String::from("SELECT * FROM sqlt_loco_queue WHERE name = $1");
+
+    if let Some(status_list) = status {
+        if !status_list.is_empty() {
+            let status_in = status_list
+                .iter()
+                .map(|s| format!("'{s}'"))
+                .collect::<Vec<String>>()
+                .join(",");
+            let _ = write!(query, " AND status IN ({status_in})");
+        }
+    }
+
+    debug!(job_name = %name, status = ?status, "Retrieving jobs by name");
+    let rows = sqlx::query(&query).bind(name).fetch_all(pool).await?;
+    let jobs = rows.iter().filter_map(|row| to_job(row).ok()).collect();
+    debug!(job_count = rows.len(), "Retrieved jobs from database");
+    Ok(jobs)
+}
+
+/// Cancels a specific job by its ID in the `sqlt_loco_queue` table.
+///
+/// This function updates the status of the job with the given ID from
+/// [`JobStatus::Queued`] to [`JobStatus::Cancelled`]. The update also sets
+/// the `updated_at` timestamp to the current time.
+///
+/// Returns `true` if the job was cancelled, `false` if the job was not found
+/// or was not in a cancellable state.
+///
+/// # Errors
+///
+/// This function will return an error if it fails
+pub async fn cancel_job(pool: &SqlitePool, id: &str) -> Result<bool> {
+    debug!(job_id = %id, "Cancelling job by ID");
+    let result = sqlx::query(
+        "UPDATE sqlt_loco_queue SET status = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2 AND status = $3",
+    )
+    .bind(JobStatus::Cancelled.to_string())
+    .bind(id)
+    .bind(JobStatus::Queued.to_string())
+    .execute(pool)
+    .await?;
+
+    Ok(result.rows_affected() > 0)
+}
+
 /// Converts a row from the database into a [`Job`] object.
 ///
 /// This function takes a row from the `SQLite` database and manually extracts the necessary
@@ -1513,5 +1590,111 @@ mod tests {
         // 6. No more jobs should be available for untagged worker
         let job = dequeue(&pool, &[]).await.expect("dequeue failed");
         assert!(job.is_none());
+    }
+
+    #[tokio::test]
+    async fn can_get_job_by_id() {
+        let tree_fs = tree_fs::TreeBuilder::default()
+            .drop(true)
+            .create()
+            .expect("create temp folder");
+        let pool = init(&tree_fs.root).await;
+
+        assert!(initialize_database(&pool).await.is_ok());
+        tests_cfg::queue::sqlite_seed_data(&pool).await;
+
+        // Test getting an existing job
+        let job = super::get_job(&pool, "01JDM0X8EVAM823JZBGKYNBA99")
+            .await
+            .expect("get job");
+        assert!(job.is_some());
+        let job = job.unwrap();
+        assert_eq!(job.id, "01JDM0X8EVAM823JZBGKYNBA99");
+        assert_eq!(job.name, "UserAccountActivation");
+
+        // Test getting a non-existent job
+        let job = super::get_job(&pool, "nonexistent")
+            .await
+            .expect("get job");
+        assert!(job.is_none());
+    }
+
+    #[tokio::test]
+    async fn can_get_jobs_by_name() {
+        let tree_fs = tree_fs::TreeBuilder::default()
+            .drop(true)
+            .create()
+            .expect("create temp folder");
+        let pool = init(&tree_fs.root).await;
+
+        assert!(initialize_database(&pool).await.is_ok());
+        tests_cfg::queue::sqlite_seed_data(&pool).await;
+
+        // Test getting jobs by name (UserAccountActivation has 2 jobs in fixture)
+        let jobs = get_jobs_by_name(&pool, "UserAccountActivation", None)
+            .await
+            .expect("get jobs by name");
+        assert_eq!(jobs.len(), 2);
+        for job in &jobs {
+            assert_eq!(job.name, "UserAccountActivation");
+        }
+
+        // Test getting jobs by name with status filter
+        let jobs = get_jobs_by_name(
+            &pool,
+            "UserAccountActivation",
+            Some(&vec![JobStatus::Queued]),
+        )
+        .await
+        .expect("get jobs by name with status");
+        assert_eq!(jobs.len(), 1);
+        for job in &jobs {
+            assert_eq!(job.name, "UserAccountActivation");
+            assert_eq!(job.status, JobStatus::Queued);
+        }
+
+        // Test getting jobs by non-existent name
+        let jobs = get_jobs_by_name(&pool, "NonExistentWorker", None)
+            .await
+            .expect("get jobs by name");
+        assert!(jobs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn can_cancel_job_by_id() {
+        let tree_fs = tree_fs::TreeBuilder::default()
+            .drop(true)
+            .create()
+            .expect("create temp folder");
+        let pool = init(&tree_fs.root).await;
+
+        assert!(initialize_database(&pool).await.is_ok());
+        tests_cfg::queue::sqlite_seed_data(&pool).await;
+
+        // Get a queued job
+        let job_before = get_job(&pool, "01JDM0X8EVAM823JZBGKYNBA99").await;
+        assert_eq!(job_before.status, JobStatus::Queued);
+
+        // Cancel the job
+        let cancelled = cancel_job(&pool, "01JDM0X8EVAM823JZBGKYNBA99")
+            .await
+            .expect("cancel job");
+        assert!(cancelled);
+
+        // Verify job is cancelled
+        let job_after = get_job(&pool, "01JDM0X8EVAM823JZBGKYNBA99").await;
+        assert_eq!(job_after.status, JobStatus::Cancelled);
+
+        // Try to cancel again - should return false
+        let cancelled_again = cancel_job(&pool, "01JDM0X8EVAM823JZBGKYNBA99")
+            .await
+            .expect("cancel job");
+        assert!(!cancelled_again);
+
+        // Try to cancel non-existent job
+        let cancelled_nonexistent = cancel_job(&pool, "nonexistent")
+            .await
+            .expect("cancel job");
+        assert!(!cancelled_nonexistent);
     }
 }

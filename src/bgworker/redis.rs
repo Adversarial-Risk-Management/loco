@@ -871,6 +871,124 @@ pub async fn cancel_jobs_by_name(client: &RedisPool, job_name: &str) -> Result<(
     Ok(())
 }
 
+/// Retrieves a single job by its ID from Redis.
+///
+/// # Errors
+///
+/// This function will return an error if it fails
+pub async fn get_job(client: &RedisPool, id: &str) -> Result<Option<Job>> {
+    let mut conn = get_connection(client).await?;
+    let job_key = format!("{JOB_KEY_PREFIX}{id}");
+
+    debug!(job_id = %id, "Retrieving job by ID");
+    let job_json: Option<String> = conn.get(&job_key).await?;
+
+    match job_json {
+        Some(json) => Ok(Job::from_json(&json).ok()),
+        None => Ok(None),
+    }
+}
+
+/// Retrieves jobs by worker name from Redis queues.
+///
+/// This function queries Redis for jobs with the specified worker name,
+/// optionally filtering by status.
+///
+/// # Errors
+///
+/// This function will return an error if it fails
+pub async fn get_jobs_by_name(
+    client: &RedisPool,
+    name: &str,
+    status: Option<&Vec<JobStatus>>,
+) -> Result<Vec<Job>> {
+    let mut conn = get_connection(client).await?;
+    let mut jobs = Vec::new();
+
+    // Get all job keys
+    let job_pattern = format!("{JOB_KEY_PREFIX}*");
+    let job_keys: Vec<String> = redis::cmd("KEYS")
+        .arg(&job_pattern)
+        .query_async(&mut conn)
+        .await?;
+
+    debug!(job_name = %name, status = ?status, "Retrieving jobs by name");
+
+    for job_key in job_keys {
+        let job_json: Option<String> = conn.get(&job_key).await?;
+        if let Some(json) = job_json {
+            if let Ok(job) = Job::from_json(&json) {
+                // Check if job name matches
+                if job.name == name {
+                    // Check status filter if provided
+                    let status_matches = status.map_or(true, |s| s.contains(&job.status));
+                    if status_matches {
+                        jobs.push(job);
+                    }
+                }
+            }
+        }
+    }
+
+    debug!(job_count = jobs.len(), "Retrieved jobs from Redis");
+    Ok(jobs)
+}
+
+/// Cancels a specific job by its ID in Redis.
+///
+/// This function updates the status of the job with the given ID from
+/// [`JobStatus::Queued`] to [`JobStatus::Cancelled`]. The job is also
+/// removed from its queue and added to a cancelled set.
+///
+/// Returns `true` if the job was cancelled, `false` if the job was not found
+/// or was not in a cancellable state.
+///
+/// # Errors
+///
+/// This function will return an error if it fails
+pub async fn cancel_job(client: &RedisPool, id: &str) -> Result<bool> {
+    let mut conn = get_connection(client).await?;
+    let job_key = format!("{JOB_KEY_PREFIX}{id}");
+
+    debug!(job_id = %id, "Cancelling job by ID");
+
+    // Get the job
+    let job_json: Option<String> = conn.get(&job_key).await?;
+    if let Some(json) = job_json {
+        if let Ok(mut job) = Job::from_json(&json) {
+            // Only cancel if queued
+            if job.status == JobStatus::Queued {
+                // Find and remove from queue
+                let queue_pattern = format!("{QUEUE_KEY_PREFIX}*");
+                let queue_keys: Vec<String> = redis::cmd("KEYS")
+                    .arg(&queue_pattern)
+                    .query_async(&mut conn)
+                    .await?;
+
+                for queue_key in queue_keys {
+                    let removed: i64 = conn.lrem(&queue_key, 1, id).await?;
+                    if removed > 0 {
+                        // Update job status
+                        job.status = JobStatus::Cancelled;
+                        job.updated_at = Some(Utc::now());
+                        let updated_json = job.to_json()?;
+                        let _: () = conn.set(&job_key, &updated_json).await?;
+
+                        // Add to cancelled set
+                        let cancelled_key = format!(
+                            "cancelled:{}",
+                            queue_key.trim_start_matches(QUEUE_KEY_PREFIX)
+                        );
+                        let _: () = conn.sadd(&cancelled_key, id).await?;
+                        return Ok(true);
+                    }
+                }
+            }
+        }
+    }
+    Ok(false)
+}
+
 pub const DEFAULT_QUEUES: &[&str] = &["default", "mailer"];
 
 pub fn get_queues(config_queues: &Option<Vec<String>>) -> Vec<String> {
@@ -1538,5 +1656,102 @@ mod tests {
                 assert!(created_at <= Utc::now() - chrono::Duration::days(10));
             }
         }
+    }
+
+    #[tokio::test]
+    async fn test_can_get_job_by_id() {
+        let (client, _container) = setup_redis().await;
+
+        // Enqueue a job
+        let args = serde_json::json!({"user_id": 42});
+        let job_id = enqueue(&client, "TestJob".to_string(), None, args, None)
+            .await
+            .expect("enqueue job");
+
+        // Test getting the job by ID
+        let job = get_job(&client, &job_id).await.expect("get job");
+        assert!(job.is_some());
+        let job = job.unwrap();
+        assert_eq!(job.id, job_id);
+        assert_eq!(job.name, "TestJob");
+
+        // Test getting a non-existent job
+        let job = get_job(&client, "nonexistent").await.expect("get job");
+        assert!(job.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_can_get_jobs_by_name() {
+        let (client, _container) = setup_redis().await;
+
+        // Enqueue multiple jobs with different names
+        let args = serde_json::json!({"data": "test1"});
+        enqueue(&client, "WorkerA".to_string(), None, args.clone(), None)
+            .await
+            .expect("enqueue job");
+        enqueue(&client, "WorkerA".to_string(), None, args.clone(), None)
+            .await
+            .expect("enqueue job");
+        enqueue(&client, "WorkerB".to_string(), None, args.clone(), None)
+            .await
+            .expect("enqueue job");
+
+        // Test getting jobs by name
+        let jobs = get_jobs_by_name(&client, "WorkerA", None)
+            .await
+            .expect("get jobs by name");
+        assert_eq!(jobs.len(), 2);
+        for job in &jobs {
+            assert_eq!(job.name, "WorkerA");
+        }
+
+        // Test getting jobs by name with status filter
+        let jobs = get_jobs_by_name(&client, "WorkerA", Some(&vec![JobStatus::Queued]))
+            .await
+            .expect("get jobs by name with status");
+        assert_eq!(jobs.len(), 2);
+        for job in &jobs {
+            assert_eq!(job.name, "WorkerA");
+            assert_eq!(job.status, JobStatus::Queued);
+        }
+
+        // Test getting jobs by non-existent name
+        let jobs = get_jobs_by_name(&client, "NonExistentWorker", None)
+            .await
+            .expect("get jobs by name");
+        assert!(jobs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_can_cancel_job_by_id() {
+        let (client, _container) = setup_redis().await;
+
+        // Enqueue a job
+        let args = serde_json::json!({"data": "test"});
+        let job_id = enqueue(&client, "CancelTestJob".to_string(), None, args, None)
+            .await
+            .expect("enqueue job");
+
+        // Verify job is queued
+        let job = get_job(&client, &job_id).await.expect("get job").unwrap();
+        assert_eq!(job.status, JobStatus::Queued);
+
+        // Cancel the job
+        let cancelled = cancel_job(&client, &job_id).await.expect("cancel job");
+        assert!(cancelled);
+
+        // Verify job is cancelled
+        let job = get_job(&client, &job_id).await.expect("get job").unwrap();
+        assert_eq!(job.status, JobStatus::Cancelled);
+
+        // Try to cancel again - should return false
+        let cancelled_again = cancel_job(&client, &job_id).await.expect("cancel job");
+        assert!(!cancelled_again);
+
+        // Try to cancel non-existent job
+        let cancelled_nonexistent = cancel_job(&client, "nonexistent")
+            .await
+            .expect("cancel job");
+        assert!(!cancelled_nonexistent);
     }
 }
