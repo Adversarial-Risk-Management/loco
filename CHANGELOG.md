@@ -3,6 +3,7 @@
 
 
 ##  Unreleased
+- Add job query methods: `Queue::get_job()`, `Queue::get_jobs_by_name()`, and `Queue::cancel_job()` for programmatic job management ([#1624](https://github.com/loco-rs/loco/pull/1624))
 - Fix `cargo fmt` error in `loco-new` ([#1669](https://github.com/loco-rs/loco/pull/1669))
 - Fix UUID pattern in form field generation ([#1665](https://github.com/loco-rs/loco/pull/1665))
 - Add tests for auth extractor ([#1671](https://github.com/loco-rs/loco/pull/1671))

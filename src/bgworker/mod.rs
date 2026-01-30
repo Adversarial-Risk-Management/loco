@@ -63,6 +63,17 @@ impl std::fmt::Display for JobStatus {
     }
 }
 
+/// Query options for paginated job listing
+#[derive(Debug, Clone, Default)]
+pub struct JobQueryOptions {
+    /// Filter by status(es)
+    pub status: Option<Vec<JobStatus>>,
+    /// Max results (default: 50, max: 1000)
+    pub limit: Option<i64>,
+    /// Skip N results (default: 0)
+    pub offset: Option<i64>,
+}
+
 // Queue struct now holds both a QueueProvider and QueueRegistrar
 pub enum Queue {
     #[cfg(feature = "bg_redis")]
@@ -395,6 +406,170 @@ impl Queue {
         }
     }
 
+    /// Retrieves a single job by its ID.
+    ///
+    /// # Errors
+    /// - If no queue provider is configured, it will return an error indicating the lack of configuration.
+    /// - Any error in the underlying provider's query logic will propagate from the respective function.
+    pub async fn get_job(&self, job_id: &str) -> Result<Option<serde_json::Value>> {
+        tracing::debug!(job_id = job_id, "Retrieving job by ID");
+        match self {
+            #[cfg(feature = "bg_pg")]
+            Self::Postgres(pool, _, _, _) => {
+                let job = pg::get_job(pool, job_id).await.map_err(Box::from)?;
+                match job {
+                    Some(j) => Ok(Some(serde_json::to_value(j)?)),
+                    None => Ok(None),
+                }
+            }
+            #[cfg(feature = "bg_sqlt")]
+            Self::Sqlite(pool, _, _, _) => {
+                let job = sqlt::get_job(pool, job_id).await?;
+                match job {
+                    Some(j) => Ok(Some(serde_json::to_value(j)?)),
+                    None => Ok(None),
+                }
+            }
+            #[cfg(feature = "bg_redis")]
+            Self::Redis(pool, _, _, _) => {
+                let job = redis::get_job(pool, job_id).await?;
+                match job {
+                    Some(j) => Ok(Some(serde_json::to_value(j)?)),
+                    None => Ok(None),
+                }
+            }
+            Self::None => {
+                tracing::error!(
+                    "No queue provider is configured: compile with at least one queue provider feature"
+                );
+                Err(Error::string("provider not configured"))
+            }
+        }
+    }
+
+    /// Retrieves jobs filtered by worker name with optional status filtering and pagination.
+    ///
+    /// Returns a JSON object with the following structure:
+    /// ```json
+    /// {
+    ///   "jobs": [...],
+    ///   "total": 150,
+    ///   "limit": 50,
+    ///   "offset": 0
+    /// }
+    /// ```
+    ///
+    /// # Errors
+    /// - If no queue provider is configured, it will return an error indicating the lack of configuration.
+    /// - Any error in the underlying provider's query logic will propagate from the respective function.
+    pub async fn get_jobs_by_name(
+        &self,
+        worker_name: &str,
+        opts: Option<JobQueryOptions>,
+    ) -> Result<serde_json::Value> {
+        let opts = opts.unwrap_or_default();
+        let limit = opts.limit.unwrap_or(50).min(1000);
+        let offset = opts.offset.unwrap_or(0);
+        let status_slice: Option<Vec<JobStatus>> = opts.status;
+
+        tracing::debug!(
+            worker_name = worker_name,
+            status = ?status_slice,
+            limit = limit,
+            offset = offset,
+            "Retrieving jobs by worker name"
+        );
+
+        match self {
+            #[cfg(feature = "bg_pg")]
+            Self::Postgres(pool, _, _, _) => {
+                let (jobs, total) = pg::get_jobs_by_name(
+                    pool,
+                    worker_name,
+                    status_slice.as_deref(),
+                    limit,
+                    offset,
+                )
+                .await
+                .map_err(Box::from)?;
+                Ok(serde_json::json!({
+                    "jobs": jobs,
+                    "total": total,
+                    "limit": limit,
+                    "offset": offset
+                }))
+            }
+            #[cfg(feature = "bg_sqlt")]
+            Self::Sqlite(pool, _, _, _) => {
+                let (jobs, total) = sqlt::get_jobs_by_name(
+                    pool,
+                    worker_name,
+                    status_slice.as_deref(),
+                    limit,
+                    offset,
+                )
+                .await?;
+                Ok(serde_json::json!({
+                    "jobs": jobs,
+                    "total": total,
+                    "limit": limit,
+                    "offset": offset
+                }))
+            }
+            #[cfg(feature = "bg_redis")]
+            Self::Redis(pool, _, _, _) => {
+                let (jobs, total) = redis::get_jobs_by_name(
+                    pool,
+                    worker_name,
+                    status_slice.as_deref(),
+                    limit,
+                    offset,
+                )
+                .await?;
+                Ok(serde_json::json!({
+                    "jobs": jobs,
+                    "total": total,
+                    "limit": limit,
+                    "offset": offset
+                }))
+            }
+            Self::None => {
+                tracing::error!(
+                    "No queue provider is configured: compile with at least one queue provider feature"
+                );
+                Err(Error::string("provider not configured"))
+            }
+        }
+    }
+
+    /// Cancels a specific job by its ID.
+    ///
+    /// Returns `true` if the job was cancelled, `false` if the job was not found
+    /// or was not in a cancellable state (only jobs with status `queued` can be cancelled).
+    ///
+    /// # Errors
+    /// - If no queue provider is configured, it will return an error indicating the lack of configuration.
+    /// - Any error in the underlying provider's cancellation logic will propagate from the respective function.
+    pub async fn cancel_job(&self, job_id: &str) -> Result<bool> {
+        tracing::info!(job_id = job_id, "Cancelling job by ID");
+        match self {
+            #[cfg(feature = "bg_pg")]
+            Self::Postgres(pool, _, _, _) => {
+                Ok(pg::cancel_job(pool, job_id).await.map_err(Box::from)?)
+            }
+            #[cfg(feature = "bg_sqlt")]
+            Self::Sqlite(pool, _, _, _) => sqlt::cancel_job(pool, job_id).await,
+            #[cfg(feature = "bg_redis")]
+            Self::Redis(pool, _, _, _) => redis::cancel_job(pool, job_id).await,
+            Self::None => {
+                tracing::error!(
+                    "No queue provider is configured: compile with at least one queue provider feature"
+                );
+                Err(Error::string("provider not configured"))
+            }
+        }
+    }
+
     /// Cancels jobs based on the given job name for the configured queue
     /// provider.
     ///
@@ -511,122 +686,6 @@ impl Queue {
             Self::Sqlite(pool, _, _, _) => sqlt::requeue(pool, age_minutes).await,
             #[cfg(feature = "bg_redis")]
             Self::Redis(pool, _, _, _) => redis::requeue(pool, age_minutes).await,
-            Self::None => {
-                tracing::error!(
-                    "No queue provider is configured: compile with at least one queue provider \
-                     feature"
-                );
-                Err(Error::string("provider not configured"))
-            }
-        }
-    }
-
-    /// Retrieves a single job by its ID.
-    ///
-    /// # Errors
-    /// - If no queue provider is configured, it will return an error indicating
-    ///   the lack of configuration.
-    /// - Any error in the underlying provider's job retrieval logic will
-    ///   propagate from the respective function.
-    pub async fn get_job(&self, job_id: &str) -> Result<Option<serde_json::Value>> {
-        tracing::info!(job_id = job_id, "Retrieving job by ID");
-        match self {
-            #[cfg(feature = "bg_pg")]
-            Self::Postgres(pool, _, _, _) => {
-                let job = pg::get_job(pool, job_id).await.map_err(Box::from)?;
-                match job {
-                    Some(j) => Ok(Some(serde_json::to_value(j)?)),
-                    None => Ok(None),
-                }
-            }
-            #[cfg(feature = "bg_sqlt")]
-            Self::Sqlite(pool, _, _, _) => {
-                let job = sqlt::get_job(pool, job_id).await.map_err(Box::from)?;
-                match job {
-                    Some(j) => Ok(Some(serde_json::to_value(j)?)),
-                    None => Ok(None),
-                }
-            }
-            #[cfg(feature = "bg_redis")]
-            Self::Redis(pool, _, _, _) => {
-                let job = redis::get_job(pool, job_id).await?;
-                match job {
-                    Some(j) => Ok(Some(serde_json::to_value(j)?)),
-                    None => Ok(None),
-                }
-            }
-            Self::None => {
-                tracing::error!(
-                    "No queue provider is configured: compile with at least one queue provider \
-                     feature"
-                );
-                Err(Error::string("provider not configured"))
-            }
-        }
-    }
-
-    /// Retrieves jobs by worker name, optionally filtered by status.
-    ///
-    /// # Errors
-    /// - If no queue provider is configured, it will return an error indicating
-    ///   the lack of configuration.
-    /// - Any error in the underlying provider's job retrieval logic will
-    ///   propagate from the respective function.
-    pub async fn get_jobs_by_name(
-        &self,
-        worker_name: &str,
-        status: Option<&Vec<JobStatus>>,
-    ) -> Result<serde_json::Value> {
-        tracing::info!(worker_name = worker_name, status = ?status, "Retrieving jobs by worker name");
-        match self {
-            #[cfg(feature = "bg_pg")]
-            Self::Postgres(pool, _, _, _) => {
-                let jobs = pg::get_jobs_by_name(pool, worker_name, status)
-                    .await
-                    .map_err(Box::from)?;
-                Ok(serde_json::to_value(jobs)?)
-            }
-            #[cfg(feature = "bg_sqlt")]
-            Self::Sqlite(pool, _, _, _) => {
-                let jobs = sqlt::get_jobs_by_name(pool, worker_name, status)
-                    .await
-                    .map_err(Box::from)?;
-                Ok(serde_json::to_value(jobs)?)
-            }
-            #[cfg(feature = "bg_redis")]
-            Self::Redis(pool, _, _, _) => {
-                let jobs = redis::get_jobs_by_name(pool, worker_name, status).await?;
-                Ok(serde_json::to_value(jobs)?)
-            }
-            Self::None => {
-                tracing::error!(
-                    "No queue provider is configured: compile with at least one queue provider \
-                     feature"
-                );
-                Err(Error::string("provider not configured"))
-            }
-        }
-    }
-
-    /// Cancels a specific job by its ID.
-    ///
-    /// Returns `true` if the job was cancelled, `false` if the job was not found
-    /// or was not in a cancellable state (only queued jobs can be cancelled).
-    ///
-    /// # Errors
-    /// - If no queue provider is configured, it will return an error indicating
-    ///   the lack of configuration.
-    /// - Any error in the underlying provider's cancellation logic will
-    ///   propagate from the respective function.
-    pub async fn cancel_job(&self, job_id: &str) -> Result<bool> {
-        tracing::info!(job_id = job_id, "Cancelling job by ID");
-        match self {
-            #[cfg(feature = "bg_pg")]
-            Self::Postgres(pool, _, _, _) => pg::cancel_job(pool, job_id).await,
-            #[cfg(feature = "bg_sqlt")]
-            Self::Sqlite(pool, _, _, _) => sqlt::cancel_job(pool, job_id).await,
-            #[cfg(feature = "bg_redis")]
-            Self::Redis(pool, _, _, _) => redis::cancel_job(pool, job_id).await,
             Self::None => {
                 tracing::error!(
                     "No queue provider is configured: compile with at least one queue provider \
@@ -1085,19 +1144,26 @@ mod tests {
         tests_cfg::queue::sqlite_seed_data(&pool).await;
 
         // Test getting jobs by name (UserAccountActivation has 2 jobs in fixture)
-        let jobs = queue
+        let result = queue
             .get_jobs_by_name("UserAccountActivation", None)
             .await
             .expect("get jobs by name");
-        let jobs = jobs.as_array().expect("jobs should be array");
+        let jobs = result["jobs"].as_array().expect("jobs should be array");
         assert_eq!(jobs.len(), 2);
 
         // Test getting jobs by name with status filter
-        let jobs = queue
-            .get_jobs_by_name("UserAccountActivation", Some(&vec![JobStatus::Queued]))
+        let result = queue
+            .get_jobs_by_name(
+                "UserAccountActivation",
+                Some(JobQueryOptions {
+                    status: Some(vec![JobStatus::Queued]),
+                    limit: None,
+                    offset: None,
+                }),
+            )
             .await
             .expect("get jobs by name with status");
-        let jobs = jobs.as_array().expect("jobs should be array");
+        let jobs = result["jobs"].as_array().expect("jobs should be array");
         assert_eq!(jobs.len(), 1);
     }
 

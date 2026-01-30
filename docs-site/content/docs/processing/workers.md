@@ -311,6 +311,64 @@ Options:
 
 <!-- </snip> -->
 
+### Programmatic Job Management
+
+In addition to CLI commands, Loco provides programmatic methods for managing jobs through the `Queue` struct. These methods allow you to query and manipulate jobs directly from your application code.
+
+#### Getting a Single Job by ID
+
+Retrieve a specific job by its unique identifier:
+
+```rust
+// Get a job by its ID
+let job = ctx.queue_provider.as_ref().unwrap()
+    .get_job("01JDM0X8EVAM823JZBGKYNBA99")
+    .await?;
+
+if let Some(job) = job {
+    println!("Job status: {:?}", job["status"]);
+}
+```
+
+#### Querying Jobs by Worker Name
+
+Retrieve jobs filtered by worker name with optional status filtering and pagination:
+
+```rust
+use loco_rs::bgworker::{JobQueryOptions, JobStatus};
+
+// Query jobs by worker name with pagination
+let opts = JobQueryOptions {
+    status: Some(vec![JobStatus::Queued, JobStatus::Failed]),
+    limit: Some(50),
+    offset: Some(0),
+};
+
+let result = ctx.queue_provider.as_ref().unwrap()
+    .get_jobs_by_name("DownloadWorker", Some(opts))
+    .await?;
+
+// Result contains: { "jobs": [...], "total": 150, "limit": 50, "offset": 0 }
+println!("Found {} jobs out of {} total", result["jobs"].as_array().unwrap().len(), result["total"]);
+```
+
+#### Cancelling a Specific Job
+
+Cancel a single job by its ID (only jobs with status `queued` can be cancelled):
+
+```rust
+// Cancel a specific job
+let cancelled = ctx.queue_provider.as_ref().unwrap()
+    .cancel_job("01JDM0X8EVAM823JZBGKYNBA99")
+    .await?;
+
+if cancelled {
+    println!("Job was cancelled successfully");
+} else {
+    println!("Job not found or not in cancellable state");
+}
+```
+
 ## Testing a Worker
 
 You can easily test your worker background jobs using `Loco`. Ensure that your worker is set to the `ForegroundBlocking` mode, which blocks the job, ensuring it runs synchronously. When testing the worker, the test will wait until your worker is completed, allowing you to verify if the worker accomplished its intended tasks.
