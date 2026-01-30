@@ -63,17 +63,6 @@ impl std::fmt::Display for JobStatus {
     }
 }
 
-/// Query options for paginated job listing
-#[derive(Debug, Clone, Default)]
-pub struct JobQueryOptions {
-    /// Filter by status(es)
-    pub status: Option<Vec<JobStatus>>,
-    /// Max results (default: 50, max: 1000)
-    pub limit: Option<i64>,
-    /// Skip N results (default: 0)
-    pub offset: Option<i64>,
-}
-
 // Queue struct now holds both a QueueProvider and QueueRegistrar
 pub enum Queue {
     #[cfg(feature = "bg_redis")]
@@ -369,6 +358,12 @@ impl Queue {
         Ok(())
     }
 
+    /// Retrieves jobs with optional status and age filtering.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if no queue provider is configured or if the underlying
+    /// provider's query fails.
     pub async fn get_jobs(
         &self,
         status: Option<&Vec<JobStatus>>,
@@ -447,17 +442,7 @@ impl Queue {
         }
     }
 
-    /// Retrieves jobs filtered by worker name with optional status filtering and pagination.
-    ///
-    /// Returns a JSON object with the following structure:
-    /// ```json
-    /// {
-    ///   "jobs": [...],
-    ///   "total": 150,
-    ///   "limit": 50,
-    ///   "offset": 0
-    /// }
-    /// ```
+    /// Retrieves jobs filtered by worker name with optional status and age filtering.
     ///
     /// # Errors
     /// - If no queue provider is configured, it will return an error indicating the lack of configuration.
@@ -465,73 +450,33 @@ impl Queue {
     pub async fn get_jobs_by_name(
         &self,
         worker_name: &str,
-        opts: Option<JobQueryOptions>,
+        status: Option<&Vec<JobStatus>>,
+        age_days: Option<i64>,
     ) -> Result<serde_json::Value> {
-        let opts = opts.unwrap_or_default();
-        let limit = opts.limit.unwrap_or(50).min(1000);
-        let offset = opts.offset.unwrap_or(0);
-        let status_slice: Option<Vec<JobStatus>> = opts.status;
-
-        tracing::debug!(
+        tracing::info!(
             worker_name = worker_name,
-            status = ?status_slice,
-            limit = limit,
-            offset = offset,
+            status = ?status,
+            age_days = ?age_days,
             "Retrieving jobs by worker name"
         );
 
         match self {
             #[cfg(feature = "bg_pg")]
             Self::Postgres(pool, _, _, _) => {
-                let (jobs, total) = pg::get_jobs_by_name(
-                    pool,
-                    worker_name,
-                    status_slice.as_deref(),
-                    limit,
-                    offset,
-                )
-                .await
-                .map_err(Box::from)?;
-                Ok(serde_json::json!({
-                    "jobs": jobs,
-                    "total": total,
-                    "limit": limit,
-                    "offset": offset
-                }))
+                let jobs = pg::get_jobs_by_name(pool, worker_name, status, age_days)
+                    .await
+                    .map_err(Box::from)?;
+                Ok(serde_json::to_value(jobs)?)
             }
             #[cfg(feature = "bg_sqlt")]
             Self::Sqlite(pool, _, _, _) => {
-                let (jobs, total) = sqlt::get_jobs_by_name(
-                    pool,
-                    worker_name,
-                    status_slice.as_deref(),
-                    limit,
-                    offset,
-                )
-                .await?;
-                Ok(serde_json::json!({
-                    "jobs": jobs,
-                    "total": total,
-                    "limit": limit,
-                    "offset": offset
-                }))
+                let jobs = sqlt::get_jobs_by_name(pool, worker_name, status, age_days).await?;
+                Ok(serde_json::to_value(jobs)?)
             }
             #[cfg(feature = "bg_redis")]
             Self::Redis(pool, _, _, _) => {
-                let (jobs, total) = redis::get_jobs_by_name(
-                    pool,
-                    worker_name,
-                    status_slice.as_deref(),
-                    limit,
-                    offset,
-                )
-                .await?;
-                Ok(serde_json::json!({
-                    "jobs": jobs,
-                    "total": total,
-                    "limit": limit,
-                    "offset": offset
-                }))
+                let jobs = redis::get_jobs_by_name(pool, worker_name, status, age_days).await?;
+                Ok(serde_json::to_value(jobs)?)
             }
             Self::None => {
                 tracing::error!(
@@ -1144,26 +1089,23 @@ mod tests {
         tests_cfg::queue::sqlite_seed_data(&pool).await;
 
         // Test getting jobs by name (UserAccountActivation has 2 jobs in fixture)
-        let result = queue
-            .get_jobs_by_name("UserAccountActivation", None)
+        let jobs = queue
+            .get_jobs_by_name("UserAccountActivation", None, None)
             .await
             .expect("get jobs by name");
-        let jobs = result["jobs"].as_array().expect("jobs should be array");
+        let jobs = jobs.as_array().expect("jobs should be array");
         assert_eq!(jobs.len(), 2);
 
         // Test getting jobs by name with status filter
-        let result = queue
+        let jobs = queue
             .get_jobs_by_name(
                 "UserAccountActivation",
-                Some(JobQueryOptions {
-                    status: Some(vec![JobStatus::Queued]),
-                    limit: None,
-                    offset: None,
-                }),
+                Some(&vec![JobStatus::Queued]),
+                None,
             )
             .await
             .expect("get jobs by name with status");
-        let jobs = result["jobs"].as_array().expect("jobs should be array");
+        let jobs = jobs.as_array().expect("jobs should be array");
         assert_eq!(jobs.len(), 1);
     }
 

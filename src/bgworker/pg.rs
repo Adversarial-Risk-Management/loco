@@ -544,10 +544,7 @@ pub async fn get_job(pool: &PgPool, id: &str) -> Result<Option<Job>, sqlx::Error
         .fetch_optional(pool)
         .await?;
 
-    match row {
-        Some(row) => Ok(to_job(&row).ok()),
-        None => Ok(None),
-    }
+    Ok(row.and_then(|r| to_job(&r).ok()))
 }
 
 /// Retrieves a list of jobs from the `pg_loco_queue` table in the database.
@@ -593,7 +590,7 @@ pub async fn get_jobs(
 /// Retrieves jobs from the `pg_loco_queue` table filtered by worker name.
 ///
 /// This function queries the database for jobs with a specific worker name,
-/// optionally filtering by status. Results are paginated using limit and offset.
+/// optionally filtering by status and age.
 ///
 /// # Errors
 ///
@@ -601,76 +598,32 @@ pub async fn get_jobs(
 pub async fn get_jobs_by_name(
     pool: &PgPool,
     name: &str,
-    status: Option<&[JobStatus]>,
-    limit: i64,
-    offset: i64,
-) -> Result<(Vec<Job>, i64), sqlx::Error> {
-    let (jobs, total) = if let Some(status_list) = status {
-        if status_list.is_empty() {
-            // No status filter
-            let total: i64 =
-                sqlx::query_scalar("SELECT COUNT(*) FROM pg_loco_queue WHERE name = $1")
-                    .bind(name)
-                    .fetch_one(pool)
-                    .await?;
+    status: Option<&Vec<JobStatus>>,
+    age_days: Option<i64>,
+) -> Result<Vec<Job>, sqlx::Error> {
+    let mut query = format!("SELECT * FROM pg_loco_queue WHERE name = '{name}'");
 
-            let rows = sqlx::query(
-                "SELECT * FROM pg_loco_queue WHERE name = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3",
-            )
-            .bind(name)
-            .bind(limit)
-            .bind(offset)
-            .fetch_all(pool)
-            .await?;
+    if let Some(status) = status {
+        let status_in = status
+            .iter()
+            .map(|s| format!("'{s}'"))
+            .collect::<Vec<String>>()
+            .join(",");
+        let _ = write!(query, " AND status IN ({status_in})");
+    }
 
-            let jobs = rows.iter().filter_map(|row| to_job(row).ok()).collect();
-            (jobs, total)
-        } else {
-            let status_strings: Vec<String> =
-                status_list.iter().map(std::string::ToString::to_string).collect();
+    if let Some(age_days) = age_days {
+        let _ = write!(
+            query,
+            " AND created_at <= NOW() - INTERVAL '1 day' * {age_days}"
+        );
+    }
 
-            let total: i64 = sqlx::query_scalar(
-                "SELECT COUNT(*) FROM pg_loco_queue WHERE name = $1 AND status = ANY($2)",
-            )
-            .bind(name)
-            .bind(&status_strings)
-            .fetch_one(pool)
-            .await?;
-
-            let rows = sqlx::query(
-                "SELECT * FROM pg_loco_queue WHERE name = $1 AND status = ANY($2) ORDER BY created_at DESC LIMIT $3 OFFSET $4",
-            )
-            .bind(name)
-            .bind(&status_strings)
-            .bind(limit)
-            .bind(offset)
-            .fetch_all(pool)
-            .await?;
-
-            let jobs = rows.iter().filter_map(|row| to_job(row).ok()).collect();
-            (jobs, total)
-        }
-    } else {
-        // No status filter
-        let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pg_loco_queue WHERE name = $1")
-            .bind(name)
-            .fetch_one(pool)
-            .await?;
-
-        let rows = sqlx::query(
-            "SELECT * FROM pg_loco_queue WHERE name = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3",
-        )
-        .bind(name)
-        .bind(limit)
-        .bind(offset)
-        .fetch_all(pool)
-        .await?;
-
-        let jobs = rows.iter().filter_map(|row| to_job(row).ok()).collect();
-        (jobs, total)
-    };
-
-    Ok((jobs, total))
+    debug!(name = name, status = ?status, age_days = ?age_days, "Retrieving jobs by name");
+    let rows = sqlx::query(&query).fetch_all(pool).await?;
+    let jobs = rows.iter().filter_map(|row| to_job(row).ok()).collect();
+    debug!(job_count = rows.len(), "Retrieved jobs from database");
+    Ok(jobs)
 }
 
 /// Cancels a specific job by its ID.
@@ -1477,12 +1430,10 @@ mod tests {
         tests_cfg::queue::postgres_seed_data(&pool).await;
 
         // Test getting jobs by name
-        let (jobs, total) =
-            super::get_jobs_by_name(&pool, "PasswordChangeNotification", None, 50, 0)
-                .await
-                .expect("get jobs by name should not fail");
+        let jobs = super::get_jobs_by_name(&pool, "PasswordChangeNotification", None, None)
+            .await
+            .expect("get jobs by name should not fail");
         assert!(!jobs.is_empty());
-        assert!(total > 0);
         for job in &jobs {
             assert_eq!(job.name, "PasswordChangeNotification");
         }
@@ -1494,12 +1445,11 @@ mod tests {
         tests_cfg::queue::postgres_seed_data(&pool).await;
 
         // Test getting jobs by name with status filter
-        let (jobs, _total) = super::get_jobs_by_name(
+        let jobs = super::get_jobs_by_name(
             &pool,
             "PasswordChangeNotification",
-            Some(&[JobStatus::Queued]),
-            50,
-            0,
+            Some(&vec![JobStatus::Queued]),
+            None,
         )
         .await
         .expect("get jobs by name should not fail");
@@ -1507,32 +1457,6 @@ mod tests {
         for job in &jobs {
             assert_eq!(job.name, "PasswordChangeNotification");
             assert_eq!(job.status, JobStatus::Queued);
-        }
-    }
-
-    #[tokio::test]
-    async fn can_get_jobs_by_name_pagination() {
-        let (pool, _container) = setup_pg_test().await;
-        tests_cfg::queue::postgres_seed_data(&pool).await;
-
-        // Test pagination - get first page
-        let (jobs_page1, total) =
-            super::get_jobs_by_name(&pool, "PasswordChangeNotification", None, 2, 0)
-                .await
-                .expect("get jobs by name should not fail");
-
-        // Test pagination - get second page
-        let (jobs_page2, total2) =
-            super::get_jobs_by_name(&pool, "PasswordChangeNotification", None, 2, 2)
-                .await
-                .expect("get jobs by name should not fail");
-
-        // Total should be the same for both queries
-        assert_eq!(total, total2);
-
-        // Jobs on different pages should be different (if there are enough jobs)
-        if !jobs_page1.is_empty() && !jobs_page2.is_empty() {
-            assert_ne!(jobs_page1[0].id, jobs_page2[0].id);
         }
     }
 

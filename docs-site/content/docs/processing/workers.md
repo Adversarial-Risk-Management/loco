@@ -332,24 +332,28 @@ if let Some(job) = job {
 
 #### Querying Jobs by Worker Name
 
-Retrieve jobs filtered by worker name with optional status filtering and pagination:
+Retrieve jobs filtered by worker name with optional status and age filtering:
 
 ```rust
-use loco_rs::bgworker::{JobQueryOptions, JobStatus};
+use loco_rs::bgworker::JobStatus;
 
-// Query jobs by worker name with pagination
-let opts = JobQueryOptions {
-    status: Some(vec![JobStatus::Queued, JobStatus::Failed]),
-    limit: Some(50),
-    offset: Some(0),
-};
-
-let result = ctx.queue_provider.as_ref().unwrap()
-    .get_jobs_by_name("DownloadWorker", Some(opts))
+// Query all jobs by worker name
+let jobs = ctx.queue_provider.as_ref().unwrap()
+    .get_jobs_by_name("DownloadWorker", None, None)
     .await?;
 
-// Result contains: { "jobs": [...], "total": 150, "limit": 50, "offset": 0 }
-println!("Found {} jobs out of {} total", result["jobs"].as_array().unwrap().len(), result["total"]);
+// Query jobs by worker name with status filter
+let status_filter = vec![JobStatus::Queued, JobStatus::Failed];
+let jobs = ctx.queue_provider.as_ref().unwrap()
+    .get_jobs_by_name("DownloadWorker", Some(&status_filter), None)
+    .await?;
+
+// Query jobs older than 7 days
+let jobs = ctx.queue_provider.as_ref().unwrap()
+    .get_jobs_by_name("DownloadWorker", None, Some(7))
+    .await?;
+
+println!("Found {} jobs", jobs.as_array().unwrap().len());
 ```
 
 #### Cancelling a Specific Job

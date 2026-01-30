@@ -454,16 +454,13 @@ pub async fn get_job(client: &RedisPool, id: &str) -> Result<Option<Job>> {
     let job_key = format!("{JOB_KEY_PREFIX}{id}");
     let job_json: Option<String> = conn.get(&job_key).await?;
 
-    match job_json {
-        Some(json) => Ok(Job::from_json(&json).ok()),
-        None => Ok(None),
-    }
+    Ok(job_json.and_then(|json| Job::from_json(&json).ok()))
 }
 
 /// Retrieves jobs from Redis filtered by worker name.
 ///
 /// This function queries Redis for jobs with a specific worker name,
-/// optionally filtering by status. Results are paginated using limit and offset.
+/// optionally filtering by status and age.
 /// Note: Redis filtering happens in memory after fetching all matching jobs.
 ///
 /// # Errors
@@ -472,10 +469,9 @@ pub async fn get_job(client: &RedisPool, id: &str) -> Result<Option<Job>> {
 pub async fn get_jobs_by_name(
     client: &RedisPool,
     name: &str,
-    status: Option<&[JobStatus]>,
-    limit: i64,
-    offset: i64,
-) -> Result<(Vec<Job>, i64)> {
+    status: Option<&Vec<JobStatus>>,
+    age_days: Option<i64>,
+) -> Result<Vec<Job>> {
     let mut conn = get_connection(client).await?;
 
     // Get all job keys
@@ -486,7 +482,7 @@ pub async fn get_jobs_by_name(
         .await?;
 
     // Collect all matching jobs
-    let mut matching_jobs = Vec::new();
+    let mut jobs = Vec::new();
     for job_key in job_keys {
         let job_json: Option<String> = conn.get(&job_key).await?;
         if let Some(json) = job_json {
@@ -495,36 +491,15 @@ pub async fn get_jobs_by_name(
                 if job.name != name {
                     continue;
                 }
-                // Filter by status if provided
-                if let Some(status_list) = status {
-                    if !status_list.is_empty() && !status_list.contains(&job.status) {
-                        continue;
-                    }
+                // Use the same filter logic as get_jobs
+                if should_include_job(&job, status, age_days) {
+                    jobs.push(job);
                 }
-                matching_jobs.push(job);
             }
         }
     }
 
-    // Sort by created_at descending
-    matching_jobs.sort_by(|a, b| {
-        let a_time = a.created_at.unwrap_or(chrono::DateTime::<Utc>::MIN_UTC);
-        let b_time = b.created_at.unwrap_or(chrono::DateTime::<Utc>::MIN_UTC);
-        b_time.cmp(&a_time)
-    });
-
-    let total = matching_jobs.len() as i64;
-
-    // Apply pagination
-    let offset_usize = offset as usize;
-    let limit_usize = limit as usize;
-    let paginated_jobs: Vec<Job> = matching_jobs
-        .into_iter()
-        .skip(offset_usize)
-        .take(limit_usize)
-        .collect();
-
-    Ok((paginated_jobs, total))
+    Ok(jobs)
 }
 
 /// Cancels a specific job by its ID.
@@ -1530,11 +1505,10 @@ mod tests {
         redis_seed_data(&client).await.expect("seed data");
 
         // Test getting jobs by name
-        let (jobs, total) = super::get_jobs_by_name(&client, "TestJob", None, 50, 0)
+        let jobs = super::get_jobs_by_name(&client, "TestJob", None, None)
             .await
             .expect("get jobs by name should not fail");
 
-        assert!(total >= 0);
         for job in &jobs {
             assert_eq!(job.name, "TestJob");
         }
@@ -1546,38 +1520,18 @@ mod tests {
         redis_seed_data(&client).await.expect("seed data");
 
         // Test getting jobs by name with status filter
-        let (jobs, _total) =
-            super::get_jobs_by_name(&client, "TestJob", Some(&[JobStatus::Completed]), 50, 0)
-                .await
-                .expect("get jobs by name should not fail");
+        let jobs = super::get_jobs_by_name(
+            &client,
+            "TestJob",
+            Some(&vec![JobStatus::Completed]),
+            None,
+        )
+        .await
+        .expect("get jobs by name should not fail");
 
         for job in &jobs {
             assert_eq!(job.name, "TestJob");
             assert_eq!(job.status, JobStatus::Completed);
-        }
-    }
-
-    #[tokio::test]
-    async fn test_can_get_jobs_by_name_pagination() {
-        let (client, _container) = setup_redis().await;
-        redis_seed_data(&client).await.expect("seed data");
-
-        // Test pagination - get first page
-        let (jobs_page1, total) = super::get_jobs_by_name(&client, "TestJob", None, 2, 0)
-            .await
-            .expect("get jobs by name should not fail");
-
-        // Test pagination - get second page
-        let (jobs_page2, total2) = super::get_jobs_by_name(&client, "TestJob", None, 2, 2)
-            .await
-            .expect("get jobs by name should not fail");
-
-        // Total should be the same for both queries
-        assert_eq!(total, total2);
-
-        // Jobs on different pages should be different (if there are enough jobs)
-        if jobs_page1.len() >= 2 && !jobs_page2.is_empty() {
-            assert_ne!(jobs_page1[0].id, jobs_page2[0].id);
         }
     }
 
