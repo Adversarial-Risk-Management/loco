@@ -1520,14 +1520,10 @@ mod tests {
         redis_seed_data(&client).await.expect("seed data");
 
         // Test getting jobs by name with status filter
-        let jobs = super::get_jobs_by_name(
-            &client,
-            "TestJob",
-            Some(&vec![JobStatus::Completed]),
-            None,
-        )
-        .await
-        .expect("get jobs by name should not fail");
+        let jobs =
+            super::get_jobs_by_name(&client, "TestJob", Some(&vec![JobStatus::Completed]), None)
+                .await
+                .expect("get jobs by name should not fail");
 
         for job in &jobs {
             assert_eq!(job.name, "TestJob");
@@ -1541,9 +1537,11 @@ mod tests {
 
         // Add a fresh job to test cancellation
         let args = serde_json::json!({"test": "cancel"});
-        assert!(enqueue(&client, "CancelTestJob".to_string(), None, args, None)
-            .await
-            .is_ok());
+        assert!(
+            enqueue(&client, "CancelTestJob".to_string(), None, args, None)
+                .await
+                .is_ok()
+        );
 
         // Get the queued job
         let jobs = get_jobs(&client, Some(&vec![JobStatus::Queued]), None)
