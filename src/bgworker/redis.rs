@@ -290,6 +290,40 @@ pub async fn enqueue(
     Ok(())
 }
 
+/// Enqueue multiple jobs in a single pipeline operation.
+///
+/// # Errors
+///
+/// This function will return an error if it fails
+pub async fn enqueue_batch(
+    client: &RedisPool,
+    class: String,
+    queue: Option<String>,
+    jobs: Vec<(serde_json::Value, Option<Vec<String>>)>,
+) -> Result<()> {
+    if jobs.is_empty() {
+        return Ok(());
+    }
+
+    let mut conn = get_connection(client).await?;
+    let queue_name = queue.unwrap_or_else(|| "default".to_string());
+    let queue_key = format!("{QUEUE_KEY_PREFIX}{queue_name}");
+
+    let mut pipe = redis::pipe();
+    for (args_json, tags) in jobs {
+        let job_id = Ulid::new().to_string();
+        let mut job = Job::new(job_id, class.clone(), args_json);
+        job.tags = tags;
+        let job_json = job.to_json()?;
+        let job_key = format!("{JOB_KEY_PREFIX}{}", job.id);
+        pipe.set(&job_key, &job_json).ignore();
+        pipe.rpush(&queue_key, &job.id).ignore();
+    }
+
+    pipe.query_async::<()>(&mut conn).await?;
+    Ok(())
+}
+
 const DEQUEUE_SCRIPT: &str = r#"
 local queue_key = KEYS[1]
 local processing_key = KEYS[2]

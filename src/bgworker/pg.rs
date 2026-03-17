@@ -289,6 +289,48 @@ pub async fn enqueue(
     Ok(id)
 }
 
+/// Enqueue multiple jobs in a single batch INSERT.
+///
+/// # Errors
+///
+/// This function will return an error if it fails
+pub async fn enqueue_batch(
+    pool: &PgPool,
+    jobs: Vec<(String, JobData, Option<Vec<String>>)>,
+) -> Result<Vec<JobId>> {
+    if jobs.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let now = Utc::now();
+    let mut ids = Vec::with_capacity(jobs.len());
+    let mut query_builder = sqlx::query_builder::QueryBuilder::<sqlx::Postgres>::new(
+        "INSERT INTO pg_loco_queue (id, task_data, name, run_at, interval, tags) ",
+    );
+
+    query_builder.push_values(jobs.iter(), |mut b, (name, data, tags)| {
+        let id = Ulid::new().to_string();
+        let data_json = serde_json::to_value(data).unwrap_or(serde_json::Value::Null);
+        let tags_json = tags
+            .as_ref()
+            .map(|t| serde_json::to_value(t).unwrap_or(serde_json::Value::Null));
+
+        b.push_bind(id.clone())
+            .push_bind(data_json)
+            .push_bind(name.clone())
+            .push_bind(now)
+            .push_bind(None::<i64>)
+            .push_bind(tags_json);
+
+        ids.push(id);
+    });
+
+    debug!(count = jobs.len(), "Batch enqueueing jobs");
+    query_builder.build().execute(pool).await?;
+
+    Ok(ids)
+}
+
 async fn dequeue(client: &PgPool, worker_tags: &[String]) -> Result<Option<Job>> {
     let mut tx = client.begin().await?;
 

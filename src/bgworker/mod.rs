@@ -139,6 +139,78 @@ impl Queue {
         Ok(())
     }
 
+    /// Add multiple jobs to the queue in a single batch operation.
+    ///
+    /// This reduces database round trips compared to calling `enqueue` in a
+    /// loop, which is important when the app DB and queue DB share an instance.
+    ///
+    /// # Errors
+    ///
+    /// This function will return an error if fails
+    #[allow(unused_variables)]
+    pub async fn enqueue_batch<A: Serialize + Send + Sync>(
+        &self,
+        class: String,
+        queue: Option<String>,
+        args_list: Vec<A>,
+        tags: Option<Vec<String>>,
+    ) -> Result<()> {
+        if args_list.is_empty() {
+            return Ok(());
+        }
+        tracing::debug!(
+            worker = class,
+            queue = ?queue,
+            count = args_list.len(),
+            "Batch enqueueing background jobs"
+        );
+        match self {
+            #[cfg(feature = "bg_redis")]
+            Self::Redis(pool, _, _, _) => {
+                let jobs: Vec<(serde_json::Value, Option<Vec<String>>)> = args_list
+                    .into_iter()
+                    .map(|a| {
+                        (
+                            serde_json::to_value(a).unwrap_or(serde_json::Value::Null),
+                            tags.clone(),
+                        )
+                    })
+                    .collect();
+                redis::enqueue_batch(pool, class, queue, jobs).await?;
+            }
+            #[cfg(feature = "bg_pg")]
+            Self::Postgres(pool, _, _, _) => {
+                let jobs: Vec<(String, serde_json::Value, Option<Vec<String>>)> = args_list
+                    .into_iter()
+                    .map(|a| {
+                        (
+                            class.clone(),
+                            serde_json::to_value(a).unwrap_or(serde_json::Value::Null),
+                            tags.clone(),
+                        )
+                    })
+                    .collect();
+                pg::enqueue_batch(pool, jobs).await.map_err(Box::from)?;
+            }
+            #[cfg(feature = "bg_sqlt")]
+            Self::Sqlite(pool, _, _, _) => {
+                let jobs: Vec<(String, serde_json::Value, Option<Vec<String>>)> = args_list
+                    .into_iter()
+                    .map(|a| {
+                        (
+                            class.clone(),
+                            serde_json::to_value(a).unwrap_or(serde_json::Value::Null),
+                            tags.clone(),
+                        )
+                    })
+                    .collect();
+                sqlt::enqueue_batch(pool, jobs).await.map_err(Box::from)?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
     /// Register a worker
     ///
     /// # Errors
@@ -638,6 +710,61 @@ pub trait BackgroundWorker<A: Send + Sync + serde::Serialize + 'static>: Send + 
                 tokio::spawn(async move {
                     if let Err(err) = Self::build(&dx).perform(args).await {
                         tracing::error!(err = err.to_string(), "worker failed to perform job");
+                    }
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Enqueue multiple jobs at once, reducing database round trips.
+    ///
+    /// In `ForegroundBlocking` mode, jobs are executed sequentially.
+    /// In `BackgroundAsync` mode, jobs are spawned concurrently.
+    /// In `BackgroundQueue` mode, jobs are inserted in a single batch.
+    async fn perform_all_later(ctx: &AppContext, args_list: Vec<A>) -> crate::Result<()>
+    where
+        Self: Sized,
+    {
+        if args_list.is_empty() {
+            return Ok(());
+        }
+        match &ctx.config.workers.mode {
+            WorkerMode::BackgroundQueue => {
+                if let Some(p) = &ctx.queue_provider {
+                    let tags = Self::tags();
+                    let tags_option = if tags.is_empty() { None } else { Some(tags) };
+                    p.enqueue_batch(
+                        Self::class_name(),
+                        Self::queue(),
+                        args_list,
+                        tags_option,
+                    )
+                    .await?;
+                } else {
+                    tracing::error!(
+                        "perform_all_later: background queue is selected, but queue was not \
+                         populated in context"
+                    );
+                }
+            }
+            WorkerMode::ForegroundBlocking => {
+                let worker = Self::build(ctx);
+                for args in args_list {
+                    worker.perform(args).await?;
+                }
+            }
+            WorkerMode::BackgroundAsync => {
+                let dx = ctx.clone();
+                tokio::spawn(async move {
+                    let worker = Self::build(&dx);
+                    for args in args_list {
+                        if let Err(err) = worker.perform(args).await {
+                            tracing::error!(
+                                err = err.to_string(),
+                                "worker failed to perform job"
+                            );
+                        }
                     }
                 });
             }
