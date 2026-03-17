@@ -734,13 +734,8 @@ pub trait BackgroundWorker<A: Send + Sync + serde::Serialize + 'static>: Send + 
                 if let Some(p) = &ctx.queue_provider {
                     let tags = Self::tags();
                     let tags_option = if tags.is_empty() { None } else { Some(tags) };
-                    p.enqueue_batch(
-                        Self::class_name(),
-                        Self::queue(),
-                        args_list,
-                        tags_option,
-                    )
-                    .await?;
+                    p.enqueue_batch(Self::class_name(), Self::queue(), args_list, tags_option)
+                        .await?;
                 } else {
                     tracing::error!(
                         "perform_all_later: background queue is selected, but queue was not \
@@ -755,18 +750,14 @@ pub trait BackgroundWorker<A: Send + Sync + serde::Serialize + 'static>: Send + 
                 }
             }
             WorkerMode::BackgroundAsync => {
-                let dx = ctx.clone();
-                tokio::spawn(async move {
-                    let worker = Self::build(&dx);
-                    for args in args_list {
-                        if let Err(err) = worker.perform(args).await {
-                            tracing::error!(
-                                err = err.to_string(),
-                                "worker failed to perform job"
-                            );
+                for args in args_list {
+                    let dx = ctx.clone();
+                    tokio::spawn(async move {
+                        if let Err(err) = Self::build(&dx).perform(args).await {
+                            tracing::error!(err = err.to_string(), "worker failed to perform job");
                         }
-                    }
-                });
+                    });
+                }
             }
         }
         Ok(())
