@@ -3,7 +3,7 @@
 //! sending emails with options like sender, recipient, subject, and content.
 
 use lettre::{
-    message::{header, MultiPart},
+    message::{header, Mailbox, Mailboxes, MultiPart},
     transport::smtp::{authentication::Credentials, extension::ClientId},
     AsyncTransport, Message, Tokio1Executor, Transport,
 };
@@ -102,24 +102,30 @@ impl EmailSender {
     /// message
     pub async fn mail(&self, email: &Email) -> Result<()> {
         let content = MultiPart::alternative_plain_html(email.text.clone(), email.html.clone());
-        let mut builder = Message::builder().from(
-            email
-                .from
-                .clone()
-                .unwrap_or_else(|| DEFAULT_FROM_SENDER.to_string())
-                .parse()?,
-        );
+        let parse_mailboxes = |addrs: &[String]| -> Result<Mailboxes> {
+            addrs
+                .iter()
+                .map(|a| a.parse::<Mailbox>())
+                .collect::<std::result::Result<Mailboxes, _>>()
+                .map_err(Into::into)
+        };
 
-        for recipient in &email.to {
-            builder = builder.to(recipient.parse()?);
+        let mut builder = Message::builder()
+            .from(
+                email
+                    .from
+                    .clone()
+                    .unwrap_or_else(|| DEFAULT_FROM_SENDER.to_string())
+                    .parse()?,
+            )
+            .header(header::To::from(parse_mailboxes(&email.to)?));
+
+        if !email.bcc.is_empty() {
+            builder = builder.header(header::Bcc::from(parse_mailboxes(&email.bcc)?));
         }
 
-        if let Some(bcc) = &email.bcc {
-            builder = builder.bcc(bcc.parse()?);
-        }
-
-        if let Some(cc) = &email.cc {
-            builder = builder.cc(cc.parse()?);
+        if !email.cc.is_empty() {
+            builder = builder.header(header::Cc::from(parse_mailboxes(&email.cc)?));
         }
 
         if let Some(reply_to) = &email.reply_to {
@@ -189,8 +195,8 @@ mod tests {
             subject: "Email Subject".to_string(),
             text: "Welcome".to_string(),
             html: html.to_string(),
-            bcc: None,
-            cc: None,
+            bcc: vec![],
+            cc: vec![],
             headers: None,
         };
         assert!(sender.mail(&data).await.is_ok());
@@ -221,8 +227,8 @@ mod tests {
             subject: "Multi Recipient".to_string(),
             text: "Hello all".to_string(),
             html: "<p>Hello all</p>".to_string(),
-            bcc: None,
-            cc: None,
+            bcc: vec![],
+            cc: vec![],
             headers: None,
         };
         assert!(sender.mail(&data).await.is_ok());
@@ -263,8 +269,8 @@ mod tests {
             subject: "Email Subject with Headers".to_string(),
             text: "Welcome with headers".to_string(),
             html: html.to_string(),
-            bcc: None,
-            cc: None,
+            bcc: vec![],
+            cc: vec![],
             headers: Some(headers),
         };
         assert!(sender.mail(&data).await.is_ok());
