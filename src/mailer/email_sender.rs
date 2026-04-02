@@ -102,15 +102,17 @@ impl EmailSender {
     /// message
     pub async fn mail(&self, email: &Email) -> Result<()> {
         let content = MultiPart::alternative_plain_html(email.text.clone(), email.html.clone());
-        let mut builder = Message::builder()
-            .from(
-                email
-                    .from
-                    .clone()
-                    .unwrap_or_else(|| DEFAULT_FROM_SENDER.to_string())
-                    .parse()?,
-            )
-            .to(email.to.parse()?);
+        let mut builder = Message::builder().from(
+            email
+                .from
+                .clone()
+                .unwrap_or_else(|| DEFAULT_FROM_SENDER.to_string())
+                .parse()?,
+        );
+
+        for recipient in &email.to {
+            builder = builder.to(recipient.parse()?);
+        }
 
         if let Some(bcc) = &email.bcc {
             builder = builder.bcc(bcc.parse()?);
@@ -182,7 +184,7 @@ mod tests {
 
         let data = Email {
             from: Some("test@framework.com".to_string()),
-            to: "user1@framework.com".to_string(),
+            to: vec!["user1@framework.com".to_string()],
             reply_to: None,
             subject: "Email Subject".to_string(),
             text: "Welcome".to_string(),
@@ -199,6 +201,38 @@ mod tests {
         ]}, {
             assert_debug_snapshot!(stub.messages());
         });
+    }
+
+    #[tokio::test]
+    async fn can_send_email_to_multiple_recipients() {
+        let stub = StubTransport::new_ok();
+
+        let sender = EmailSender {
+            transport: EmailTransport::Test(stub.clone()),
+        };
+
+        let data = Email {
+            from: Some("test@framework.com".to_string()),
+            to: vec![
+                "user1@framework.com".to_string(),
+                "user2@framework.com".to_string(),
+            ],
+            reply_to: None,
+            subject: "Multi Recipient".to_string(),
+            text: "Hello all".to_string(),
+            html: "<p>Hello all</p>".to_string(),
+            bcc: None,
+            cc: None,
+            headers: None,
+        };
+        assert!(sender.mail(&data).await.is_ok());
+
+        let messages = stub.messages();
+        assert_eq!(messages.len(), 1);
+        // Both recipients should appear in the To header
+        let raw = &messages[0].1;
+        assert!(raw.contains("user1@framework.com"));
+        assert!(raw.contains("user2@framework.com"));
     }
 
     #[tokio::test]
@@ -224,7 +258,7 @@ mod tests {
 
         let data = Email {
             from: Some("test@framework.com".to_string()),
-            to: "user1@framework.com".to_string(),
+            to: vec!["user1@framework.com".to_string()],
             reply_to: None,
             subject: "Email Subject with Headers".to_string(),
             text: "Welcome with headers".to_string(),

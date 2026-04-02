@@ -29,7 +29,7 @@ pub struct EmailHeaders {
 #[derive(Debug, Clone, Default)]
 pub struct Args {
     pub from: Option<String>,
-    pub to: String,
+    pub to: Vec<String>,
     pub reply_to: Option<String>,
     pub locals: serde_json::Value,
     pub bcc: Option<String>,
@@ -43,7 +43,7 @@ pub struct Email {
     /// Mailbox to `From` header
     pub from: Option<String>,
     /// Mailbox to `To` header
-    pub to: String,
+    pub to: Vec<String>,
     /// Mailbox to `ReplyTo` header
     pub reply_to: Option<String>,
     /// Subject header to message
