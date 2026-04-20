@@ -418,6 +418,12 @@ pub async fn create_context<H: Hooks>(
         shared_store: Arc::new(crate::app::SharedStore::default()),
     };
 
+    #[cfg(feature = "encryption")]
+    if let Some(enc_cfg) = ctx.config.encryption.as_ref() {
+        crate::encryption::registry::register(&ctx, enc_cfg)
+            .map_err(|e| Error::Message(format!("encryption: {e}")))?;
+    }
+
     H::after_context(ctx).await
 }
 

@@ -24,77 +24,46 @@
 //!
 //! # Quick Start
 //!
-//! 1. Add configuration to your `config/*.yaml`:
+//! 1. Add configuration to your `config/*.yaml` (generate a key with
+//!    `openssl rand -hex 32`):
 //!
 //! ```yaml
 //! encryption:
 //!   primary_key: {{ get_env(name="LOCO_ENCRYPTION_PRIMARY_KEY") }}
 //! ```
 //!
-//! 2. Generate a key with: `openssl rand -hex 32`
+//!    When present, the key provider is registered automatically during
+//!    `boot::create_context`; no user code required.
 //!
-//! 3. Implement `Encryptable` on your `ActiveModel`:
+//! 2. Declare the encryptable fields on your `ActiveModel`. The
+//!    [`impl_encryptable_fields!`](crate::impl_encryptable_fields) macro
+//!    generates the required boilerplate:
 //!
 //! ```rust,ignore
-//! use loco_rs::encryption::Encryptable;
+//! use loco_rs::impl_encryptable_fields;
 //!
-//! impl Encryptable for users::ActiveModel {
-//!     fn encrypted_fields() -> Vec<String> {
-//!         vec!["ssn".into(), "credit_card".into()]
-//!     }
+//! impl_encryptable_fields!(users::ActiveModel, [ssn, credit_card]);
+//! ```
+//!
+//! 3. Use the context-aware helpers in controllers:
+//!
+//! ```rust,ignore
+//! use loco_rs::prelude::*;
+//!
+//! // Encrypt on save:
+//! let active = users::ActiveModel { ssn: Set(ssn), ..Default::default() };
+//! let user = active.encrypt_fields_ctx(&ctx)?.insert(&ctx.db).await?;
+//!
+//! // Decrypt on read:
+//! if let Some(mut user) = users::Entity::find_by_id(id).one(&ctx.db).await? {
+//!     user.decrypt_fields_ctx::<users::Entity>(&ctx)?;
+//!     println!("{}", user.ssn); // Decrypted
 //! }
 //! ```
 //!
-//! 4. Add helper methods on your Model for encrypted save/find:
-//!
-//! ```rust,ignore
-//! impl users::Model {
-//!     pub async fn save_encrypted(
-//!         active_model: users::ActiveModel,
-//!         db: &DatabaseConnection,
-//!         ctx: &AppContext,
-//!     ) -> Result<Self> {
-//!         let provider = ConfigKeyProvider::new(
-//!             ctx.config.encryption.clone()
-//!                 .ok_or_else(|| Error::string("encryption not configured"))?
-//!         )?;
-//!         let encrypted = active_model.encrypt_fields(&provider)?;
-//!         Ok(encrypted.insert(db).await?)
-//!     }
-//!
-//!     pub async fn find_decrypt(
-//!         db: &DatabaseConnection,
-//!         id: i32,
-//!         ctx: &AppContext,
-//!     ) -> Result<Option<Self>> {
-//!         let provider = ConfigKeyProvider::new(
-//!             ctx.config.encryption.clone()
-//!                 .ok_or_else(|| Error::string("encryption not configured"))?
-//!         )?;
-//!         if let Some(mut model) = users::Entity::find_by_id(id).one(db).await? {
-//!             model.decrypt_fields::<users::Entity>(&provider)?;
-//!             Ok(Some(model))
-//!         } else {
-//!             Ok(None)
-//!         }
-//!     }
-//! }
-//! ```
-//!
-//! 5. Use in your controllers:
-//!
-//! ```rust,ignore
-//! // Creating with encryption
-//! let user = users::Model::save_encrypted(active_model, &ctx.db, &ctx).await?;
-//!
-//! // Finding with decryption
-//! let user = users::Model::find_decrypt(&ctx.db, 1, &ctx).await?
-//!     .ok_or_else(|| Error::NotFound)?;
-//! println!("{}", user.ssn); // Decrypted!
-//! ```
-//!
-//! **Note**: `SeaORM`'s `ActiveModelBehavior::before_save` hook does not have access
-//! to the `AppContext`, so encryption must be done explicitly before calling save.
+//! **Note**: `SeaORM`'s `ActiveModelBehavior::before_save` hook has no access
+//! to the `AppContext`, so encryption is invoked explicitly via
+//! `encrypt_fields_ctx` before save rather than from the hook.
 //!
 //! # Encrypted Value Format
 //!
@@ -125,6 +94,7 @@ pub mod encryptable;
 pub mod errors;
 pub mod format;
 pub mod key_provider;
+pub mod registry;
 
 // Re-export main types for convenience
 pub use cipher::{decrypt, encrypt, parse_hex_key, KEY_SIZE, NONCE_SIZE, TAG_SIZE};
@@ -136,6 +106,7 @@ pub use format::{
     EncryptionMetadata,
 };
 pub use key_provider::{ConfigKeyProvider, KeyProvider, SecureKey, StaticKeyProvider};
+pub use registry::SharedKeyProvider;
 
 /// Convenience macro to implement `Encryptable` for an `ActiveModel`
 ///

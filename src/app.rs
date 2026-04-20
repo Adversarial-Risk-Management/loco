@@ -378,6 +378,20 @@ impl AppContextBuilder {
     }
 }
 
+#[cfg(feature = "encryption")]
+impl AppContext {
+    /// Resolve the encryption key provider for this context.
+    ///
+    /// Returns the provider registered during boot via
+    /// [`crate::encryption::registry::register`], falling back to the
+    /// process-wide singleton if the per-context store is empty. Returns
+    /// `None` when no provider is registered.
+    #[must_use]
+    pub fn encryption_provider(&self) -> Option<crate::encryption::SharedKeyProvider> {
+        crate::encryption::registry::from_ctx(self)
+    }
+}
+
 /// A trait that defines hooks for customizing and extending the behavior of a
 /// web server application.
 ///

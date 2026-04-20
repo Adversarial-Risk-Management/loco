@@ -17,110 +17,39 @@
 //!
 //! # Usage
 //!
-//! 1. Implement `Encryptable` on your `ActiveModel`:
+//! 1. Declare encryptable fields. The [`impl_encryptable_fields!`] macro
+//!    generates the trait impl:
 //!
 //! ```rust,ignore
-//! use loco_rs::encryption::{Encryptable, EncryptionResult};
-//! use sea_orm::ActiveValue;
+//! use loco_rs::impl_encryptable_fields;
 //!
-//! impl Encryptable for users::ActiveModel {
-//!     fn encrypted_fields() -> Vec<String> {
-//!         vec!["ssn".into(), "credit_card".into()]
-//!     }
+//! impl_encryptable_fields!(users::ActiveModel, [ssn, credit_card]);
+//! ```
 //!
-//!     fn get_set_string_value(&self, field_name: &str) -> Option<String> {
-//!         match field_name {
-//!             "ssn" => match &self.ssn {
-//!                 ActiveValue::Set(v) => Some(v.clone()),
-//!                 _ => None,
-//!             },
-//!             "credit_card" => match &self.credit_card {
-//!                 ActiveValue::Set(v) => Some(v.clone()),
-//!                 _ => None,
-//!             },
-//!             _ => None,
-//!         }
-//!     }
+//! 2. Encrypt on save and decrypt on read using the context-aware helpers:
 //!
-//!     fn set_string_value(mut self, field_name: &str, value: String) -> Self {
-//!         match field_name {
-//!             "ssn" => self.ssn = ActiveValue::Set(value),
-//!             "credit_card" => self.credit_card = ActiveValue::Set(value),
-//!             _ => {}
-//!         }
-//!         self
-//!     }
+//! ```rust,ignore
+//! use loco_rs::prelude::*;
+//!
+//! // Save with encryption
+//! let active = users::ActiveModel { ssn: Set(ssn), ..Default::default() };
+//! let user = active.encrypt_fields_ctx(&ctx)?.insert(&ctx.db).await?;
+//!
+//! // Find and decrypt
+//! if let Some(mut user) = users::Entity::find_by_id(id).one(&ctx.db).await? {
+//!     user.decrypt_fields_ctx::<users::Entity>(&ctx)?;
+//!     println!("{}", user.ssn);
 //! }
 //! ```
 //!
-//! 2. Add helper methods on your Model for convenient encrypted save/find:
+//! The provider is registered automatically at boot when `config.encryption`
+//! is present. For custom providers (KMS, Vault, HSM), call
+//! [`crate::encryption::registry::set_global`] during your `Hooks::boot`
+//! implementation.
 //!
-//! ```rust,ignore
-//! impl users::Model {
-//!     /// Save with encryption (use this instead of calling save directly)
-//!     pub async fn save_encrypted(
-//!         active_model: users::ActiveModel,
-//!         db: &DatabaseConnection,
-//!         ctx: &AppContext,
-//!     ) -> Result<Self> {
-//!         let provider = ConfigKeyProvider::new(
-//!             ctx.config.encryption.clone()
-//!                 .ok_or_else(|| Error::string("encryption not configured"))?
-//!         )?;
-//!         let encrypted = active_model.encrypt_fields(&provider)?;
-//!         Ok(encrypted.insert(db).await?)
-//!     }
-//!
-//!     /// Find by ID and decrypt
-//!     pub async fn find_decrypt(
-//!         db: &DatabaseConnection,
-//!         id: i32,
-//!         ctx: &AppContext,
-//!     ) -> Result<Option<Self>> {
-//!         let provider = ConfigKeyProvider::new(
-//!             ctx.config.encryption.clone()
-//!                 .ok_or_else(|| Error::string("encryption not configured"))?
-//!         )?;
-//!         if let Some(mut model) = users::Entity::find_by_id(id).one(db).await? {
-//!             model.decrypt_fields::<users::Entity>(&provider)?;
-//!             Ok(Some(model))
-//!         } else {
-//!             Ok(None)
-//!         }
-//!     }
-//!
-//!     /// Decrypt fields in place
-//!     pub fn decrypt(&mut self, ctx: &AppContext) -> Result<()> {
-//!         let provider = ConfigKeyProvider::new(
-//!             ctx.config.encryption.clone()
-//!                 .ok_or_else(|| Error::string("encryption not configured"))?
-//!         )?;
-//!         self.decrypt_fields::<users::Entity>(&provider)?;
-//!         Ok(())
-//!     }
-//! }
-//! ```
-//!
-//! 3. Use the helper methods in your controllers:
-//!
-//! ```rust,ignore
-//! // Creating with encryption
-//! let user = users::Model::save_encrypted(active_model, &ctx.db, &ctx).await?;
-//!
-//! // Finding with decryption
-//! let user = users::Model::find_decrypt(&ctx.db, 1, &ctx).await?
-//!     .ok_or_else(|| Error::NotFound)?;
-//! println!("{}", user.ssn); // Decrypted!
-//!
-//! // Or manually encrypt before save
-//! let provider = ConfigKeyProvider::new(ctx.config.encryption.clone().unwrap())?;
-//! let encrypted = active_model.encrypt_fields(&provider)?;
-//! let user = encrypted.insert(&ctx.db).await?;
-//! ```
-//!
-//! **Note**: `SeaORM`'s `ActiveModelBehavior::before_save` hook does not have access
-//! to the `AppContext`, so encryption must be done explicitly before calling save
-//! rather than in the hook.
+//! **Note**: `SeaORM`'s `ActiveModelBehavior::before_save` hook has no access
+//! to the `AppContext`, so encryption is invoked explicitly via
+//! `encrypt_fields_ctx` rather than from the hook.
 
 use sea_orm::{ActiveModelTrait, EntityTrait};
 use serde::{de::DeserializeOwned, Serialize};
@@ -130,7 +59,9 @@ use super::{
     errors::{EncryptionError, EncryptionResult},
     format::is_encrypted_format,
     key_provider::KeyProvider,
+    registry,
 };
+use crate::app::AppContext;
 
 /// Trait for marking a model as having encryptable fields
 ///
@@ -155,13 +86,31 @@ pub trait Encryptable: ActiveModelTrait {
     where
         Self: Sized;
 
+    /// Encrypt all specified fields using the provider resolved from an
+    /// [`AppContext`](crate::app::AppContext).
+    ///
+    /// Looks up the provider registered at boot (see
+    /// [`crate::encryption::registry`]). Prefer this over
+    /// [`encrypt_fields`](Self::encrypt_fields) in controllers where `ctx` is
+    /// already available.
+    ///
+    /// # Errors
+    /// Returns an error if no provider is registered or encryption fails.
+    fn encrypt_fields_ctx(self, ctx: &AppContext) -> EncryptionResult<Self>
+    where
+        Self: Sized,
+    {
+        let provider = registry::require(ctx)?;
+        self.encrypt_fields(&*provider)
+    }
+
     /// Encrypt all specified fields before saving
     ///
     /// This method should be called in `ActiveModelBehavior::before_save`.
     ///
     /// # Errors
     /// Returns an error if encryption fails
-    fn encrypt_fields<P: KeyProvider>(mut self, provider: &P) -> EncryptionResult<Self>
+    fn encrypt_fields<P: KeyProvider + ?Sized>(mut self, provider: &P) -> EncryptionResult<Self>
     where
         Self: Sized,
     {
@@ -207,12 +156,32 @@ pub trait ModelDecryption: Sized + Serialize + DeserializeOwned {
     ///
     /// # Errors
     /// Returns an error if decryption fails
+    /// Decrypt all encrypted fields using the provider resolved from an
+    /// [`AppContext`](crate::app::AppContext).
+    ///
+    /// # Errors
+    /// Returns an error if no provider is registered or decryption fails.
+    fn decrypt_fields_ctx<E>(&mut self, ctx: &AppContext) -> EncryptionResult<()>
+    where
+        E: EntityTrait,
+        <E as EntityTrait>::Model: Serialize + DeserializeOwned,
+        <E as EntityTrait>::ActiveModel: Encryptable,
+    {
+        let provider = registry::require(ctx)?;
+        self.decrypt_fields::<E, _>(&*provider)
+    }
+
+    /// Decrypt all encrypted fields in-place using an explicit provider.
+    ///
+    /// # Errors
+    /// Returns an error if the model cannot round-trip through JSON or if a
+    /// field fails to decrypt under every configured key.
     fn decrypt_fields<E, P>(&mut self, provider: &P) -> EncryptionResult<()>
     where
         E: EntityTrait,
         <E as EntityTrait>::Model: Serialize + DeserializeOwned,
         <E as EntityTrait>::ActiveModel: Encryptable,
-        P: KeyProvider,
+        P: KeyProvider + ?Sized,
     {
         let encrypted_fields = <<E as EntityTrait>::ActiveModel as Encryptable>::encrypted_fields();
 
@@ -300,7 +269,7 @@ impl<M> ModelDecryption for M where M: Serialize + DeserializeOwned {}
 ///
 /// # Errors
 /// Returns an error if decryption fails
-pub fn decrypt_field<P: KeyProvider>(
+pub fn decrypt_field<P: KeyProvider + ?Sized>(
     encrypted_value: &str,
     field_name: &str,
     provider: &P,
@@ -320,7 +289,7 @@ pub fn decrypt_field<P: KeyProvider>(
 ///
 /// # Errors
 /// Returns an error if encryption fails
-pub fn encrypt_field<P: KeyProvider>(
+pub fn encrypt_field<P: KeyProvider + ?Sized>(
     plaintext: &str,
     field_name: &str,
     provider: &P,
