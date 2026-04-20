@@ -34,6 +34,15 @@ pub struct EncryptedHeaders {
     /// Optional key identifier for key rotation support
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kid: Option<String>,
+
+    /// Set to `true` when the value was encrypted deterministically.
+    ///
+    /// Deterministic ciphertexts use an HMAC-derived IV rather than a random
+    /// one, so the same plaintext always produces the same ciphertext under a
+    /// given key. The flag lets `decrypt_fields` route to the deterministic
+    /// key path on the way back.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub d: Option<bool>,
 }
 
 /// Rails-compatible encrypted value structure
@@ -62,8 +71,16 @@ impl EncryptedValue {
                 iv: BASE64.encode(iv),
                 at: BASE64.encode(auth_tag),
                 kid: key_id,
+                d: None,
             },
         }
+    }
+
+    /// Whether the envelope marks the ciphertext as deterministically
+    /// encrypted.
+    #[must_use]
+    pub fn is_deterministic(&self) -> bool {
+        self.h.d.unwrap_or(false)
     }
 
     /// Parse an encrypted value from a JSON string

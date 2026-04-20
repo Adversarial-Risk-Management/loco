@@ -37,7 +37,7 @@ default = [
 # toolchain — matching Loco's zero-friction onboarding.
 auth = ["dep:jsonwebtoken", "jsonwebtoken/rust_crypto"]
 # Model field encryption (AES-256-GCM)
-encryption = ["dep:aes-gcm", "dep:hkdf", "dep:sha2", "dep:zeroize"]
+encryption = ["dep:aes-gcm", "dep:hkdf", "dep:hmac", "dep:sha2", "dep:zeroize"]
 cli = ["dep:clap"]
 testing = ["dep:axum-test", "dep:scraper", "dep:tree-fs"]
 with-db = [
@@ -128,6 +128,7 @@ rand = { version = "0.9", features = ["std"] }
 # Encryption (optional, enabled with `encryption` feature)
 aes-gcm = { version = "0.10", optional = true }
 hkdf = { version = "0.12", optional = true }
+hmac = { version = "0.12", optional = true }
 sha2 = { version = "0.10", optional = true }
 zeroize = { version = "1.8", features = ["derive"], optional = true }
 base64 = "0.22"

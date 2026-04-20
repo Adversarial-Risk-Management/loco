@@ -97,9 +97,13 @@ pub mod key_provider;
 pub mod registry;
 
 // Re-export main types for convenience
-pub use cipher::{decrypt, encrypt, parse_hex_key, KEY_SIZE, NONCE_SIZE, TAG_SIZE};
+pub use cipher::{
+    decrypt, encrypt, encrypt_deterministic, parse_hex_key, KEY_SIZE, NONCE_SIZE, TAG_SIZE,
+};
 pub use config::{EncryptionConfig, KeyDerivationConfig};
-pub use encryptable::{decrypt_field, encrypt_field, Encryptable, ModelDecryption};
+pub use encryptable::{
+    decrypt_field, encrypt_field, encrypt_query_value, Encryptable, ModelDecryption,
+};
 pub use errors::{EncryptionError, EncryptionResult};
 pub use format::{
     debug, estimate_encrypted_size, is_encrypted_format, EncryptedHeaders, EncryptedValue,
@@ -108,55 +112,42 @@ pub use format::{
 pub use key_provider::{ConfigKeyProvider, KeyProvider, SecureKey, StaticKeyProvider};
 pub use registry::SharedKeyProvider;
 
-/// Convenience macro to implement `Encryptable` for an `ActiveModel`
+/// Convenience macro to implement [`Encryptable`](encryptable::Encryptable)
+/// for an `ActiveModel`.
 ///
-/// This macro reduces boilerplate by generating the `get_set_string_value`
-/// and `set_string_value` implementations automatically.
+/// Each field is either a bare ident (non-deterministic, random IV) or
+/// `name(deterministic)` to opt the field into deterministic encryption so
+/// it can be used in equality queries.
 ///
 /// # Example
 ///
 /// ```rust,ignore
 /// use loco_rs::impl_encryptable_fields;
 ///
-/// // Implements Encryptable for users::ActiveModel with ssn and credit_card as encrypted fields
-/// impl_encryptable_fields!(users::ActiveModel, [ssn, credit_card]);
-///
-/// // Is equivalent to:
-/// impl Encryptable for users::ActiveModel {
-///     fn encrypted_fields() -> Vec<String> {
-///         vec!["ssn".to_string(), "credit_card".to_string()]
-///     }
-///
-///     fn get_set_string_value(&self, field_name: &str) -> Option<String> {
-///         match field_name {
-///             "ssn" => match &self.ssn {
-///                 sea_orm::ActiveValue::Set(v) => Some(v.clone()),
-///                 _ => None,
-///             },
-///             "credit_card" => match &self.credit_card {
-///                 sea_orm::ActiveValue::Set(v) => Some(v.clone()),
-///                 _ => None,
-///             },
-///             _ => None,
-///         }
-///     }
-///
-///     fn set_string_value(mut self, field_name: &str, value: String) -> Self {
-///         match field_name {
-///             "ssn" => self.ssn = sea_orm::ActiveValue::Set(value),
-///             "credit_card" => self.credit_card = sea_orm::ActiveValue::Set(value),
-///             _ => {}
-///         }
-///         self
-///     }
-/// }
+/// // SSN is non-deterministic; email is deterministic so we can do
+/// // `WHERE email = encrypt_query_value::<users::Entity>("email", &input, &ctx)?`.
+/// impl_encryptable_fields!(users::ActiveModel, [ssn, email(deterministic)]);
 /// ```
+///
+/// The generated impl produces `encrypted_fields()` containing every name,
+/// and `deterministic_fields()` containing only those marked
+/// `(deterministic)`. Unknown modifiers are rejected at compile time.
 #[macro_export]
 macro_rules! impl_encryptable_fields {
-    ($model:ty, [$($field:ident),* $(,)?]) => {
+    ($model:ty, [$($field:ident $(($modifier:ident))?),* $(,)?]) => {
         impl $crate::encryption::Encryptable for $model {
             fn encrypted_fields() -> Vec<String> {
                 vec![$(stringify!($field).to_string()),*]
+            }
+
+            fn deterministic_fields() -> Vec<String> {
+                let mut out: Vec<String> = Vec::new();
+                $(
+                    $crate::__impl_encryptable_det_push!(
+                        out, $field $(, $modifier)?
+                    );
+                )*
+                out
             }
 
             fn get_set_string_value(&self, field_name: &str) -> Option<String> {
@@ -185,6 +176,28 @@ macro_rules! impl_encryptable_fields {
                 self
             }
         }
+    };
+}
+
+/// Internal helper for [`impl_encryptable_fields!`] — pushes deterministic
+/// field names into the accumulator and rejects unknown modifiers.
+#[macro_export]
+#[doc(hidden)]
+macro_rules! __impl_encryptable_det_push {
+    ($out:ident, $field:ident, deterministic) => {
+        $out.push(stringify!($field).to_string());
+    };
+    ($out:ident, $field:ident, $other:ident) => {
+        compile_error!(concat!(
+            "unknown encryption modifier `",
+            stringify!($other),
+            "` on field `",
+            stringify!($field),
+            "` (expected `deterministic`)"
+        ));
+    };
+    ($out:ident, $field:ident) => {
+        let _ = &$out; // bare field — non-deterministic, nothing to push
     };
 }
 
@@ -225,6 +238,19 @@ pub fn validate_config(config: &config::EncryptionConfig) -> EncryptionResult<()
             .map_err(|e| EncryptionError::InvalidKey(format!("key_derivation.salt: {e}")))?;
     }
 
+    // Validate deterministic key when present
+    if let Some(ref det) = config.deterministic_key
+        && !det.trim().is_empty()
+    {
+        cipher::parse_hex_key(det)
+            .map_err(|e| EncryptionError::InvalidKey(format!("deterministic_key: {e}")))?;
+        if det.trim() == config.primary_key.trim() {
+            return Err(EncryptionError::InvalidKey(
+                "deterministic_key must differ from primary_key".into(),
+            ));
+        }
+    }
+
     // Warn about empty previous_keys entries (don't fail, just log)
     for (i, key) in config.previous_keys.iter().enumerate() {
         if key.trim().is_empty() {
@@ -256,6 +282,7 @@ mod tests {
         let config = config::EncryptionConfig {
             primary_key: valid_hex_key(),
             previous_keys: vec![],
+            deterministic_key: None,
             key_derivation: None,
         };
         assert!(validate_config(&config).is_ok());
@@ -266,6 +293,7 @@ mod tests {
         let config = config::EncryptionConfig {
             primary_key: "too_short".to_string(),
             previous_keys: vec![],
+            deterministic_key: None,
             key_derivation: None,
         };
         assert!(validate_config(&config).is_err());
@@ -276,6 +304,7 @@ mod tests {
         let config = config::EncryptionConfig {
             primary_key: valid_hex_key(),
             previous_keys: vec![],
+            deterministic_key: None,
             key_derivation: Some(config::KeyDerivationConfig {
                 enabled: true,
                 salt: None,
@@ -289,6 +318,7 @@ mod tests {
         let config = config::EncryptionConfig {
             primary_key: valid_hex_key(),
             previous_keys: vec![],
+            deterministic_key: None,
             key_derivation: Some(config::KeyDerivationConfig {
                 enabled: true,
                 salt: Some("invalid".to_string()),
@@ -302,11 +332,60 @@ mod tests {
         let config = config::EncryptionConfig {
             primary_key: valid_hex_key(),
             previous_keys: vec![],
+            deterministic_key: None,
             key_derivation: Some(config::KeyDerivationConfig {
                 enabled: true,
                 salt: Some(valid_hex_key()),
             }),
         };
         assert!(validate_config(&config).is_ok());
+    }
+
+    #[test]
+    fn test_validate_config_deterministic_key_valid() {
+        let other_hex = "1f1e1d1c1b1a191817161514131211100f0e0d0c0b0a09080706050403020100";
+        let config = config::EncryptionConfig {
+            primary_key: valid_hex_key(),
+            previous_keys: vec![],
+            deterministic_key: Some(other_hex.to_string()),
+            key_derivation: None,
+        };
+        assert!(validate_config(&config).is_ok());
+    }
+
+    #[test]
+    fn test_validate_config_deterministic_key_equal_to_primary() {
+        let config = config::EncryptionConfig {
+            primary_key: valid_hex_key(),
+            previous_keys: vec![],
+            deterministic_key: Some(valid_hex_key()),
+            key_derivation: None,
+        };
+        assert!(validate_config(&config).is_err());
+    }
+
+    #[test]
+    fn test_validate_config_deterministic_key_invalid_hex() {
+        let config = config::EncryptionConfig {
+            primary_key: valid_hex_key(),
+            previous_keys: vec![],
+            deterministic_key: Some("not-a-valid-hex-key".to_string()),
+            key_derivation: None,
+        };
+        assert!(validate_config(&config).is_err());
+    }
+
+    /// Direct unit test of the macro's deterministic-marker helper. The full
+    /// `impl_encryptable_fields!` macro requires `ActiveModelTrait` to be
+    /// implemented for the target type, which is heavyweight to mock here;
+    /// the SeaORM round-trip is covered in the Phase 4 integration tests.
+    #[test]
+    fn impl_encryptable_det_push_helper_collects_marked_fields() {
+        let mut out: Vec<String> = Vec::new();
+        crate::__impl_encryptable_det_push!(out, ssn);
+        crate::__impl_encryptable_det_push!(out, email, deterministic);
+        crate::__impl_encryptable_det_push!(out, phone);
+        crate::__impl_encryptable_det_push!(out, recovery_email, deterministic);
+        assert_eq!(out, vec!["email".to_string(), "recovery_email".to_string()]);
     }
 }

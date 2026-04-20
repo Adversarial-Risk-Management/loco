@@ -7,11 +7,15 @@ use aes_gcm::{
     aead::{Aead, KeyInit, OsRng},
     AeadCore, Aes256Gcm, Nonce,
 };
+use hmac::{Hmac, Mac};
+use sha2::Sha256;
 
 use super::{
     errors::{EncryptionError, EncryptionResult},
     format::EncryptedValue,
 };
+
+type HmacSha256 = Hmac<Sha256>;
 
 /// AES-256-GCM key size in bytes
 pub const KEY_SIZE: usize = 32;
@@ -115,6 +119,59 @@ pub fn decrypt(encrypted_json: &str, key: &[u8]) -> EncryptionResult<String> {
 
     String::from_utf8(plaintext)
         .map_err(|e| EncryptionError::DecryptionFailed(format!("invalid UTF-8: {e}")))
+}
+
+/// Encrypt plaintext deterministically using AES-256-GCM with an
+/// HMAC-SHA256-derived IV.
+///
+/// Produces the same ciphertext for identical `(key, plaintext)` inputs,
+/// enabling equality queries on encrypted columns. The IV is
+/// `HMAC-SHA256(key, plaintext)[..12]`.
+///
+/// # Arguments
+/// * `plaintext` - The data to encrypt
+/// * `key` - The 32-byte encryption key (typically derived from the
+///   deterministic master)
+/// * `key_id` - Optional key identifier for key rotation support
+///
+/// # Returns
+/// The encrypted value as a JSON string with `h.d = true`.
+///
+/// # Errors
+/// Returns an error if encryption fails or the key is invalid.
+pub fn encrypt_deterministic(
+    plaintext: &str,
+    key: &[u8],
+    key_id: Option<String>,
+) -> EncryptionResult<String> {
+    validate_key(key)?;
+
+    let cipher =
+        Aes256Gcm::new_from_slice(key).map_err(|e| EncryptionError::InvalidKey(e.to_string()))?;
+
+    // Derive a stable IV from the plaintext so the same input always encrypts
+    // to the same ciphertext. Using the encryption key as the HMAC key binds
+    // the IV to this specific key — rotating the key produces a different
+    // IV even for identical plaintexts.
+    let mut mac = <HmacSha256 as Mac>::new_from_slice(key)
+        .map_err(|e| EncryptionError::EncryptionFailed(e.to_string()))?;
+    mac.update(plaintext.as_bytes());
+    let tag = mac.finalize().into_bytes();
+    // Infallible: the HMAC output (32 bytes) is longer than `NONCE_SIZE`.
+    let iv_bytes: [u8; NONCE_SIZE] = tag[..NONCE_SIZE]
+        .try_into()
+        .map_err(|_| EncryptionError::EncryptionFailed("invalid derived IV size".to_string()))?;
+    let nonce = Nonce::from(iv_bytes);
+
+    let ciphertext_with_tag = cipher
+        .encrypt(&nonce, plaintext.as_bytes())
+        .map_err(|e| EncryptionError::EncryptionFailed(e.to_string()))?;
+
+    let (ciphertext, auth_tag) = ciphertext_with_tag.split_at(ciphertext_with_tag.len() - TAG_SIZE);
+
+    let mut encrypted = EncryptedValue::new(ciphertext, &nonce, auth_tag, key_id);
+    encrypted.h.d = Some(true);
+    encrypted.to_json()
 }
 
 /// Validate that a key is the correct size for AES-256
@@ -290,5 +347,53 @@ mod tests {
 
         let tampered_json = parsed.to_json().unwrap();
         assert!(decrypt(&tampered_json, &key).is_err());
+    }
+
+    #[test]
+    fn test_encrypt_deterministic_is_stable() {
+        let key = test_key();
+        let plaintext = "alice@example.com";
+
+        let a = encrypt_deterministic(plaintext, &key, None).unwrap();
+        let b = encrypt_deterministic(plaintext, &key, None).unwrap();
+        assert_eq!(a, b, "same plaintext must produce same ciphertext");
+
+        let parsed = EncryptedValue::from_json(&a).unwrap();
+        assert!(parsed.is_deterministic(), "envelope should mark h.d=true");
+    }
+
+    #[test]
+    fn test_encrypt_deterministic_differs_per_plaintext() {
+        let key = test_key();
+        let a = encrypt_deterministic("foo@example.com", &key, None).unwrap();
+        let b = encrypt_deterministic("bar@example.com", &key, None).unwrap();
+        assert_ne!(
+            a, b,
+            "different plaintexts must produce different ciphertexts"
+        );
+    }
+
+    #[test]
+    fn test_encrypt_deterministic_roundtrips() {
+        let key = test_key();
+        let plaintext = "sensitive";
+        let encrypted = encrypt_deterministic(plaintext, &key, None).unwrap();
+        assert_eq!(decrypt(&encrypted, &key).unwrap(), plaintext);
+    }
+
+    #[test]
+    fn test_encrypt_deterministic_key_change_changes_iv() {
+        let plaintext = "same-value";
+        let mut k1 = test_key();
+        let mut k2 = test_key();
+        k2[0] ^= 0xff;
+
+        let e1 = encrypt_deterministic(plaintext, &k1, None).unwrap();
+        let e2 = encrypt_deterministic(plaintext, &k2, None).unwrap();
+        assert_ne!(e1, e2, "IV must bind to the key as well as the plaintext");
+
+        // Consume k1 so it isn't dropped as unused.
+        k1[0] ^= 0;
+        let _ = (k1, k2);
     }
 }

@@ -28,6 +28,18 @@ pub struct EncryptionConfig {
     #[serde(default)]
     pub previous_keys: Vec<String>,
 
+    /// Separate key used for fields marked `deterministic`.
+    ///
+    /// Deterministic encryption derives its IV from
+    /// `HMAC-SHA256(deterministic_key, plaintext)`, so a distinct key is used
+    /// to avoid any interaction between deterministic and non-deterministic
+    /// ciphertexts. Required when any `Encryptable` declares deterministic
+    /// fields; otherwise optional.
+    ///
+    /// Generate with: `openssl rand -hex 32`
+    #[serde(default)]
+    pub deterministic_key: Option<String>,
+
     /// Key derivation settings
     #[serde(default)]
     pub key_derivation: Option<KeyDerivationConfig>,
@@ -69,6 +81,14 @@ impl EncryptionConfig {
             .as_ref()
             .is_some_and(|kd| kd.enabled && kd.salt.is_some())
     }
+
+    /// Whether a deterministic key is configured
+    #[must_use]
+    pub fn has_deterministic_key(&self) -> bool {
+        self.deterministic_key
+            .as_ref()
+            .is_some_and(|k| !k.trim().is_empty())
+    }
 }
 
 #[cfg(test)]
@@ -80,6 +100,7 @@ mod tests {
         let config = EncryptionConfig {
             primary_key: "abc123".to_string(),
             previous_keys: vec![],
+            deterministic_key: None,
             key_derivation: None,
         };
         assert!(config.has_primary_key());
@@ -87,6 +108,7 @@ mod tests {
         let empty_config = EncryptionConfig {
             primary_key: "  ".to_string(),
             previous_keys: vec![],
+            deterministic_key: None,
             key_derivation: None,
         };
         assert!(!empty_config.has_primary_key());
@@ -102,6 +124,7 @@ mod tests {
                 "  ".to_string(), // whitespace, should be filtered
                 "key2".to_string(),
             ],
+            deterministic_key: None,
             key_derivation: None,
         };
 
@@ -114,6 +137,7 @@ mod tests {
         let config_disabled = EncryptionConfig {
             primary_key: "key".to_string(),
             previous_keys: vec![],
+            deterministic_key: None,
             key_derivation: None,
         };
         assert!(!config_disabled.is_key_derivation_enabled());
@@ -121,6 +145,7 @@ mod tests {
         let config_no_salt = EncryptionConfig {
             primary_key: "key".to_string(),
             previous_keys: vec![],
+            deterministic_key: None,
             key_derivation: Some(KeyDerivationConfig {
                 enabled: true,
                 salt: None,
@@ -131,6 +156,7 @@ mod tests {
         let config_enabled = EncryptionConfig {
             primary_key: "key".to_string(),
             previous_keys: vec![],
+            deterministic_key: None,
             key_derivation: Some(KeyDerivationConfig {
                 enabled: true,
                 salt: Some("salt".to_string()),

@@ -119,6 +119,19 @@ pub trait KeyProvider: Send + Sync {
         let key_id = self.get_key_id();
         Ok(vec![(primary, key_id)])
     }
+
+    /// Return the deterministic master key, if one is configured.
+    ///
+    /// Deterministic encryption requires a distinct master from the primary
+    /// so that `HMAC(deterministic_key, plaintext)`-derived IVs never collide
+    /// with random-IV ciphertexts. Providers that do not support
+    /// deterministic encryption should return `None` (the default).
+    ///
+    /// # Errors
+    /// Returns an error if the key is configured but unavailable.
+    fn get_deterministic_key(&self) -> EncryptionResult<Option<SecureKey>> {
+        Ok(None)
+    }
 }
 
 /// Default key provider that reads from Loco configuration
@@ -135,6 +148,7 @@ pub struct ConfigKeyProvider {
     config: EncryptionConfig,
     primary_key: SecureKey,
     previous_keys: Vec<SecureKey>,
+    deterministic_key: Option<SecureKey>,
     salt: Option<SecureKey>,
 }
 
@@ -171,10 +185,26 @@ impl ConfigKeyProvider {
             None
         };
 
+        // Parse deterministic key if configured. It must be distinct from the
+        // primary to avoid any interaction between the two cipher modes.
+        let deterministic_key = match config.deterministic_key.as_ref() {
+            Some(k) if !k.trim().is_empty() => {
+                let det = parse_hex_key(k)?;
+                if det.as_slice() == primary_key.as_bytes() {
+                    return Err(EncryptionError::InvalidKey(
+                        "deterministic_key must differ from primary_key".into(),
+                    ));
+                }
+                Some(SecureKey::new(det))
+            }
+            _ => None,
+        };
+
         Ok(Self {
             config,
             primary_key,
             previous_keys,
+            deterministic_key,
             salt,
         })
     }
@@ -217,6 +247,10 @@ impl KeyProvider for ConfigKeyProvider {
             keys.push((key.clone(), Some(format!("previous_{i}"))));
         }
         Ok(keys)
+    }
+
+    fn get_deterministic_key(&self) -> EncryptionResult<Option<SecureKey>> {
+        Ok(self.deterministic_key.clone())
     }
 }
 
@@ -280,6 +314,7 @@ mod tests {
             primary_key: "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
                 .to_string(),
             previous_keys: vec![],
+            deterministic_key: None,
             key_derivation: None,
         }
     }
@@ -300,6 +335,7 @@ mod tests {
         let config = EncryptionConfig {
             primary_key: "".to_string(),
             previous_keys: vec![],
+            deterministic_key: None,
             key_derivation: None,
         };
 
@@ -314,6 +350,7 @@ mod tests {
             previous_keys: vec![
                 "1f1e1d1c1b1a191817161514131211100f0e0d0c0b0a09080706050403020100".to_string(),
             ],
+            deterministic_key: None,
             key_derivation: None,
         };
 
@@ -331,6 +368,7 @@ mod tests {
             primary_key: "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
                 .to_string(),
             previous_keys: vec![],
+            deterministic_key: None,
             key_derivation: Some(super::super::config::KeyDerivationConfig {
                 enabled: true,
                 salt: Some(
@@ -358,6 +396,52 @@ mod tests {
     }
 
     #[test]
+    fn test_config_key_provider_deterministic_key() {
+        let config = EncryptionConfig {
+            primary_key: "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
+                .to_string(),
+            previous_keys: vec![],
+            deterministic_key: Some(
+                "1f1e1d1c1b1a191817161514131211100f0e0d0c0b0a09080706050403020100".to_string(),
+            ),
+            key_derivation: None,
+        };
+        let provider = ConfigKeyProvider::new(config).unwrap();
+
+        let det = provider
+            .get_deterministic_key()
+            .unwrap()
+            .expect("deterministic key should be present");
+        assert_eq!(det.len(), KEY_SIZE);
+        assert_ne!(
+            det.as_bytes(),
+            provider.get_encryption_key().unwrap().as_bytes()
+        );
+    }
+
+    #[test]
+    fn test_config_key_provider_rejects_det_equal_to_primary() {
+        let hex = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+        let config = EncryptionConfig {
+            primary_key: hex.to_string(),
+            previous_keys: vec![],
+            deterministic_key: Some(hex.to_string()),
+            key_derivation: None,
+        };
+        let err = ConfigKeyProvider::new(config).unwrap_err();
+        assert!(
+            matches!(err, EncryptionError::InvalidKey(_)),
+            "expected InvalidKey, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_config_key_provider_no_deterministic_key() {
+        let provider = ConfigKeyProvider::new(test_config()).unwrap();
+        assert!(provider.get_deterministic_key().unwrap().is_none());
+    }
+
+    #[test]
     fn test_derive_field_key_per_master_for_rotation() {
         // Regression for the rotation+derivation bug: derive_field_key must
         // derive from the supplied master, not always from the primary.
@@ -367,6 +451,7 @@ mod tests {
             previous_keys: vec![
                 "1f1e1d1c1b1a191817161514131211100f0e0d0c0b0a09080706050403020100".to_string(),
             ],
+            deterministic_key: None,
             key_derivation: Some(super::super::config::KeyDerivationConfig {
                 enabled: true,
                 salt: Some(

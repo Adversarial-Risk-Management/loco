@@ -111,6 +111,7 @@ mod tests {
         let cfg = EncryptionConfig {
             primary_key: valid_hex_key(),
             previous_keys: vec![],
+            deterministic_key: None,
             key_derivation: None,
         };
 
@@ -122,24 +123,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn require_errors_when_not_configured() {
+    async fn require_resolution_is_consistent_with_helpers() {
+        // The process-wide OnceLock may or may not be set depending on the
+        // order in which other tests in this binary ran. The contract under
+        // test is "if `from_ctx` returns Some, `require` returns the same
+        // pointer; otherwise `require` returns NotConfigured". That's
+        // independent of whether the global is set.
         let ctx = get_app_context().await;
-        // The global may already be set by another test; the per-ctx store is
-        // always fresh, so the error path is tested by ensuring nothing was
-        // registered in *this* ctx.
-        let err = require(&ctx);
-        // Can't assert on err unconditionally because a parallel test may have
-        // installed the global. Just make sure resolution is consistent with
-        // the helpers.
-        match err {
-            Ok(p) => {
-                assert!(global().is_some());
-                assert!(Arc::ptr_eq(&p, &global().unwrap()));
+        match (from_ctx(&ctx), require(&ctx)) {
+            (Some(p_lookup), Ok(p_required)) => {
+                assert!(
+                    Arc::ptr_eq(&p_lookup, &p_required),
+                    "from_ctx and require must agree on the provider"
+                );
             }
-            Err(EncryptionError::NotConfigured(_)) => {
-                assert!(global().is_none() && from_ctx(&ctx).is_none());
-            }
-            Err(other) => panic!("unexpected error: {other:?}"),
+            (None, Err(EncryptionError::NotConfigured(_))) => {}
+            (lookup, required) => panic!(
+                "inconsistent resolution: from_ctx={:?}, require={:?}",
+                lookup.is_some(),
+                required.is_ok()
+            ),
         }
     }
 
@@ -149,6 +152,7 @@ mod tests {
         let cfg = EncryptionConfig {
             primary_key: "not-hex".to_string(),
             previous_keys: vec![],
+            deterministic_key: None,
             key_derivation: Some(KeyDerivationConfig {
                 enabled: true,
                 salt: None,
@@ -163,6 +167,7 @@ mod tests {
         let cfg = EncryptionConfig {
             primary_key: valid_hex_key(),
             previous_keys: vec![],
+            deterministic_key: None,
             key_derivation: None,
         };
         register(&ctx, &cfg).unwrap();
