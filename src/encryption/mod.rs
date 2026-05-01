@@ -75,7 +75,8 @@
 //!   "h": {
 //!     "iv": "base64-encoded-iv",
 //!     "at": "base64-encoded-auth-tag",
-//!     "kid": "optional-key-id"
+//!     "v": 1,
+//!     "i": "optional-key-id"
 //!   }
 //! }
 //! ```

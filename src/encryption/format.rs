@@ -10,21 +10,43 @@
 //! {
 //!   "p": "base64-encoded-ciphertext",
 //!   "h": {
+//!     "v": 1,
 //!     "iv": "base64-encoded-iv",
 //!     "at": "base64-encoded-auth-tag",
-//!     "kid": "optional-key-id"
+//!     "i": "optional-key-id",
+//!     "d": true
 //!   }
 //! }
 //! ```
+//!
+//! Header keys:
+//! - `v` — envelope version (`1` is current). Missing means the legacy
+//!   pre-versioned format; reading is supported, writing always emits `v=1`.
+//! - `iv` — AES-GCM nonce (12 bytes, base64).
+//! - `at` — AES-GCM authentication tag (16 bytes, base64).
+//! - `i` — optional key identifier for rotation. Rails uses this for the
+//!   first 4 hex of `SHA1(key)`; this implementation uses semantic labels
+//!   like `"primary"` / `"previous_0"`. The names match Rails; the values
+//!   differ.
+//! - `d` — set when the ciphertext was produced by deterministic
+//!   encryption. Elided when false.
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use serde::{Deserialize, Serialize};
 
 use super::errors::{EncryptionError, EncryptionResult};
 
+/// Current envelope schema version emitted by [`EncryptedValue::new`].
+pub const CURRENT_ENVELOPE_VERSION: u8 = 1;
+
 /// Headers for encrypted value metadata
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EncryptedHeaders {
+    /// Envelope schema version. Missing on legacy pre-versioned writes;
+    /// new writes always emit `v = 1`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub v: Option<u8>,
+
     /// Base64-encoded initialization vector (nonce)
     pub iv: String,
 
@@ -32,8 +54,8 @@ pub struct EncryptedHeaders {
     pub at: String,
 
     /// Optional key identifier for key rotation support
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub kid: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none", alias = "kid")]
+    pub i: Option<String>,
 
     /// Set to `true` when the value was encrypted deterministically.
     ///
@@ -68,9 +90,10 @@ impl EncryptedValue {
         Self {
             p: BASE64.encode(ciphertext),
             h: EncryptedHeaders {
+                v: Some(CURRENT_ENVELOPE_VERSION),
                 iv: BASE64.encode(iv),
                 at: BASE64.encode(auth_tag),
-                kid: key_id,
+                i: key_id,
                 d: None,
             },
         }
@@ -86,11 +109,22 @@ impl EncryptedValue {
     /// Parse an encrypted value from a JSON string
     ///
     /// # Errors
-    /// Returns an error if the JSON is invalid or missing required fields
+    /// Returns an error if the JSON is invalid, missing required fields, or
+    /// declares an envelope version this build does not understand. Missing
+    /// `h.v` is accepted (legacy pre-versioned format).
     pub fn from_json(json: &str) -> EncryptionResult<Self> {
-        serde_json::from_str(json).map_err(|e| {
+        let value: Self = serde_json::from_str(json).map_err(|e| {
             EncryptionError::InvalidFormat(format!("failed to parse encrypted value: {e}"))
-        })
+        })?;
+        if let Some(v) = value.h.v
+            && v > CURRENT_ENVELOPE_VERSION
+        {
+            return Err(EncryptionError::InvalidFormat(format!(
+                "unsupported envelope version: {v} (this build supports up to \
+                 v{CURRENT_ENVELOPE_VERSION})"
+            )));
+        }
+        Ok(value)
     }
 
     /// Serialize to a JSON string
@@ -128,7 +162,7 @@ impl EncryptedValue {
     /// Get the key identifier if present
     #[must_use]
     pub fn key_id(&self) -> Option<&str> {
-        self.h.kid.as_deref()
+        self.h.i.as_deref()
     }
 }
 
@@ -180,8 +214,8 @@ pub mod debug {
         EncryptedValue::from_json(value)
             .ok()
             .map(|v| EncryptionMetadata {
-                has_key_id: v.h.kid.is_some(),
-                key_id: v.h.kid,
+                has_key_id: v.h.i.is_some(),
+                key_id: v.h.i,
                 payload_len: v.p.len(),
                 iv_len: v.h.iv.len(),
                 auth_tag_len: v.h.at.len(),
@@ -319,12 +353,45 @@ mod tests {
 
     #[test]
     fn test_inspect_encrypted() {
-        let json = r#"{"p":"dGVzdCBkYXRh","h":{"iv":"MTIzNDU2Nzg5MDEy","at":"MDEyMzQ1Njc4OWFiY2RlZg==","kid":"primary"}}"#;
+        let json = r#"{"p":"dGVzdCBkYXRh","h":{"v":1,"iv":"MTIzNDU2Nzg5MDEy","at":"MDEyMzQ1Njc4OWFiY2RlZg==","i":"primary"}}"#;
         let meta = inspect_encrypted(json).unwrap();
 
         assert!(meta.has_key_id);
         assert_eq!(meta.key_id, Some("primary".to_string()));
         assert_eq!(meta.payload_len, "dGVzdCBkYXRh".len());
+    }
+
+    #[test]
+    fn test_inspect_encrypted_accepts_legacy_kid_alias() {
+        // Pre-versioning envelopes used `kid` instead of `i`. The serde
+        // alias keeps them readable so existing data isn't stranded.
+        let legacy = r#"{"p":"dGVzdCBkYXRh","h":{"iv":"MTIzNDU2Nzg5MDEy","at":"MDEyMzQ1Njc4OWFiY2RlZg==","kid":"primary"}}"#;
+        let meta = inspect_encrypted(legacy).unwrap();
+        assert!(meta.has_key_id);
+        assert_eq!(meta.key_id, Some("primary".to_string()));
+    }
+
+    #[test]
+    fn test_from_json_rejects_unknown_future_version() {
+        // h.v=99 is not a version this build understands.
+        let future = r#"{"p":"dGVzdA==","h":{"v":99,"iv":"MTIzNDU2Nzg5MDEy","at":"MDEyMzQ1Njc4OWFiY2RlZg=="}}"#;
+        let err = EncryptedValue::from_json(future).unwrap_err();
+        assert!(matches!(err, EncryptionError::InvalidFormat(_)));
+    }
+
+    #[test]
+    fn test_from_json_accepts_missing_version() {
+        // Legacy pre-versioned envelopes (no h.v field) must continue to work.
+        let legacy =
+            r#"{"p":"dGVzdA==","h":{"iv":"MTIzNDU2Nzg5MDEy","at":"MDEyMzQ1Njc4OWFiY2RlZg=="}}"#;
+        let parsed = EncryptedValue::from_json(legacy).unwrap();
+        assert_eq!(parsed.h.v, None);
+    }
+
+    #[test]
+    fn test_new_envelope_carries_current_version() {
+        let v = EncryptedValue::new(b"ct", b"123456789012", b"0123456789abcdef", None);
+        assert_eq!(v.h.v, Some(CURRENT_ENVELOPE_VERSION));
     }
 
     #[test]
@@ -344,7 +411,7 @@ mod tests {
 
     #[test]
     fn test_safe_preview() {
-        let json = r#"{"p":"dGVzdCBkYXRh","h":{"iv":"MTIzNDU2Nzg5MDEy","at":"MDEyMzQ1Njc4OWFiY2RlZg==","kid":"primary"}}"#;
+        let json = r#"{"p":"dGVzdCBkYXRh","h":{"v":1,"iv":"MTIzNDU2Nzg5MDEy","at":"MDEyMzQ1Njc4OWFiY2RlZg==","i":"primary"}}"#;
         let preview = safe_preview(json);
 
         assert!(preview.contains("[ENCRYPTED:"));
