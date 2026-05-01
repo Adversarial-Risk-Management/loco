@@ -2,6 +2,10 @@
 
 
 
+##  Unreleased
+
+- Add model field encryption (`encryption` feature). AES-256-GCM via the `Encryptable` trait, with HKDF-SHA256 per-field key derivation, deterministic mode for queryable encrypted columns (`encrypt_query_value`), key rotation through `previous_keys`, automatic key-provider registration during `boot::create_context`, and context-aware helpers `encrypt_fields_ctx` / `decrypt_fields_ctx`. Generator support: `cargo loco generate model user ssn:string:encrypted email:string:encrypted:deterministic`. Envelope is Rails-compatible (`{p, h: {v, iv, at, i, d}}`) with versioning. Docs: `/docs/the-app/encryption`.
+
 ## 1.0.0 - 2026-07-25
 
 1.0.0 is the first stable Loco release — a single, intentionally-breaking
