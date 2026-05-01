@@ -9,7 +9,26 @@
 {% endif %}
 to: "migration/src/{{module_name}}.rs"
 skip_glob: "migration/src/m????????_??????_{{plural_snake}}.rs"
+{% if encrypted_fields and encrypted_fields | length > 0 -%}
+message: |
+  Migration for `{{name}}` added! Apply it with `$ cargo loco db migrate && cargo loco db entities`.
+
+  Encryption was requested for: {% for f in encrypted_fields %}`{{f.name}}`{% if f.deterministic %} (deterministic){% endif %}{% if not loop.last %}, {% endif %}{% endfor %}
+  After running `db entities`, add the macro call to your model file (e.g.
+  `src/models/{{plural_snake}}.rs`) so encryption runs at the SeaORM layer:
+
+      use loco_rs::impl_encryptable_fields;
+      impl_encryptable_fields!(super::_entities::{{plural_snake}}::ActiveModel, [
+      {%- for f in encrypted_fields %}
+          {{f.name}}{% if f.deterministic %}(deterministic){% endif %}{% if not loop.last %},{% endif -%}
+      {% endfor %}
+      ]);
+
+  Set `encryption.primary_key` (and `encryption.deterministic_key` if any
+  field is `(deterministic)`) in your `config/*.yaml`.
+{% else -%}
 message: "Migration for `{{name}}` added! You can now apply it with `$ cargo loco db migrate && cargo loco db entities`."
+{%- endif %}
 injections:
 - into: "migration/src/lib.rs"
   before: "inject-above"

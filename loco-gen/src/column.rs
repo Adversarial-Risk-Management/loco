@@ -57,6 +57,15 @@ pub enum ColumnKind {
     },
 }
 
+/// How a column's value is encrypted at the model layer (the `:encrypted`
+/// DSL qualifier). The DB column keeps its inner scalar type; only the
+/// in-row value is wrapped in the Loco encryption envelope.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EncryptionMode {
+    NonDeterministic,
+    Deterministic,
+}
+
 /// A fully-parsed column: its name, shape, and nullability/uniqueness flags.
 ///
 /// Invariant upheld by [`parse_column`]: `unique` is only ever `true`
@@ -70,6 +79,10 @@ pub struct Column {
     pub kind: ColumnKind,
     pub nullable: bool,
     pub unique: bool,
+    /// `Some` when the field carries a `:encrypted`/`:encrypted:deterministic`
+    /// qualifier. Encryption never changes the emitted DB column type —
+    /// it is a model-layer serialization concern.
+    pub encrypted: Option<EncryptionMode>,
 }
 
 /// The web form control a column should be edited with in a generated
@@ -133,13 +146,18 @@ impl Flag {
 /// * `binary_len:N` (+ `!`/`^`)        => `ScalarType::BinaryLen`
 /// * `array:inner` (+ `!`/`^`)         => `ColumnKind::Array` (inner is one
 ///   of `string`/`int`/`big_int`/`float`/`double`/`bool`)
+/// * trailing `:encrypted` or `:encrypted:deterministic` (after any base
+///   type, composable with `!`/`^`: `string:encrypted!`,
+///   `string!:encrypted`) => model-layer encryption qualifier; the DB
+///   column keeps the inner type. References cannot be encrypted.
 /// * otherwise a bare scalar base name (see `scalar_from_base_name`)
 ///
 /// # Errors
 /// Returns `Error::Message` for: unknown base names, wrong arity/unparsable
 /// parameters for `decimal_len`/`var_binary`/`binary_len`, an empty `enum`
-/// value list, an unsupported `array` inner type, or a unique/nullable
-/// combination that has no matching `ColType` (`bool^`, `tstz^`).
+/// value list, an unsupported `array` inner type, a unique/nullable
+/// combination that has no matching `ColType` (`bool^`, `tstz^`), an
+/// `:encrypted` qualifier on a reference or with no inner type.
 // A flat DSL parser: one function walks the whole `name:spec` grammar
 // (references, flags, enum/decimal/binary/array/scalar). Splitting it would
 // scatter the grammar across helpers without making any single branch clearer.
@@ -150,6 +168,12 @@ pub fn parse_column(name: &str, spec: &str) -> Result<Column> {
         || spec.starts_with("references:")
         || spec.starts_with("references?:")
     {
+        if spec.ends_with(":encrypted") || spec.ends_with(":encrypted:deterministic") {
+            return Err(Error::Message(format!(
+                "cannot encrypt a reference field: `{spec}` (encryption applies to values, not \
+                 foreign keys)"
+            )));
+        }
         let nullable = spec.starts_with("references?");
         let fk_field = spec.split_once(':').and_then(|(_, field)| {
             if field.is_empty() {
@@ -166,6 +190,7 @@ pub fn parse_column(name: &str, spec: &str) -> Result<Column> {
             },
             nullable,
             unique: false,
+            encrypted: None,
         });
     }
 
@@ -191,6 +216,27 @@ pub fn parse_column(name: &str, spec: &str) -> Result<Column> {
             nullable = false;
         }
     }
+    // Peel a trailing `:encrypted` / `:encrypted:deterministic` qualifier so
+    // it composes with any base type. The qualifier never changes the emitted
+    // DB column type — encryption is a model-layer serialization concern.
+    let encrypted = match parts.as_slice() {
+        [_, .., "encrypted", "deterministic"] => {
+            parts.truncate(parts.len() - 2);
+            Some(EncryptionMode::Deterministic)
+        }
+        [_, .., "encrypted"] => {
+            parts.truncate(parts.len() - 1);
+            Some(EncryptionMode::NonDeterministic)
+        }
+        ["encrypted"] | ["encrypted", "deterministic"] => {
+            return Err(Error::Message(format!(
+                "`:encrypted` requires an inner column type (e.g. `string:encrypted`), got \
+                 `{spec}`"
+            )));
+        }
+        _ => None,
+    };
+
     let base = parts.join(":");
     let kind = match parts.as_slice() {
         ["array", rest @ ..] => {
@@ -305,6 +351,7 @@ pub fn parse_column(name: &str, spec: &str) -> Result<Column> {
         kind,
         nullable,
         unique,
+        encrypted,
     })
 }
 
@@ -1402,6 +1449,7 @@ mod tests {
             kind: ColumnKind::Scalar(ScalarType::Unsigned),
             nullable: false,
             unique: false,
+            encrypted: None,
         };
         assert_eq!(required.col_type(), "Unsigned");
         assert_eq!(required.dto_rust_type(), "u32");
@@ -1421,6 +1469,7 @@ mod tests {
             kind: ColumnKind::Scalar(ScalarType::Unsigned),
             nullable: false,
             unique: true,
+            encrypted: None,
         };
         assert_eq!(unique.col_type(), "UnsignedUniq");
     }
@@ -1464,6 +1513,74 @@ mod tests {
     #[test]
     fn columns_from_fields_propagates_parse_errors() {
         assert!(columns_from_fields(&[field("thing", "not_a_real_type")]).is_err());
+    }
+
+    #[test]
+    fn encrypted_qualifier_composes_with_flags_and_types() {
+        // bare: nullable, non-deterministic
+        let c = col("ssn", "string:encrypted");
+        assert_eq!(c.kind, ColumnKind::Scalar(ScalarType::String));
+        assert!(c.nullable);
+        assert_eq!(c.encrypted, Some(EncryptionMode::NonDeterministic));
+        assert_eq!(c.col_type(), "StringNull");
+
+        // deterministic
+        let c = col("email", "string:encrypted:deterministic");
+        assert_eq!(c.encrypted, Some(EncryptionMode::Deterministic));
+
+        // trailing `!` after the qualifier
+        let c = col("bio", "text:encrypted!");
+        assert_eq!(c.kind, ColumnKind::Scalar(ScalarType::Text));
+        assert!(!c.nullable);
+        assert_eq!(c.encrypted, Some(EncryptionMode::NonDeterministic));
+        assert_eq!(c.col_type(), "Text");
+
+        // flag attached to the base type name
+        let c = col("token", "string!:encrypted");
+        assert!(!c.nullable);
+        assert_eq!(c.encrypted, Some(EncryptionMode::NonDeterministic));
+
+        // unique + deterministic (equality-queryable, so uniq is meaningful)
+        let c = col("api_key", "string:encrypted:deterministic^");
+        assert!(c.unique);
+        assert_eq!(c.encrypted, Some(EncryptionMode::Deterministic));
+
+        // parametrized inner type
+        let c = col("code", "enum:a,b:encrypted");
+        assert_eq!(
+            c.kind,
+            ColumnKind::Scalar(ScalarType::Enum {
+                values: vec!["a".to_string(), "b".to_string()]
+            })
+        );
+        assert_eq!(c.encrypted, Some(EncryptionMode::NonDeterministic));
+
+        // unqualified columns parse with `encrypted: None`
+        assert_eq!(col("plain", "string").encrypted, None);
+    }
+
+    #[test]
+    fn encrypted_qualifier_rejections() {
+        // references cannot be encrypted
+        let err = parse_column("user", "references:encrypted").unwrap_err();
+        assert!(
+            err.to_string().contains("cannot encrypt a reference field"),
+            "unexpected error: {err}"
+        );
+        let err = parse_column("user", "references?:encrypted:deterministic").unwrap_err();
+        assert!(err.to_string().contains("cannot encrypt a reference field"));
+
+        // the qualifier alone is not a type
+        let err = parse_column("ssn", "encrypted").unwrap_err();
+        assert!(
+            err.to_string().contains("requires an inner column type"),
+            "unexpected error: {err}"
+        );
+        let err = parse_column("ssn", "encrypted:deterministic").unwrap_err();
+        assert!(err.to_string().contains("requires an inner column type"));
+
+        // `deterministic` without `encrypted` is not a valid parameter
+        assert!(parse_column("ssn", "string:deterministic").is_err());
     }
 
     #[test]
