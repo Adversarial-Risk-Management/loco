@@ -1,0 +1,40 @@
+# Loco encryption-example development config.
+
+logger:
+  enable: true
+  pretty_backtrace: true
+  level: debug
+  format: compact
+
+server:
+  port: 5150
+  binding: localhost
+  host: "http://localhost"
+  middlewares: {}
+
+# Sqlite-on-disk; the example resets the file on each boot in
+# `Hooks::after_context` so it behaves like an in-memory DB. Using a real
+# file (rather than `:memory:`) avoids the pool-per-connection isolation
+# issue that would hide the schema from request handlers.
+database:
+  uri: "sqlite:///tmp/loco_encryption_example.sqlite?mode=rwc"
+  enable_logging: false
+  connect_timeout: 500
+  idle_timeout: 500
+  min_connections: 1
+  max_connections: 1
+  # auto_migrate runs the migration above on every boot, then
+  # dangerously_recreate wipes the data so each run starts fresh.
+  # `dangerously_recreate` drops and re-applies migrations on every boot
+  # so the example always starts with a clean schema.
+  auto_migrate: true
+  dangerously_truncate: false
+  dangerously_recreate: true
+
+# Generate keys with: openssl rand -hex 32
+encryption:
+  primary_key: {{ get_env(name="LOCO_ENCRYPTION_PRIMARY_KEY") }}
+  deterministic_key: {{ get_env(name="LOCO_ENCRYPTION_DETERMINISTIC_KEY") }}
+  key_derivation:
+    enabled: true
+    salt: {{ get_env(name="LOCO_ENCRYPTION_SALT") }}
