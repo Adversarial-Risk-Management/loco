@@ -86,6 +86,25 @@ pub trait Encryptable: ActiveModelTrait {
         Vec::new()
     }
 
+    /// Returns the Additional Authenticated Data to bind to ciphertexts of
+    /// the named field.
+    ///
+    /// AES-GCM authenticates this byte string alongside the ciphertext: the
+    /// same AAD must be supplied at decryption time, otherwise authentication
+    /// fails. Override this to defeat ciphertext-relocation attacks where a
+    /// row-level attacker copies a ciphertext from one column to another.
+    ///
+    /// A common choice is `format!("{table}:{field}").into_bytes()`. Once
+    /// non-empty AAD is in use, all reads and writes of the field must
+    /// agree, so changing the value invalidates existing ciphertexts.
+    ///
+    /// The default is empty (no AAD binding).
+    #[must_use]
+    fn field_aad(field_name: &str) -> Vec<u8> {
+        let _ = field_name;
+        Vec::new()
+    }
+
     /// Get the current value of a string field if it is Set
     ///
     /// This method must be implemented for each field that can be encrypted.
@@ -142,6 +161,7 @@ pub trait Encryptable: ActiveModelTrait {
 
             let key_id = provider.get_key_id();
             let is_deterministic = det_fields.iter().any(|f| f == field_name);
+            let aad = Self::field_aad(field_name);
 
             let encrypted = if is_deterministic {
                 let det_master = provider.get_deterministic_key()?.ok_or_else(|| {
@@ -151,10 +171,10 @@ pub trait Encryptable: ActiveModelTrait {
                     ))
                 })?;
                 let field_key = provider.derive_field_key(&det_master, field_name)?;
-                encrypt_deterministic(&plaintext, field_key.as_bytes(), key_id)?
+                encrypt_deterministic(&plaintext, field_key.as_bytes(), key_id, &aad)?
             } else {
                 let key = provider.get_field_key(field_name)?;
-                encrypt(&plaintext, key.as_bytes(), key_id)?
+                encrypt(&plaintext, key.as_bytes(), key_id, &aad)?
             };
 
             self = self.set_string_value(field_name, encrypted);
@@ -252,6 +272,8 @@ pub trait ModelDecryption: Sized + Serialize + DeserializeOwned {
             let mut decrypted = None;
             let mut last_error = None;
 
+            let aad = <<E as EntityTrait>::ActiveModel as Encryptable>::field_aad(&field_name);
+
             if is_deterministic {
                 for master in masters {
                     let field_key = match provider.derive_field_key(master, &field_name) {
@@ -261,7 +283,7 @@ pub trait ModelDecryption: Sized + Serialize + DeserializeOwned {
                             continue;
                         }
                     };
-                    match decrypt(encrypted_str, field_key.as_bytes()) {
+                    match decrypt(encrypted_str, field_key.as_bytes(), &aad) {
                         Ok(plaintext) => {
                             decrypted = Some(plaintext);
                             break;
@@ -278,7 +300,7 @@ pub trait ModelDecryption: Sized + Serialize + DeserializeOwned {
                             continue;
                         }
                     };
-                    match decrypt(encrypted_str, field_key.as_bytes()) {
+                    match decrypt(encrypted_str, field_key.as_bytes(), &aad) {
                         Ok(plaintext) => {
                             decrypted = Some(plaintext);
                             break;
@@ -332,12 +354,27 @@ pub fn decrypt_field<P: KeyProvider + ?Sized>(
     field_name: &str,
     provider: &P,
 ) -> EncryptionResult<String> {
+    decrypt_field_with_aad(encrypted_value, field_name, provider, &[])
+}
+
+/// Decrypt a single field value with explicit AAD.
+///
+/// The same AAD bytes that were passed to encryption must be supplied here.
+///
+/// # Errors
+/// Returns an error if decryption fails (including AAD mismatch).
+pub fn decrypt_field_with_aad<P: KeyProvider + ?Sized>(
+    encrypted_value: &str,
+    field_name: &str,
+    provider: &P,
+    aad: &[u8],
+) -> EncryptionResult<String> {
     if !is_encrypted_format(encrypted_value) {
         return Ok(encrypted_value.to_string());
     }
 
     let key = provider.get_field_key(field_name)?;
-    decrypt(encrypted_value, key.as_bytes())
+    decrypt(encrypted_value, key.as_bytes(), aad)
 }
 
 /// Helper function to encrypt a single field value
@@ -352,9 +389,25 @@ pub fn encrypt_field<P: KeyProvider + ?Sized>(
     field_name: &str,
     provider: &P,
 ) -> EncryptionResult<String> {
+    encrypt_field_with_aad(plaintext, field_name, provider, &[])
+}
+
+/// Encrypt a single field value with explicit AAD bound to the ciphertext.
+///
+/// The exact AAD bytes must be supplied at decryption (see
+/// [`decrypt_field_with_aad`]).
+///
+/// # Errors
+/// Returns an error if encryption fails.
+pub fn encrypt_field_with_aad<P: KeyProvider + ?Sized>(
+    plaintext: &str,
+    field_name: &str,
+    provider: &P,
+    aad: &[u8],
+) -> EncryptionResult<String> {
     let key = provider.get_field_key(field_name)?;
     let key_id = provider.get_key_id();
-    encrypt(plaintext, key.as_bytes(), key_id)
+    encrypt(plaintext, key.as_bytes(), key_id, aad)
 }
 
 /// Produce the deterministic ciphertext used for equality queries.
@@ -404,7 +457,8 @@ where
         )
     })?;
     let field_key = provider.derive_field_key(&det_master, field_name)?;
-    encrypt_deterministic(plaintext, field_key.as_bytes(), provider.get_key_id())
+    let aad = <<E as EntityTrait>::ActiveModel as Encryptable>::field_aad(field_name);
+    encrypt_deterministic(plaintext, field_key.as_bytes(), provider.get_key_id(), &aad)
 }
 
 #[cfg(test)]
@@ -431,6 +485,28 @@ mod tests {
 
         let decrypted = decrypt_field(&encrypted, field_name, &provider).unwrap();
         assert_eq!(decrypted, plaintext);
+    }
+
+    #[test]
+    fn test_encrypt_field_with_aad_round_trip() {
+        let provider = test_provider();
+        let plaintext = "secret";
+        let aad = b"users:ssn";
+
+        let encrypted = encrypt_field_with_aad(plaintext, "ssn", &provider, aad).unwrap();
+        assert!(is_encrypted_format(&encrypted));
+
+        // Same AAD: decrypts.
+        assert_eq!(
+            decrypt_field_with_aad(&encrypted, "ssn", &provider, aad).unwrap(),
+            plaintext
+        );
+
+        // Different AAD: authentication fails.
+        assert!(
+            decrypt_field_with_aad(&encrypted, "ssn", &provider, b"users:other").is_err(),
+            "AAD mismatch must fail decryption"
+        );
     }
 
     #[test]
@@ -475,17 +551,19 @@ mod tests {
         let field_key_1 = p1.derive_field_key(&det_master_1, "email").unwrap();
         let field_key_2 = p2.derive_field_key(&det_master_2, "email").unwrap();
 
-        let ct_a = cipher::encrypt_deterministic("alice@example.com", field_key_1.as_bytes(), None)
-            .unwrap();
-        let ct_b = cipher::encrypt_deterministic("alice@example.com", field_key_2.as_bytes(), None)
-            .unwrap();
+        let ct_a =
+            cipher::encrypt_deterministic("alice@example.com", field_key_1.as_bytes(), None, b"")
+                .unwrap();
+        let ct_b =
+            cipher::encrypt_deterministic("alice@example.com", field_key_2.as_bytes(), None, b"")
+                .unwrap();
         assert_eq!(
             ct_a, ct_b,
             "cross-process deterministic ciphertext must match"
         );
 
         // Decrypts cleanly with the field key.
-        let pt = cipher::decrypt(&ct_a, field_key_1.as_bytes()).unwrap();
+        let pt = cipher::decrypt(&ct_a, field_key_1.as_bytes(), b"").unwrap();
         assert_eq!(pt, "alice@example.com");
 
         // Different field name → different key → different ciphertext for the
@@ -493,9 +571,13 @@ mod tests {
         let other_field_key = p1
             .derive_field_key(&det_master_1, "recovery_email")
             .unwrap();
-        let ct_other =
-            cipher::encrypt_deterministic("alice@example.com", other_field_key.as_bytes(), None)
-                .unwrap();
+        let ct_other = cipher::encrypt_deterministic(
+            "alice@example.com",
+            other_field_key.as_bytes(),
+            None,
+            b"",
+        )
+        .unwrap();
         assert_ne!(
             ct_a, ct_other,
             "same plaintext in different fields must not collide"
@@ -556,7 +638,9 @@ mod tests {
         let mut decrypted = None;
         for (master, _kid) in &masters {
             let field_key = new_provider.derive_field_key(master, "ssn").unwrap();
-            if let Ok(pt) = crate::encryption::cipher::decrypt(&ciphertext, field_key.as_bytes()) {
+            if let Ok(pt) =
+                crate::encryption::cipher::decrypt(&ciphertext, field_key.as_bytes(), b"")
+            {
                 decrypted = Some(pt);
                 break;
             }

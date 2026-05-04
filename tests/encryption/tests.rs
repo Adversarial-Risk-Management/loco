@@ -238,6 +238,7 @@ async fn deterministic_envelope_carries_d_flag() {
         "alice@example.com",
         field_key.as_bytes(),
         provider.get_key_id(),
+        b"",
     )
     .unwrap();
     let stored = raw_email.clone();

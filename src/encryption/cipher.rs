@@ -32,13 +32,22 @@ pub const TAG_SIZE: usize = 16;
 /// * `plaintext` - The data to encrypt
 /// * `key` - The 32-byte encryption key
 /// * `key_id` - Optional key identifier for key rotation support
+/// * `aad` - Additional Authenticated Data bound to the ciphertext. Pass `&[]`
+///   for no binding (the default at the model layer). When non-empty, the
+///   same AAD must be supplied to [`decrypt`] or authentication will fail —
+///   this is what defeats ciphertext-relocation attacks.
 ///
 /// # Returns
 /// The encrypted value as a JSON string in Rails-compatible format
 ///
 /// # Errors
 /// Returns an error if encryption fails or key is invalid
-pub fn encrypt(plaintext: &str, key: &[u8], key_id: Option<String>) -> EncryptionResult<String> {
+pub fn encrypt(
+    plaintext: &str,
+    key: &[u8],
+    key_id: Option<String>,
+    aad: &[u8],
+) -> EncryptionResult<String> {
     validate_key(key)?;
 
     let cipher =
@@ -48,16 +57,17 @@ pub fn encrypt(plaintext: &str, key: &[u8], key_id: Option<String>) -> Encryptio
     // encryptions per key (NIST SP 800-38D); rotate keys before that bound.
     let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
 
-    // Encrypt the plaintext
+    let payload = aes_gcm::aead::Payload {
+        msg: plaintext.as_bytes(),
+        aad,
+    };
     let ciphertext_with_tag = cipher
-        .encrypt(&nonce, plaintext.as_bytes())
+        .encrypt(&nonce, payload)
         .map_err(|e| EncryptionError::EncryptionFailed(e.to_string()))?;
 
-    // Split ciphertext and auth tag
-    // AES-GCM appends the tag at the end
+    // Split ciphertext and auth tag (AES-GCM appends the tag at the end)
     let (ciphertext, auth_tag) = ciphertext_with_tag.split_at(ciphertext_with_tag.len() - TAG_SIZE);
 
-    // Create Rails-compatible encrypted value
     let encrypted = EncryptedValue::new(ciphertext, &nonce, auth_tag, key_id);
     encrypted.to_json()
 }
@@ -67,13 +77,16 @@ pub fn encrypt(plaintext: &str, key: &[u8], key_id: Option<String>) -> Encryptio
 /// # Arguments
 /// * `encrypted_json` - The encrypted value as a JSON string
 /// * `key` - The 32-byte encryption key
+/// * `aad` - Additional Authenticated Data that must match the value used at
+///   encryption time. Pass `&[]` if no AAD was bound.
 ///
 /// # Returns
 /// The decrypted plaintext
 ///
 /// # Errors
-/// Returns an error if decryption fails, format is invalid, or key is wrong
-pub fn decrypt(encrypted_json: &str, key: &[u8]) -> EncryptionResult<String> {
+/// Returns an error if decryption fails, format is invalid, key is wrong, or
+/// the supplied AAD does not match what was bound at encryption.
+pub fn decrypt(encrypted_json: &str, key: &[u8], aad: &[u8]) -> EncryptionResult<String> {
     validate_key(key)?;
 
     let encrypted = EncryptedValue::from_json(encrypted_json)?;
@@ -112,9 +125,12 @@ pub fn decrypt(encrypted_json: &str, key: &[u8]) -> EncryptionResult<String> {
     let mut ciphertext_with_tag = ciphertext;
     ciphertext_with_tag.extend_from_slice(&auth_tag);
 
-    // Decrypt
+    let payload = aes_gcm::aead::Payload {
+        msg: ciphertext_with_tag.as_ref(),
+        aad,
+    };
     let plaintext = cipher
-        .decrypt(&nonce, ciphertext_with_tag.as_ref())
+        .decrypt(&nonce, payload)
         .map_err(|e| EncryptionError::DecryptionFailed(e.to_string()))?;
 
     String::from_utf8(plaintext)
@@ -143,18 +159,21 @@ pub fn encrypt_deterministic(
     plaintext: &str,
     key: &[u8],
     key_id: Option<String>,
+    aad: &[u8],
 ) -> EncryptionResult<String> {
     validate_key(key)?;
 
     let cipher =
         Aes256Gcm::new_from_slice(key).map_err(|e| EncryptionError::InvalidKey(e.to_string()))?;
 
-    // Derive a stable IV from the plaintext so the same input always encrypts
-    // to the same ciphertext. Using the encryption key as the HMAC key binds
-    // the IV to this specific key — rotating the key produces a different
-    // IV even for identical plaintexts.
+    // Derive a stable IV from the plaintext (and any AAD, so AAD-bound
+    // ciphertexts produce different IVs from non-bound ones for the same
+    // plaintext). Using the encryption key as the HMAC key binds the IV to
+    // this specific key — rotating the key produces a different IV even for
+    // identical plaintexts.
     let mut mac = <HmacSha256 as Mac>::new_from_slice(key)
         .map_err(|e| EncryptionError::EncryptionFailed(e.to_string()))?;
+    mac.update(aad);
     mac.update(plaintext.as_bytes());
     let tag = mac.finalize().into_bytes();
     // Infallible: the HMAC output (32 bytes) is longer than `NONCE_SIZE`.
@@ -163,8 +182,12 @@ pub fn encrypt_deterministic(
         .map_err(|_| EncryptionError::EncryptionFailed("invalid derived IV size".to_string()))?;
     let nonce = Nonce::from(iv_bytes);
 
+    let payload = aes_gcm::aead::Payload {
+        msg: plaintext.as_bytes(),
+        aad,
+    };
     let ciphertext_with_tag = cipher
-        .encrypt(&nonce, plaintext.as_bytes())
+        .encrypt(&nonce, payload)
         .map_err(|e| EncryptionError::EncryptionFailed(e.to_string()))?;
 
     let (ciphertext, auth_tag) = ciphertext_with_tag.split_at(ciphertext_with_tag.len() - TAG_SIZE);
@@ -230,8 +253,8 @@ mod tests {
         let key = test_key();
         let plaintext = "Hello, World!";
 
-        let encrypted = encrypt(plaintext, &key, None).unwrap();
-        let decrypted = decrypt(&encrypted, &key).unwrap();
+        let encrypted = encrypt(plaintext, &key, None, b"").unwrap();
+        let decrypted = decrypt(&encrypted, &key, b"").unwrap();
 
         assert_eq!(decrypted, plaintext);
     }
@@ -241,15 +264,15 @@ mod tests {
         let key = test_key();
         let plaintext = "Same input";
 
-        let encrypted1 = encrypt(plaintext, &key, None).unwrap();
-        let encrypted2 = encrypt(plaintext, &key, None).unwrap();
+        let encrypted1 = encrypt(plaintext, &key, None, b"").unwrap();
+        let encrypted2 = encrypt(plaintext, &key, None, b"").unwrap();
 
         // Different nonces should produce different ciphertexts
         assert_ne!(encrypted1, encrypted2);
 
         // But both should decrypt to the same plaintext
-        assert_eq!(decrypt(&encrypted1, &key).unwrap(), plaintext);
-        assert_eq!(decrypt(&encrypted2, &key).unwrap(), plaintext);
+        assert_eq!(decrypt(&encrypted1, &key, b"").unwrap(), plaintext);
+        assert_eq!(decrypt(&encrypted2, &key, b"").unwrap(), plaintext);
     }
 
     #[test]
@@ -259,10 +282,10 @@ mod tests {
         key2[0] = 0xff; // Modify first byte
 
         let plaintext = "Secret data";
-        let encrypted = encrypt(plaintext, &key1, None).unwrap();
+        let encrypted = encrypt(plaintext, &key1, None, b"").unwrap();
 
         // Decryption with wrong key should fail
-        assert!(decrypt(&encrypted, &key2).is_err());
+        assert!(decrypt(&encrypted, &key2, b"").is_err());
     }
 
     #[test]
@@ -270,7 +293,7 @@ mod tests {
         let short_key = vec![0u8; 16]; // 16 bytes instead of 32
         let plaintext = "test";
 
-        assert!(encrypt(plaintext, &short_key, None).is_err());
+        assert!(encrypt(plaintext, &short_key, None, b"").is_err());
     }
 
     #[test]
@@ -278,8 +301,8 @@ mod tests {
         let key = test_key();
         let plaintext = "";
 
-        let encrypted = encrypt(plaintext, &key, None).unwrap();
-        let decrypted = decrypt(&encrypted, &key).unwrap();
+        let encrypted = encrypt(plaintext, &key, None, b"").unwrap();
+        let decrypted = decrypt(&encrypted, &key, b"").unwrap();
 
         assert_eq!(decrypted, plaintext);
     }
@@ -289,8 +312,8 @@ mod tests {
         let key = test_key();
         let plaintext = "Hello, \u{4e16}\u{754c}! \u{1f600}"; // "Hello, 世界! 😀"
 
-        let encrypted = encrypt(plaintext, &key, None).unwrap();
-        let decrypted = decrypt(&encrypted, &key).unwrap();
+        let encrypted = encrypt(plaintext, &key, None, b"").unwrap();
+        let decrypted = decrypt(&encrypted, &key, b"").unwrap();
 
         assert_eq!(decrypted, plaintext);
     }
@@ -323,14 +346,14 @@ mod tests {
         let key = test_key();
         let plaintext = "test";
 
-        let encrypted = encrypt(plaintext, &key, Some("primary".to_string())).unwrap();
+        let encrypted = encrypt(plaintext, &key, Some("primary".to_string()), b"").unwrap();
 
         // Verify key_id is present in the encrypted value
         let parsed = EncryptedValue::from_json(&encrypted).unwrap();
         assert_eq!(parsed.key_id(), Some("primary"));
 
         // Should still decrypt correctly
-        let decrypted = decrypt(&encrypted, &key).unwrap();
+        let decrypted = decrypt(&encrypted, &key, b"").unwrap();
         assert_eq!(decrypted, plaintext);
     }
 
@@ -339,14 +362,14 @@ mod tests {
         let key = test_key();
         let plaintext = "Secret";
 
-        let encrypted = encrypt(plaintext, &key, None).unwrap();
+        let encrypted = encrypt(plaintext, &key, None, b"").unwrap();
         let mut parsed = EncryptedValue::from_json(&encrypted).unwrap();
 
         // Tamper with the ciphertext
         parsed.p = "dGFtcGVyZWQ=".to_string(); // "tampered" in base64
 
         let tampered_json = parsed.to_json().unwrap();
-        assert!(decrypt(&tampered_json, &key).is_err());
+        assert!(decrypt(&tampered_json, &key, b"").is_err());
     }
 
     #[test]
@@ -354,8 +377,8 @@ mod tests {
         let key = test_key();
         let plaintext = "alice@example.com";
 
-        let a = encrypt_deterministic(plaintext, &key, None).unwrap();
-        let b = encrypt_deterministic(plaintext, &key, None).unwrap();
+        let a = encrypt_deterministic(plaintext, &key, None, b"").unwrap();
+        let b = encrypt_deterministic(plaintext, &key, None, b"").unwrap();
         assert_eq!(a, b, "same plaintext must produce same ciphertext");
 
         let parsed = EncryptedValue::from_json(&a).unwrap();
@@ -365,8 +388,8 @@ mod tests {
     #[test]
     fn test_encrypt_deterministic_differs_per_plaintext() {
         let key = test_key();
-        let a = encrypt_deterministic("foo@example.com", &key, None).unwrap();
-        let b = encrypt_deterministic("bar@example.com", &key, None).unwrap();
+        let a = encrypt_deterministic("foo@example.com", &key, None, b"").unwrap();
+        let b = encrypt_deterministic("bar@example.com", &key, None, b"").unwrap();
         assert_ne!(
             a, b,
             "different plaintexts must produce different ciphertexts"
@@ -377,8 +400,60 @@ mod tests {
     fn test_encrypt_deterministic_roundtrips() {
         let key = test_key();
         let plaintext = "sensitive";
-        let encrypted = encrypt_deterministic(plaintext, &key, None).unwrap();
-        assert_eq!(decrypt(&encrypted, &key).unwrap(), plaintext);
+        let encrypted = encrypt_deterministic(plaintext, &key, None, b"").unwrap();
+        assert_eq!(decrypt(&encrypted, &key, b"").unwrap(), plaintext);
+    }
+
+    #[test]
+    fn test_aad_must_match_on_decrypt() {
+        let key = test_key();
+        let plaintext = "secret";
+
+        let with_aad = encrypt(plaintext, &key, None, b"users:ssn").unwrap();
+
+        // Same AAD: decrypts.
+        assert_eq!(decrypt(&with_aad, &key, b"users:ssn").unwrap(), plaintext);
+
+        // Wrong AAD: GCM authentication fails.
+        assert!(
+            decrypt(&with_aad, &key, b"users:other").is_err(),
+            "different AAD must fail authentication"
+        );
+
+        // Missing AAD: also fails.
+        assert!(
+            decrypt(&with_aad, &key, b"").is_err(),
+            "empty AAD against bound ciphertext must fail"
+        );
+    }
+
+    #[test]
+    fn test_aad_unbound_ciphertext_decrypts_only_with_empty_aad() {
+        let key = test_key();
+        let plaintext = "secret";
+        let unbound = encrypt(plaintext, &key, None, b"").unwrap();
+
+        assert_eq!(decrypt(&unbound, &key, b"").unwrap(), plaintext);
+        assert!(
+            decrypt(&unbound, &key, b"users:ssn").is_err(),
+            "supplying AAD against an unbound ciphertext must fail"
+        );
+    }
+
+    #[test]
+    fn test_deterministic_aad_changes_ciphertext() {
+        let key = test_key();
+        let plaintext = "alice@example.com";
+
+        let a = encrypt_deterministic(plaintext, &key, None, b"users:email").unwrap();
+        let b = encrypt_deterministic(plaintext, &key, None, b"users:other").unwrap();
+        assert_ne!(
+            a, b,
+            "deterministic IV must absorb AAD so different AADs produce different ciphertexts"
+        );
+
+        assert_eq!(decrypt(&a, &key, b"users:email").unwrap(), plaintext);
+        assert!(decrypt(&a, &key, b"users:other").is_err());
     }
 
     #[test]
@@ -388,8 +463,8 @@ mod tests {
         let mut k2 = test_key();
         k2[0] ^= 0xff;
 
-        let e1 = encrypt_deterministic(plaintext, &k1, None).unwrap();
-        let e2 = encrypt_deterministic(plaintext, &k2, None).unwrap();
+        let e1 = encrypt_deterministic(plaintext, &k1, None, b"").unwrap();
+        let e2 = encrypt_deterministic(plaintext, &k2, None, b"").unwrap();
         assert_ne!(e1, e2, "IV must bind to the key as well as the plaintext");
 
         // Consume k1 so it isn't dropped as unused.

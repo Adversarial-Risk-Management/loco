@@ -133,9 +133,56 @@ pub use registry::SharedKeyProvider;
 /// The generated impl produces `encrypted_fields()` containing every name,
 /// and `deterministic_fields()` containing only those marked
 /// `(deterministic)`. Unknown modifiers are rejected at compile time.
+///
+/// # Binding ciphertexts to a `(table, column)` location (AAD)
+///
+/// Pass an `aad_namespace = "<label>"` argument to bind every ciphertext to
+/// `<label>:<field_name>` via Additional Authenticated Data. With this
+/// enabled, a ciphertext written for one field will not decrypt as another:
+///
+/// ```rust,ignore
+/// impl_encryptable_fields!(
+///     users::ActiveModel,
+///     [ssn, email(deterministic)],
+///     aad_namespace = "users",
+/// );
+/// ```
+///
+/// Once enabled, all reads and writes must agree on the namespace; turning it
+/// on for a field that already has data invalidates existing ciphertexts the
+/// same way a key rotation does.
 #[macro_export]
 macro_rules! impl_encryptable_fields {
     ($model:ty, [$($field:ident $(($modifier:ident))?),* $(,)?]) => {
+        $crate::__impl_encryptable_fields_inner!(
+            $model,
+            [$($field $(($modifier))?),*],
+            aad_namespace = ""
+        );
+    };
+    (
+        $model:ty,
+        [$($field:ident $(($modifier:ident))?),* $(,)?],
+        aad_namespace = $ns:literal $(,)?
+    ) => {
+        $crate::__impl_encryptable_fields_inner!(
+            $model,
+            [$($field $(($modifier))?),*],
+            aad_namespace = $ns
+        );
+    };
+}
+
+/// Shared expansion for [`impl_encryptable_fields!`] — public-but-hidden so
+/// the public macro's two arms can both delegate here.
+#[macro_export]
+#[doc(hidden)]
+macro_rules! __impl_encryptable_fields_inner {
+    (
+        $model:ty,
+        [$($field:ident $(($modifier:ident))?),* $(,)?],
+        aad_namespace = $ns:literal
+    ) => {
         impl $crate::encryption::Encryptable for $model {
             fn encrypted_fields() -> Vec<String> {
                 vec![$(stringify!($field).to_string()),*]
@@ -149,6 +196,14 @@ macro_rules! impl_encryptable_fields {
                     );
                 )*
                 out
+            }
+
+            fn field_aad(field_name: &str) -> Vec<u8> {
+                if $ns.is_empty() {
+                    Vec::new()
+                } else {
+                    format!("{}:{}", $ns, field_name).into_bytes()
+                }
             }
 
             fn get_set_string_value(&self, field_name: &str) -> Option<String> {

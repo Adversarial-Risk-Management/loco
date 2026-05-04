@@ -158,7 +158,17 @@ It protects against **leaked database state**: stolen `pg_dump` output, a miscon
 
 It does not protect against a **compromised application server**. The app holds the keys, in memory, by design. Anyone who can run code in your process can decrypt anything you can decrypt. If your threat model includes app-server compromise, you need a different layer (KMS with audit logging, HSM-backed decryption, per-request user-bound keys, etc.).
 
-There is one specific limitation worth calling out. Ciphertexts are not currently bound to their `(table, column)` location. If an attacker with write access to the database moves a ciphertext from `users.ssn` into `audit_log.notes`, the value will decrypt successfully when `audit_log` is read, because the same key derivation inputs are not re-checked at decryption time. Per-field key derivation prevents *cross-field* decryption, but not cross-row movement of a value within fields that share derivation inputs. AAD (Additional Authenticated Data) binding is on the roadmap and will close this gap.
+By default, ciphertexts are *not* bound to their `(table, column)` location. If an attacker with row-level write access to the database moves a ciphertext from `users.ssn` into `audit_log.notes`, the value will decrypt successfully when `audit_log` is read. To close that gap, opt the model into Additional Authenticated Data binding via the macro's `aad_namespace`:
+
+```rust
+impl_encryptable_fields!(
+    users::ActiveModel,
+    [ssn, email(deterministic)],
+    aad_namespace = "users",
+);
+```
+
+This makes `Encryptable::field_aad("ssn")` return `b"users:ssn"`, which AES-GCM authenticates alongside the ciphertext. A relocated ciphertext authenticates against a different AAD and fails. You can also implement `field_aad` by hand for non-`(table, column)` schemes — anything goes as long as encrypt and decrypt agree. Turning AAD on for an existing field invalidates ciphertexts written without it; plan the rollout the same way you would a key rotation.
 
 Finally, AES-GCM with random IVs has a birthday-bound limit. Roughly: after about 2^32 encryptions under a single key, the probability of an IV collision becomes non-negligible. If you are encrypting at that scale, rotate keys before you get there. For most applications this is far beyond anything you'll hit, but it is the reason to take key rotation seriously even when nothing has gone wrong.
 
