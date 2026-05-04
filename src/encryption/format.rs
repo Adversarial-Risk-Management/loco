@@ -65,6 +65,11 @@ pub struct EncryptedHeaders {
     /// key path on the way back.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub d: Option<bool>,
+
+    /// Set to `true` when the plaintext was zlib-deflated before encryption.
+    /// Decryption reverses the steps in `decrypt → inflate` order.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub c: Option<bool>,
 }
 
 /// Rails-compatible encrypted value structure
@@ -95,6 +100,7 @@ impl EncryptedValue {
                 at: BASE64.encode(auth_tag),
                 i: key_id,
                 d: None,
+                c: None,
             },
         }
     }
@@ -104,6 +110,13 @@ impl EncryptedValue {
     #[must_use]
     pub fn is_deterministic(&self) -> bool {
         self.h.d.unwrap_or(false)
+    }
+
+    /// Whether the envelope marks the plaintext as zlib-compressed before
+    /// encryption.
+    #[must_use]
+    pub fn is_compressed(&self) -> bool {
+        self.h.c.unwrap_or(false)
     }
 
     /// Parse an encrypted value from a JSON string

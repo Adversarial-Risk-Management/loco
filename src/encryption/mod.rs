@@ -189,13 +189,27 @@ macro_rules! __impl_encryptable_fields_inner {
             }
 
             fn deterministic_fields() -> Vec<String> {
-                let mut out: Vec<String> = Vec::new();
+                let mut det: Vec<String> = Vec::new();
+                let mut comp: Vec<String> = Vec::new();
                 $(
-                    $crate::__impl_encryptable_det_push!(
-                        out, $field $(, $modifier)?
+                    $crate::__impl_encryptable_field_meta!(
+                        det, comp, $field $(, $modifier)?
                     );
                 )*
-                out
+                let _ = comp;
+                det
+            }
+
+            fn compressed_fields() -> Vec<String> {
+                let mut det: Vec<String> = Vec::new();
+                let mut comp: Vec<String> = Vec::new();
+                $(
+                    $crate::__impl_encryptable_field_meta!(
+                        det, comp, $field $(, $modifier)?
+                    );
+                )*
+                let _ = det;
+                comp
             }
 
             fn field_aad(field_name: &str) -> Vec<u8> {
@@ -235,25 +249,33 @@ macro_rules! __impl_encryptable_fields_inner {
     };
 }
 
-/// Internal helper for [`impl_encryptable_fields!`] — pushes deterministic
-/// field names into the accumulator and rejects unknown modifiers.
+/// Internal helper for [`impl_encryptable_fields!`] — classifies a single
+/// field's modifier into either the deterministic-list or compressed-list
+/// accumulator, and rejects unknown modifiers at compile time.
 #[macro_export]
 #[doc(hidden)]
-macro_rules! __impl_encryptable_det_push {
-    ($out:ident, $field:ident, deterministic) => {
-        $out.push(stringify!($field).to_string());
+macro_rules! __impl_encryptable_field_meta {
+    ($det:ident, $comp:ident, $field:ident, deterministic) => {
+        $det.push(stringify!($field).to_string());
+        let _ = &$comp;
     };
-    ($out:ident, $field:ident, $other:ident) => {
+    ($det:ident, $comp:ident, $field:ident, compress) => {
+        $comp.push(stringify!($field).to_string());
+        let _ = &$det;
+    };
+    ($det:ident, $comp:ident, $field:ident, $other:ident) => {
         compile_error!(concat!(
             "unknown encryption modifier `",
             stringify!($other),
             "` on field `",
             stringify!($field),
-            "` (expected `deterministic`)"
+            "` (expected `deterministic` or `compress`)"
         ));
+        let _ = (&$det, &$comp);
     };
-    ($out:ident, $field:ident) => {
-        let _ = &$out; // bare field — non-deterministic, nothing to push
+    ($det:ident, $comp:ident, $field:ident) => {
+        // bare field — neither deterministic nor compressed
+        let _ = (&$det, &$comp);
     };
 }
 
@@ -431,17 +453,22 @@ mod tests {
         assert!(validate_config(&config).is_err());
     }
 
-    /// Direct unit test of the macro's deterministic-marker helper. The full
+    /// Direct unit test of the macro's modifier classifier. The full
     /// `impl_encryptable_fields!` macro requires `ActiveModelTrait` to be
     /// implemented for the target type, which is heavyweight to mock here;
     /// the SeaORM round-trip is covered in the Phase 4 integration tests.
     #[test]
-    fn impl_encryptable_det_push_helper_collects_marked_fields() {
-        let mut out: Vec<String> = Vec::new();
-        crate::__impl_encryptable_det_push!(out, ssn);
-        crate::__impl_encryptable_det_push!(out, email, deterministic);
-        crate::__impl_encryptable_det_push!(out, phone);
-        crate::__impl_encryptable_det_push!(out, recovery_email, deterministic);
-        assert_eq!(out, vec!["email".to_string(), "recovery_email".to_string()]);
+    fn impl_encryptable_field_meta_helper_classifies_modifiers() {
+        let mut det: Vec<String> = Vec::new();
+        let mut comp: Vec<String> = Vec::new();
+        crate::__impl_encryptable_field_meta!(det, comp, ssn);
+        crate::__impl_encryptable_field_meta!(det, comp, email, deterministic);
+        crate::__impl_encryptable_field_meta!(det, comp, bio, compress);
+        crate::__impl_encryptable_field_meta!(det, comp, phone);
+        crate::__impl_encryptable_field_meta!(det, comp, recovery_email, deterministic);
+        crate::__impl_encryptable_field_meta!(det, comp, journal, compress);
+
+        assert_eq!(det, vec!["email".to_string(), "recovery_email".to_string()]);
+        assert_eq!(comp, vec!["bio".to_string(), "journal".to_string()]);
     }
 }

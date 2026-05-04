@@ -135,6 +135,22 @@ let user = users::Entity::find()
 
 The trade-off is real. Deterministic ciphertexts leak which rows share the same plaintext: an attacker with read access to the table can group rows by encrypted email even if they cannot decrypt any of them. For low-cardinality fields (think `country_code`) this is close to giving up the plaintext entirely. Reserve deterministic mode for fields where you actually need equality lookups — typically uniqueness checks, login flows, or foreign-key-style joins on natural keys — and keep everything else random.
 
+## Compressing large encrypted fields
+
+Long, redundant payloads — JSON blobs, biographies, free-form journal entries — can take significant database space once encrypted. Loco supports zlib `deflate` compression of the plaintext before encryption, opt-in per field. Mark a field with the `(compress)` modifier:
+
+```rust
+impl_encryptable_fields!(profiles::ActiveModel, [
+    bio(compress),
+    notes(compress),
+    email(deterministic),
+]);
+```
+
+Compression only kicks in when the plaintext is at least 140 bytes (the same threshold Rails uses); shorter values are stored uncompressed because the zlib header overhead would outweigh any savings. The envelope's `h.c` flag records whether a given ciphertext was compressed, so decryption transparently inflates when needed. Old, uncompressed rows continue to decrypt without re-encryption.
+
+Two caveats. First, compression and deterministic mode are mutually exclusive on the same field — deflate output is not stable across zlib versions, so a deterministic-then-compressed pipeline cannot guarantee identical ciphertext for identical plaintext. The macro and the runtime both reject the combination. Second, compressing user-influenced plaintext before encrypting it can leak length-correlated information (the CRIME / BREACH attack class). For database-at-rest storage this is generally fine, but treat it the way you would treat HTTP compression: not for fields whose content is partly attacker-controlled and partly secret.
+
 ## Key rotation
 
 Rotation works by stacking keys. To rotate:

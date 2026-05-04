@@ -3,10 +3,13 @@
 //! This module provides authenticated encryption using AES-256-GCM (AEAD).
 //! Each encryption operation generates a unique nonce for non-deterministic encryption.
 
+use std::io::Read;
+
 use aes_gcm::{
     aead::{Aead, KeyInit, OsRng},
     AeadCore, Aes256Gcm, Nonce,
 };
+use flate2::{read::ZlibDecoder, write::ZlibEncoder, Compression};
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 
@@ -16,6 +19,11 @@ use super::{
 };
 
 type HmacSha256 = Hmac<Sha256>;
+
+/// Plaintext byte threshold under which compression is skipped because the
+/// zlib header overhead (~10 bytes) overwhelms any savings. Matches Rails'
+/// `THRESHOLD_TO_JUSTIFY_COMPRESSION`.
+pub const COMPRESS_THRESHOLD: usize = 140;
 
 /// AES-256-GCM key size in bytes
 pub const KEY_SIZE: usize = 32;
@@ -129,12 +137,72 @@ pub fn decrypt(encrypted_json: &str, key: &[u8], aad: &[u8]) -> EncryptionResult
         msg: ciphertext_with_tag.as_ref(),
         aad,
     };
-    let plaintext = cipher
+    let plaintext_bytes = cipher
         .decrypt(&nonce, payload)
         .map_err(|e| EncryptionError::DecryptionFailed(e.to_string()))?;
 
-    String::from_utf8(plaintext)
+    let bytes = if encrypted.is_compressed() {
+        let mut decoder = ZlibDecoder::new(plaintext_bytes.as_slice());
+        let mut out = Vec::with_capacity(plaintext_bytes.len() * 2);
+        decoder
+            .read_to_end(&mut out)
+            .map_err(|e| EncryptionError::DecryptionFailed(format!("decompression: {e}")))?;
+        out
+    } else {
+        plaintext_bytes
+    };
+
+    String::from_utf8(bytes)
         .map_err(|e| EncryptionError::DecryptionFailed(format!("invalid UTF-8: {e}")))
+}
+
+/// Encrypt plaintext using AES-256-GCM, applying zlib `deflate` compression
+/// when the plaintext is large enough to benefit.
+///
+/// Compression is skipped when the plaintext is shorter than
+/// [`COMPRESS_THRESHOLD`] (140 bytes). When applied, the envelope header
+/// `h.c` is set to `true` so [`decrypt`] can reverse it.
+///
+/// # Errors
+/// Returns an error if compression, key setup, or AES-GCM encryption fails.
+pub fn encrypt_compressed(
+    plaintext: &str,
+    key: &[u8],
+    key_id: Option<String>,
+    aad: &[u8],
+) -> EncryptionResult<String> {
+    if plaintext.len() < COMPRESS_THRESHOLD {
+        return encrypt(plaintext, key, key_id, aad);
+    }
+
+    validate_key(key)?;
+
+    // Deflate the plaintext bytes. Default compression level is a reasonable
+    // tradeoff between size and CPU; matches Rails' `Zlib::Deflate.deflate`
+    // default.
+    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+    std::io::Write::write_all(&mut encoder, plaintext.as_bytes())
+        .map_err(|e| EncryptionError::EncryptionFailed(format!("compression: {e}")))?;
+    let compressed = encoder
+        .finish()
+        .map_err(|e| EncryptionError::EncryptionFailed(format!("compression finish: {e}")))?;
+
+    let cipher =
+        Aes256Gcm::new_from_slice(key).map_err(|e| EncryptionError::InvalidKey(e.to_string()))?;
+    let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
+
+    let payload = aes_gcm::aead::Payload {
+        msg: compressed.as_slice(),
+        aad,
+    };
+    let ciphertext_with_tag = cipher
+        .encrypt(&nonce, payload)
+        .map_err(|e| EncryptionError::EncryptionFailed(e.to_string()))?;
+    let (ciphertext, auth_tag) = ciphertext_with_tag.split_at(ciphertext_with_tag.len() - TAG_SIZE);
+
+    let mut envelope = EncryptedValue::new(ciphertext, &nonce, auth_tag, key_id);
+    envelope.h.c = Some(true);
+    envelope.to_json()
 }
 
 /// Encrypt plaintext deterministically using AES-256-GCM with an
@@ -402,6 +470,53 @@ mod tests {
         let plaintext = "sensitive";
         let encrypted = encrypt_deterministic(plaintext, &key, None, b"").unwrap();
         assert_eq!(decrypt(&encrypted, &key, b"").unwrap(), plaintext);
+    }
+
+    #[test]
+    fn test_encrypt_compressed_below_threshold_skips_compression() {
+        let key = test_key();
+        // Short plaintext: compression is skipped, so the envelope is
+        // indistinguishable from a regular encrypt() call.
+        let short = "tiny";
+        let env = encrypt_compressed(short, &key, None, b"").unwrap();
+        let parsed = EncryptedValue::from_json(&env).unwrap();
+        assert!(
+            !parsed.is_compressed(),
+            "h.c should be unset below threshold"
+        );
+        assert_eq!(decrypt(&env, &key, b"").unwrap(), short);
+    }
+
+    #[test]
+    fn test_encrypt_compressed_above_threshold_compresses() {
+        let key = test_key();
+        // Highly compressible payload longer than COMPRESS_THRESHOLD: zlib
+        // should make the output meaningfully smaller than the plaintext.
+        let plaintext: String = "a".repeat(2048);
+        let env = encrypt_compressed(&plaintext, &key, None, b"").unwrap();
+        let parsed = EncryptedValue::from_json(&env).unwrap();
+        assert!(parsed.is_compressed(), "h.c must be set above threshold");
+
+        // Round-trips through decrypt().
+        assert_eq!(decrypt(&env, &key, b"").unwrap(), plaintext);
+
+        // Compressed ciphertext should be substantially smaller than the
+        // plaintext for a repetitive payload of this size.
+        let payload_len = parsed.ciphertext().unwrap().len();
+        assert!(
+            payload_len < plaintext.len() / 4,
+            "expected compressed payload << plaintext (got {payload_len} vs {})",
+            plaintext.len()
+        );
+    }
+
+    #[test]
+    fn test_compressed_envelope_authenticates_aad() {
+        let key = test_key();
+        let plaintext: String = "loco-".repeat(50);
+        let env = encrypt_compressed(&plaintext, &key, None, b"users:bio").unwrap();
+        assert_eq!(decrypt(&env, &key, b"users:bio").unwrap(), plaintext);
+        assert!(decrypt(&env, &key, b"other").is_err());
     }
 
     #[test]

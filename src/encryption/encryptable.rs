@@ -55,7 +55,7 @@ use sea_orm::{ActiveModelTrait, EntityTrait};
 use serde::{de::DeserializeOwned, Serialize};
 
 use super::{
-    cipher::{decrypt, encrypt, encrypt_deterministic},
+    cipher::{decrypt, encrypt, encrypt_compressed, encrypt_deterministic},
     errors::{EncryptionError, EncryptionResult},
     format::{is_encrypted_format, EncryptedValue},
     key_provider::{KeyProvider, SecureKey},
@@ -83,6 +83,27 @@ pub trait Encryptable: ActiveModelTrait {
     /// list — all fields are non-deterministic.
     #[must_use]
     fn deterministic_fields() -> Vec<String> {
+        Vec::new()
+    }
+
+    /// Returns the list of field names whose plaintext should be zlib-deflated
+    /// before encryption.
+    ///
+    /// Compression only kicks in when the plaintext is at least
+    /// [`crate::encryption::cipher::COMPRESS_THRESHOLD`] bytes long; smaller
+    /// values are stored uncompressed because the zlib header overhead
+    /// outweighs any savings. The envelope header `h.c` records whether a
+    /// given ciphertext was compressed, so changing the trait return value
+    /// for an existing field is safe — old uncompressed ciphertexts continue
+    /// to decrypt without re-encryption.
+    ///
+    /// Be aware of the security trade-off: compressing user-influenced
+    /// plaintext before encryption can leak length-correlated information
+    /// (CRIME / BREACH-style attacks). Only enable compression on fields
+    /// where the plaintext is not under attacker control, or where length
+    /// leakage is acceptable.
+    #[must_use]
+    fn compressed_fields() -> Vec<String> {
         Vec::new()
     }
 
@@ -149,6 +170,7 @@ pub trait Encryptable: ActiveModelTrait {
     {
         let fields = Self::encrypted_fields();
         let det_fields = Self::deterministic_fields();
+        let compressed_fields = Self::compressed_fields();
 
         for field_name in &fields {
             let Some(plaintext) = self.get_set_string_value(field_name) else {
@@ -161,9 +183,17 @@ pub trait Encryptable: ActiveModelTrait {
 
             let key_id = provider.get_key_id();
             let is_deterministic = det_fields.iter().any(|f| f == field_name);
+            let is_compressed = compressed_fields.iter().any(|f| f == field_name);
             let aad = Self::field_aad(field_name);
 
             let encrypted = if is_deterministic {
+                if is_compressed {
+                    return Err(EncryptionError::NotConfigured(format!(
+                        "field '{field_name}' is marked both deterministic and \
+                         compressed; compression is not supported in deterministic \
+                         mode (zlib output is not stable across libc versions)"
+                    )));
+                }
                 let det_master = provider.get_deterministic_key()?.ok_or_else(|| {
                     EncryptionError::NotConfigured(format!(
                         "field '{field_name}' is marked deterministic but no \
@@ -172,6 +202,9 @@ pub trait Encryptable: ActiveModelTrait {
                 })?;
                 let field_key = provider.derive_field_key(&det_master, field_name)?;
                 encrypt_deterministic(&plaintext, field_key.as_bytes(), key_id, &aad)?
+            } else if is_compressed {
+                let key = provider.get_field_key(field_name)?;
+                encrypt_compressed(&plaintext, key.as_bytes(), key_id, &aad)?
             } else {
                 let key = provider.get_field_key(field_name)?;
                 encrypt(&plaintext, key.as_bytes(), key_id, &aad)?
