@@ -36,6 +36,15 @@ pub struct EncryptionConfig {
     /// ciphertexts. Required when any `Encryptable` declares deterministic
     /// fields; otherwise optional.
     ///
+    /// **Rotation is not supported for this key.** As in Rails Active Record
+    /// Encryption ("Rotating keys is not supported for deterministic
+    /// encryption"), changing `deterministic_key` would change the ciphertext
+    /// for the same plaintext and break equality queries and uniqueness — and
+    /// unlike `previous_keys`, there is no fallback list, so existing
+    /// deterministic values would no longer decrypt. Pick this key once and
+    /// keep it stable. Rotating `primary_key`/`previous_keys` does not affect
+    /// deterministic fields, which live on this separate key.
+    ///
     /// Generate with: `openssl rand -hex 32`
     #[serde(default)]
     pub deterministic_key: Option<String>,

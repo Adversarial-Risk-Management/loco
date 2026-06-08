@@ -81,6 +81,21 @@ pub trait Encryptable: ActiveModelTrait {
     /// name returned here must also appear in
     /// [`encrypted_fields`](Self::encrypted_fields). The default is an empty
     /// list — all fields are non-deterministic.
+    ///
+    /// # Information leakage
+    ///
+    /// Deterministic encryption is inherently less private than the random-IV
+    /// default: equal plaintexts yield equal ciphertexts, which is what makes
+    /// equality queries possible but also reveals which rows share a value.
+    /// This matches Rails Active Record Encryption. Note the leak is not
+    /// confined to a single column: with key derivation disabled (or no
+    /// `aad_namespace`), two deterministic fields holding the same plaintext
+    /// produce the *same* ciphertext, revealing the cross-field equality.
+    /// Enabling key derivation derives a distinct per-field key, so identical
+    /// plaintexts in different fields no longer collide — prefer it whenever
+    /// you have more than one deterministic field. Reserve deterministic mode
+    /// for fields you must query by exact value (e.g. an email used for
+    /// lookup); leave everything else non-deterministic.
     #[must_use]
     fn deterministic_fields() -> Vec<String> {
         Vec::new()
@@ -171,6 +186,9 @@ pub trait Encryptable: ActiveModelTrait {
         let fields = Self::encrypted_fields();
         let det_fields = Self::deterministic_fields();
         let compressed_fields = Self::compressed_fields();
+        // The key id is constant across all fields of a model; fetch it once
+        // rather than re-allocating it on every loop iteration.
+        let key_id = provider.get_key_id();
 
         for field_name in &fields {
             let Some(plaintext) = self.get_set_string_value(field_name) else {
@@ -181,7 +199,6 @@ pub trait Encryptable: ActiveModelTrait {
                 continue;
             }
 
-            let key_id = provider.get_key_id();
             let is_deterministic = det_fields.iter().any(|f| f == field_name);
             let is_compressed = compressed_fields.iter().any(|f| f == field_name);
             let aad = Self::field_aad(field_name);
@@ -201,13 +218,13 @@ pub trait Encryptable: ActiveModelTrait {
                     ))
                 })?;
                 let field_key = provider.derive_field_key(&det_master, field_name)?;
-                encrypt_deterministic(&plaintext, field_key.as_bytes(), key_id, &aad)?
+                encrypt_deterministic(&plaintext, field_key.as_bytes(), key_id.clone(), &aad)?
             } else if is_compressed {
                 let key = provider.get_field_key(field_name)?;
-                encrypt_compressed(&plaintext, key.as_bytes(), key_id, &aad)?
+                encrypt_compressed(&plaintext, key.as_bytes(), key_id.clone(), &aad)?
             } else {
                 let key = provider.get_field_key(field_name)?;
-                encrypt(&plaintext, key.as_bytes(), key_id, &aad)?
+                encrypt(&plaintext, key.as_bytes(), key_id.clone(), &aad)?
             };
 
             self = self.set_string_value(field_name, encrypted);
@@ -406,8 +423,49 @@ pub fn decrypt_field_with_aad<P: KeyProvider + ?Sized>(
         return Ok(encrypted_value.to_string());
     }
 
-    let key = provider.get_field_key(field_name)?;
-    decrypt(encrypted_value, key.as_bytes(), aad)
+    // Route on the envelope's deterministic flag and walk the same master-key
+    // lists as `ModelDecryption::decrypt_fields`, so this helper handles key
+    // rotation (previous_keys) and deterministic values rather than only the
+    // current primary key.
+    let is_deterministic =
+        EncryptedValue::from_json(encrypted_value).is_ok_and(|v| v.is_deterministic());
+
+    let masters: Vec<SecureKey> = if is_deterministic {
+        provider.get_deterministic_key()?.into_iter().collect()
+    } else {
+        provider
+            .get_decryption_keys()?
+            .into_iter()
+            .map(|(master, _id)| master)
+            .collect()
+    };
+
+    if masters.is_empty() {
+        return Err(EncryptionError::NotConfigured(format!(
+            "field '{field_name}' was encrypted deterministically but no \
+             `deterministic_key` is configured"
+        )));
+    }
+
+    let mut last_error = None;
+    for master in &masters {
+        let field_key = match provider.derive_field_key(master, field_name) {
+            Ok(k) => k,
+            Err(e) => {
+                last_error = Some(e);
+                continue;
+            }
+        };
+        match decrypt(encrypted_value, field_key.as_bytes(), aad) {
+            Ok(plaintext) => return Ok(plaintext),
+            Err(e) => last_error = Some(e),
+        }
+    }
+
+    Err(EncryptionError::all_keys_failed(
+        masters.len(),
+        last_error.map_or_else(|| "unknown error".to_string(), |e| e.to_string()),
+    ))
 }
 
 /// Helper function to encrypt a single field value
@@ -552,6 +610,49 @@ mod tests {
     }
 
     #[test]
+    fn test_decrypt_field_reads_value_written_under_previous_key() {
+        // decrypt_field must walk the rotation key list, not just the primary.
+        use crate::encryption::{
+            config::{EncryptionConfig, KeyDerivationConfig},
+            key_provider::ConfigKeyProvider,
+        };
+
+        let old = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f".to_string();
+        let new = "1f1e1d1c1b1a191817161514131211100f0e0d0c0b0a09080706050403020100".to_string();
+        let salt = "aabbccdd00112233445566778899aabbccddeeff00112233445566778899aabb".to_string();
+
+        let kd = || {
+            Some(KeyDerivationConfig {
+                enabled: true,
+                salt: Some(salt.clone()),
+            })
+        };
+
+        // Write under old primary.
+        let old_provider = ConfigKeyProvider::new(&EncryptionConfig {
+            primary_key: old.clone(),
+            previous_keys: vec![],
+            deterministic_key: None,
+            key_derivation: kd(),
+        })
+        .unwrap();
+        let ciphertext = encrypt_field("secret ssn", "ssn", &old_provider).unwrap();
+
+        // Rotate: new primary, old as previous.
+        let new_provider = ConfigKeyProvider::new(&EncryptionConfig {
+            primary_key: new,
+            previous_keys: vec![old],
+            deterministic_key: None,
+            key_derivation: kd(),
+        })
+        .unwrap();
+
+        // Before the fix this only tried the new primary and failed.
+        let decrypted = decrypt_field(&ciphertext, "ssn", &new_provider).unwrap();
+        assert_eq!(decrypted, "secret ssn");
+    }
+
+    #[test]
     fn test_deterministic_equality_query_roundtrip() {
         // Two independent provider instances (simulating two server processes)
         // with the same config must produce identical ciphertext for the same
@@ -575,8 +676,8 @@ mod tests {
                 salt: Some(salt.to_string()),
             }),
         };
-        let p1 = ConfigKeyProvider::new(cfg.clone()).unwrap();
-        let p2 = ConfigKeyProvider::new(cfg).unwrap();
+        let p1 = ConfigKeyProvider::new(&cfg).unwrap();
+        let p2 = ConfigKeyProvider::new(&cfg).unwrap();
 
         let det_master_1 = p1.get_deterministic_key().unwrap().unwrap();
         let det_master_2 = p2.get_deterministic_key().unwrap().unwrap();
@@ -646,7 +747,7 @@ mod tests {
                 salt: Some(salt.clone()),
             }),
         };
-        let old_provider = ConfigKeyProvider::new(old_config).unwrap();
+        let old_provider = ConfigKeyProvider::new(&old_config).unwrap();
         let ciphertext = encrypt_field("secret ssn", "ssn", &old_provider).unwrap();
         assert!(is_encrypted_format(&ciphertext));
 
@@ -660,7 +761,7 @@ mod tests {
                 salt: Some(salt),
             }),
         };
-        let new_provider = ConfigKeyProvider::new(new_config).unwrap();
+        let new_provider = ConfigKeyProvider::new(&new_config).unwrap();
 
         // Simulate the decrypt_fields loop: iterate masters, derive per
         // master, try to decrypt. With the bug, this would only ever derive

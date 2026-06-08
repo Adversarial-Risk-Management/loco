@@ -145,7 +145,10 @@ pub trait KeyProvider: Send + Sync {
 /// they are zeroed from memory when the provider is dropped.
 #[derive(Debug, Clone)]
 pub struct ConfigKeyProvider {
-    config: EncryptionConfig,
+    /// Whether per-field HKDF derivation is enabled. We store only this flag
+    /// rather than the full `EncryptionConfig` so the provider does not retain
+    /// a second, un-zeroized copy of the raw hex key strings for its lifetime.
+    key_derivation_enabled: bool,
     primary_key: SecureKey,
     previous_keys: Vec<SecureKey>,
     deterministic_key: Option<SecureKey>,
@@ -157,7 +160,7 @@ impl ConfigKeyProvider {
     ///
     /// # Errors
     /// Returns an error if the primary key is missing or invalid
-    pub fn new(config: EncryptionConfig) -> EncryptionResult<Self> {
+    pub fn new(config: &EncryptionConfig) -> EncryptionResult<Self> {
         if !config.has_primary_key() {
             return Err(EncryptionError::NotConfigured(
                 "primary_key is required".to_string(),
@@ -186,7 +189,10 @@ impl ConfigKeyProvider {
         };
 
         // Parse deterministic key if configured. It must be distinct from the
-        // primary to avoid any interaction between the two cipher modes.
+        // primary AND from every previous (rotation) key: if it collided with
+        // any master used for random-IV encryption, the same HKDF-derived
+        // field key could be shared between a deterministic ciphertext and a
+        // random-IV one, risking AES-GCM nonce reuse across the two modes.
         let deterministic_key = match config.deterministic_key.as_ref() {
             Some(k) if !k.trim().is_empty() => {
                 let det = parse_hex_key(k)?;
@@ -195,13 +201,18 @@ impl ConfigKeyProvider {
                         "deterministic_key must differ from primary_key".into(),
                     ));
                 }
+                if previous_keys.iter().any(|p| p.as_bytes() == det.as_slice()) {
+                    return Err(EncryptionError::InvalidKey(
+                        "deterministic_key must differ from every previous_keys entry".into(),
+                    ));
+                }
                 Some(SecureKey::new(det))
             }
             _ => None,
         };
 
         Ok(Self {
-            config,
+            key_derivation_enabled: config.is_key_derivation_enabled(),
             primary_key,
             previous_keys,
             deterministic_key,
@@ -224,7 +235,7 @@ impl KeyProvider for ConfigKeyProvider {
         master: &SecureKey,
         field_name: &str,
     ) -> EncryptionResult<SecureKey> {
-        if !self.config.is_key_derivation_enabled() {
+        if !self.key_derivation_enabled {
             return Ok(master.clone());
         }
 
@@ -322,7 +333,7 @@ mod tests {
     #[test]
     fn test_config_key_provider_basic() {
         let config = test_config();
-        let provider = ConfigKeyProvider::new(config).unwrap();
+        let provider = ConfigKeyProvider::new(&config).unwrap();
 
         let key = provider.get_encryption_key().unwrap();
         assert_eq!(key.len(), KEY_SIZE);
@@ -339,7 +350,7 @@ mod tests {
             key_derivation: None,
         };
 
-        assert!(ConfigKeyProvider::new(config).is_err());
+        assert!(ConfigKeyProvider::new(&config).is_err());
     }
 
     #[test]
@@ -354,7 +365,7 @@ mod tests {
             key_derivation: None,
         };
 
-        let provider = ConfigKeyProvider::new(config).unwrap();
+        let provider = ConfigKeyProvider::new(&config).unwrap();
         let decryption_keys = provider.get_decryption_keys().unwrap();
 
         assert_eq!(decryption_keys.len(), 2);
@@ -377,7 +388,7 @@ mod tests {
             }),
         };
 
-        let provider = ConfigKeyProvider::new(config).unwrap();
+        let provider = ConfigKeyProvider::new(&config).unwrap();
 
         // Field-specific keys should be different from primary key
         let primary = provider.get_encryption_key().unwrap();
@@ -406,7 +417,7 @@ mod tests {
             ),
             key_derivation: None,
         };
-        let provider = ConfigKeyProvider::new(config).unwrap();
+        let provider = ConfigKeyProvider::new(&config).unwrap();
 
         let det = provider
             .get_deterministic_key()
@@ -428,7 +439,26 @@ mod tests {
             deterministic_key: Some(hex.to_string()),
             key_derivation: None,
         };
-        let err = ConfigKeyProvider::new(config).unwrap_err();
+        let err = ConfigKeyProvider::new(&config).unwrap_err();
+        assert!(
+            matches!(err, EncryptionError::InvalidKey(_)),
+            "expected InvalidKey, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_config_key_provider_rejects_det_equal_to_previous_key() {
+        let primary = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+        let previous = "1f1e1d1c1b1a191817161514131211100f0e0d0c0b0a09080706050403020100";
+        let config = EncryptionConfig {
+            primary_key: primary.to_string(),
+            previous_keys: vec![previous.to_string()],
+            // Equal to a previous master: would risk a shared HKDF-derived
+            // field key across deterministic and random-IV ciphertexts.
+            deterministic_key: Some(previous.to_string()),
+            key_derivation: None,
+        };
+        let err = ConfigKeyProvider::new(&config).unwrap_err();
         assert!(
             matches!(err, EncryptionError::InvalidKey(_)),
             "expected InvalidKey, got {err:?}"
@@ -437,7 +467,7 @@ mod tests {
 
     #[test]
     fn test_config_key_provider_no_deterministic_key() {
-        let provider = ConfigKeyProvider::new(test_config()).unwrap();
+        let provider = ConfigKeyProvider::new(&test_config()).unwrap();
         assert!(provider.get_deterministic_key().unwrap().is_none());
     }
 
@@ -459,7 +489,7 @@ mod tests {
                 ),
             }),
         };
-        let provider = ConfigKeyProvider::new(config).unwrap();
+        let provider = ConfigKeyProvider::new(&config).unwrap();
 
         let masters = provider.get_decryption_keys().unwrap();
         assert_eq!(masters.len(), 2);

@@ -10,7 +10,7 @@
 //! {
 //!   "p": "base64-encoded-ciphertext",
 //!   "h": {
-//!     "v": 1,
+//!     "v": 2,
 //!     "iv": "base64-encoded-iv",
 //!     "at": "base64-encoded-auth-tag",
 //!     "i": "optional-key-id",
@@ -20,8 +20,12 @@
 //! ```
 //!
 //! Header keys:
-//! - `v` — envelope version (`1` is current). Missing means the legacy
-//!   pre-versioned format; reading is supported, writing always emits `v=1`.
+//! - `v` — envelope version (`2` is current). `v >= 2` binds the
+//!   interpretation flags (`v`, `d`, `c`) into the AES-GCM authenticated data,
+//!   so a storage-layer attacker cannot flip them to force a mis-decryption.
+//!   `v = 1` (and the legacy pre-versioned format with no `v`) authenticates
+//!   only the caller-supplied AAD; such values are still readable. Writing
+//!   always emits the current version.
 //! - `iv` — AES-GCM nonce (12 bytes, base64).
 //! - `at` — AES-GCM authentication tag (16 bytes, base64).
 //! - `i` — optional key identifier for rotation. Rails uses this for the
@@ -34,10 +38,18 @@
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use serde::{Deserialize, Serialize};
 
-use super::errors::{EncryptionError, EncryptionResult};
+use super::{
+    cipher::{NONCE_SIZE, TAG_SIZE},
+    errors::{EncryptionError, EncryptionResult},
+};
 
 /// Current envelope schema version emitted by [`EncryptedValue::new`].
-pub const CURRENT_ENVELOPE_VERSION: u8 = 1;
+///
+/// `2` introduced header authentication: the version and the `d`/`c` flags are
+/// folded into the AES-GCM associated data (see
+/// [`crate::encryption::cipher`]). `1` is the prior format whose headers were
+/// not authenticated; it remains readable.
+pub const CURRENT_ENVELOPE_VERSION: u8 = 2;
 
 /// Headers for encrypted value metadata
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -180,13 +192,26 @@ impl EncryptedValue {
 }
 
 /// Check if a string looks like an encrypted value (JSON with expected fields)
+///
+/// Matching the envelope *shape* is not enough: organic user data (or a value
+/// crafted by an attacker who controls a field's input) could be JSON with `p`
+/// and `h` keys and would then either be stored unencrypted by the
+/// encrypt-on-save guard or trip a doomed decryption attempt on read. So this
+/// additionally requires `iv` and `at` to base64-decode to the exact AEAD
+/// sizes and `p` to be valid base64 — constraints organic data effectively
+/// never satisfies by accident.
 #[must_use]
 pub fn is_encrypted_format(value: &str) -> bool {
     // Quick check before parsing
     if !value.starts_with('{') || !value.contains("\"p\"") || !value.contains("\"h\"") {
         return false;
     }
-    EncryptedValue::from_json(value).is_ok()
+    let Ok(parsed) = EncryptedValue::from_json(value) else {
+        return false;
+    };
+    matches!(parsed.iv(), Ok(iv) if iv.len() == NONCE_SIZE)
+        && matches!(parsed.auth_tag(), Ok(at) if at.len() == TAG_SIZE)
+        && parsed.ciphertext().is_ok()
 }
 
 /// Metadata about an encrypted value (for debugging)
@@ -262,8 +287,9 @@ pub mod debug {
     #[must_use]
     pub fn estimate_decrypted_size(value: &str) -> Option<usize> {
         inspect_encrypted(value).map(|meta| {
-            // Base64 encoding increases size by ~33%, so decoded size is ~75% of encoded
-            (meta.payload_len * 3) / 4
+            // Base64 encoding increases size by ~33%, so decoded size is ~75% of encoded.
+            // Saturating: payload_len comes off the wire and could be large.
+            meta.payload_len.saturating_mul(3) / 4
         })
     }
 }
@@ -285,16 +311,21 @@ pub mod debug {
 pub fn estimate_encrypted_size(plaintext_len: usize) -> usize {
     // AES-GCM ciphertext is the same size as plaintext (stream cipher, no
     // padding). The 16-byte auth tag is stored separately in the envelope
-    // under `h.at`, and the 12-byte IV under `h.iv`.
-    let ciphertext_base64 = plaintext_len.div_ceil(3) * 4;
+    // under `h.at`, and the 12-byte IV under `h.iv`. Saturating arithmetic
+    // so an absurdly large `plaintext_len` returns usize::MAX rather than
+    // overflow-panicking (debug) or wrapping to a tiny value (release).
+    let ciphertext_base64 = (plaintext_len.saturating_add(2) / 3).saturating_mul(4);
     let iv_base64 = 16; // 12 bytes -> 16 base64 chars
     let tag_base64 = 24; // 16 bytes -> 24 base64 chars
 
     // JSON structure overhead: {"p":"...","h":{"iv":"...","at":"..."}}
     // ~50 bytes for the JSON structure itself
-    let json_overhead = 50;
+    let json_overhead: usize = 50;
 
-    json_overhead + ciphertext_base64 + iv_base64 + tag_base64
+    json_overhead
+        .saturating_add(ciphertext_base64)
+        .saturating_add(iv_base64)
+        .saturating_add(tag_base64)
 }
 
 #[cfg(test)]
@@ -356,12 +387,26 @@ mod tests {
 
     #[test]
     fn test_is_encrypted_format() {
+        // 12-byte iv + 16-byte at, both valid base64: a well-formed envelope.
         assert!(is_encrypted_format(
-            r#"{"p":"abc","h":{"iv":"def","at":"ghi"}}"#
+            r#"{"p":"dGVzdCBkYXRh","h":{"iv":"MTIzNDU2Nzg5MDEy","at":"MDEyMzQ1Njc4OWFiY2RlZg=="}}"#
         ));
         assert!(!is_encrypted_format("plain text"));
         assert!(!is_encrypted_format(r#"{"other": "json"}"#));
         assert!(!is_encrypted_format(""));
+    }
+
+    #[test]
+    fn test_is_encrypted_format_rejects_shape_only_match() {
+        // Structurally an envelope (has `p` and `h`/`iv`/`at`) but `iv` and
+        // `at` decode to 3 bytes, not the AEAD sizes. Organic JSON that merely
+        // resembles the envelope must not be mistaken for ciphertext.
+        let fake = r#"{"p":"aGVsbG8=","h":{"iv":"YWJj","at":"YWJj"}}"#;
+        assert!(!is_encrypted_format(fake));
+
+        // Non-base64 iv/at also rejected.
+        let not_b64 = r#"{"p":"abc","h":{"iv":"def","at":"ghi"}}"#;
+        assert!(!is_encrypted_format(not_b64));
     }
 
     #[test]

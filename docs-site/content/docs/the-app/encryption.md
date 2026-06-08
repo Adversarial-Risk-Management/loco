@@ -193,17 +193,18 @@ Finally, AES-GCM with random IVs has a birthday-bound limit. Roughly: after abou
 Each encrypted value is a JSON envelope stored as text:
 
 ```json
-{"p": "<base64-ciphertext>", "h": {"v": 1, "iv": "<b64>", "at": "<b64>", "i": "primary", "d": true}}
+{"p": "<base64-ciphertext>", "h": {"v": 2, "iv": "<b64>", "at": "<b64>", "i": "primary", "d": true}}
 ```
 
 The fields are:
 
 - `p` — the base64-encoded ciphertext.
-- `h.v` — envelope version. Current version is `1`. The version field exists so that future format changes can be deployed without breaking older ciphertexts.
+- `h.v` — envelope version. Current version is `2`. From `v2` on, the version and the `d`/`c` flags are folded into the AES-GCM authenticated data, so a storage-layer attacker cannot flip them to force a mis-decryption or to suppress decompression — tampering with any of them fails authentication. `v1` (and the legacy pre-versioned format) authenticated only the ciphertext and any caller AAD; those values are still read back correctly. The version field exists so that format changes like this deploy without breaking older ciphertexts.
 - `h.iv` — base64-encoded IV (12 bytes, as required by GCM).
 - `h.at` — base64-encoded authentication tag.
-- `h.i` — key id; `"primary"` for the current primary key, or a label matching an entry in `previous_keys`. The field name `i` matches Rails' envelope for compatibility. The legacy alias `h.kid` is still accepted on read but is no longer emitted on write.
+- `h.i` — key id; `"primary"` for the current primary key, or a label matching an entry in `previous_keys`. The field name `i` matches Rails' envelope shape, though the value is a semantic label rather than Rails' key fingerprint, so envelopes are not wire-compatible across the two stacks. The legacy alias `h.kid` is still accepted on read but is no longer emitted on write.
 - `h.d` — `true` if the value was encrypted with the deterministic key, `false` or absent otherwise.
+- `h.c` — `true` if the plaintext was zlib-compressed before encryption, `false` or absent otherwise.
 
 You shouldn't need to parse this yourself. It's documented because the format is part of the contract: if you back up encrypted columns, dump them, or replicate them to another store, you can be confident that any Loco app with the right keys can read them.
 

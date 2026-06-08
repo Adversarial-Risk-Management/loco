@@ -10,16 +10,17 @@
 //!   under the `Arc<dyn KeyProvider + Send + Sync>` type key. This is the
 //!   preferred access path — it lets tests and sub-apps use different providers
 //!   by constructing fresh `AppContext`s.
-//! - **Process-wide singleton**: a fallback `OnceLock` for call sites that do
-//!   not have access to an `AppContext` (notably
-//!   `sea_orm::ActiveModelBehavior::before_save`, which gets only `&self` and
-//!   `&DatabaseConnection`).
+//! - **Process-wide latest**: a fallback for call sites that do not have access
+//!   to an `AppContext` (e.g. a custom `KeyProvider` installed at boot). Held
+//!   in an `RwLock` so a later [`register`] or [`set_global`] (key rotation,
+//!   config reload, a second app context in tests) refreshes it rather than
+//!   being silently dropped.
 //!
 //! Registration happens automatically during `boot::create_context` when
 //! `config.encryption` is set. User code normally does not need to call
 //! [`register`] directly.
 
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, RwLock};
 
 use super::{
     config::EncryptionConfig,
@@ -31,44 +32,42 @@ use crate::app::AppContext;
 /// Type alias for the concrete dynamic provider stored in both locations.
 pub type SharedKeyProvider = Arc<dyn KeyProvider + Send + Sync>;
 
-static GLOBAL: OnceLock<SharedKeyProvider> = OnceLock::new();
+static GLOBAL: RwLock<Option<SharedKeyProvider>> = RwLock::new(None);
 
 /// Register a provider built from the given configuration.
 ///
-/// Inserts the provider into `ctx.shared_store` and, if the process-wide
-/// singleton has not already been set, installs it there too. Idempotent:
-/// calling twice with the same config replaces the `shared_store` entry but
-/// leaves the global untouched.
+/// Inserts the provider into `ctx.shared_store` and refreshes the process-wide
+/// fallback. Calling twice (e.g. a second `AppContext`, or a config reload with
+/// rotated keys) replaces both, so the global never points at a stale provider.
 ///
 /// # Errors
 /// Returns an error if the configuration fails validation or the primary key
 /// cannot be parsed.
 pub fn register(ctx: &AppContext, cfg: &EncryptionConfig) -> EncryptionResult<()> {
     super::validate_config(cfg)?;
-    let provider: SharedKeyProvider = Arc::new(ConfigKeyProvider::new(cfg.clone())?);
+    let provider: SharedKeyProvider = Arc::new(ConfigKeyProvider::new(cfg)?);
     ctx.shared_store.insert(provider.clone());
-    let _ = GLOBAL.set(provider);
+    if let Ok(mut guard) = GLOBAL.write() {
+        *guard = Some(provider);
+    }
     Ok(())
 }
 
-/// Install an arbitrary provider as the process-wide singleton.
+/// Install an arbitrary provider as the process-wide fallback.
 ///
 /// Useful for custom `KeyProvider` implementations (KMS, Vault, HSM) that are
-/// not driven by `EncryptionConfig`. Returns the provider back unchanged if the
-/// global was already set — the caller can decide whether to swap it into
-/// `ctx.shared_store` manually.
-///
-/// # Errors
-/// Returns `Err` with the provider when the process-wide singleton was
-/// already set.
-pub fn set_global(provider: SharedKeyProvider) -> Result<(), SharedKeyProvider> {
-    GLOBAL.set(provider)
+/// not driven by `EncryptionConfig`. Overwrites any previously installed
+/// global provider.
+pub fn set_global(provider: SharedKeyProvider) {
+    if let Ok(mut guard) = GLOBAL.write() {
+        *guard = Some(provider);
+    }
 }
 
 /// Return the process-wide provider if one has been registered.
 #[must_use]
 pub fn global() -> Option<SharedKeyProvider> {
-    GLOBAL.get().cloned()
+    GLOBAL.read().ok().and_then(|g| g.clone())
 }
 
 /// Resolve a provider from an `AppContext`, falling back to the global.

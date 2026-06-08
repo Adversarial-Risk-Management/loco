@@ -15,10 +15,39 @@ use sha2::Sha256;
 
 use super::{
     errors::{EncryptionError, EncryptionResult},
-    format::EncryptedValue,
+    format::{EncryptedValue, CURRENT_ENVELOPE_VERSION},
 };
 
 type HmacSha256 = Hmac<Sha256>;
+
+/// Fixed domain separator prefixed to the header-authenticating associated
+/// data. Keeps the header bytes from ever being confused with caller AAD or
+/// with a future associated-data scheme.
+const AAD_HEADER_DOMAIN: &[u8] = b"loco-enc-hdr\x00";
+
+/// Lowest envelope version that folds its headers into the AEAD data.
+///
+/// Values written below this (legacy `v=1` and the pre-versioned format)
+/// authenticate only the caller-supplied AAD and are read back the same way.
+pub const HEADER_AUTH_MIN_VERSION: u8 = 2;
+
+/// Build the associated data that authenticates the envelope's interpretation
+/// flags alongside any caller-supplied AAD.
+///
+/// The encoding is `domain || version || deterministic || compressed ||
+/// user_aad`. The domain and the three flag bytes are fixed-width, so the
+/// boundary with `user_aad` is unambiguous without a length prefix. Encryption
+/// and decryption must build this identically; because the flags are baked
+/// into the tag, flipping `d`/`c`/`v` in storage makes authentication fail.
+fn header_aad(version: u8, deterministic: bool, compressed: bool, user_aad: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(AAD_HEADER_DOMAIN.len() + 3 + user_aad.len());
+    out.extend_from_slice(AAD_HEADER_DOMAIN);
+    out.push(version);
+    out.push(u8::from(deterministic));
+    out.push(u8::from(compressed));
+    out.extend_from_slice(user_aad);
+    out
+}
 
 /// Plaintext byte threshold under which compression is skipped because the
 /// zlib header overhead (~10 bytes) overwhelms any savings. Matches Rails'
@@ -65,9 +94,12 @@ pub fn encrypt(
     // encryptions per key (NIST SP 800-38D); rotate keys before that bound.
     let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
 
+    // Bind the envelope's version and (here unset) flags into the auth data so
+    // the headers can't be tampered with independently of the ciphertext.
+    let aad = header_aad(CURRENT_ENVELOPE_VERSION, false, false, aad);
     let payload = aes_gcm::aead::Payload {
         msg: plaintext.as_bytes(),
-        aad,
+        aad: &aad,
     };
     let ciphertext_with_tag = cipher
         .encrypt(&nonce, payload)
@@ -133,17 +165,38 @@ pub fn decrypt(encrypted_json: &str, key: &[u8], aad: &[u8]) -> EncryptionResult
     let mut ciphertext_with_tag = ciphertext;
     ciphertext_with_tag.extend_from_slice(&auth_tag);
 
+    // Rebuild the associated data the same way the writer did. For v2+ that
+    // means re-deriving it from the stored version and flags; if an attacker
+    // flipped `d`/`c`/`v`, the reconstructed AAD no longer matches the tag and
+    // authentication fails here. Legacy values (v1 / pre-versioned) bound only
+    // the caller AAD, so we use it unchanged.
+    let version = encrypted.h.v.unwrap_or(0);
+    let auth_data = if version >= HEADER_AUTH_MIN_VERSION {
+        header_aad(
+            version,
+            encrypted.is_deterministic(),
+            encrypted.is_compressed(),
+            aad,
+        )
+    } else {
+        aad.to_vec()
+    };
+
     let payload = aes_gcm::aead::Payload {
         msg: ciphertext_with_tag.as_ref(),
-        aad,
+        aad: &auth_data,
     };
     let plaintext_bytes = cipher
         .decrypt(&nonce, payload)
         .map_err(|e| EncryptionError::DecryptionFailed(e.to_string()))?;
 
     let bytes = if encrypted.is_compressed() {
+        // No pre-sized capacity: `len * 2` could overflow usize on a large
+        // payload, and the decompressed size is unknown anyway. The
+        // compressed bytes are AES-GCM-authenticated, so only a key holder
+        // could craft a value that reaches this point.
         let mut decoder = ZlibDecoder::new(plaintext_bytes.as_slice());
-        let mut out = Vec::with_capacity(plaintext_bytes.len() * 2);
+        let mut out = Vec::new();
         decoder
             .read_to_end(&mut out)
             .map_err(|e| EncryptionError::DecryptionFailed(format!("decompression: {e}")))?;
@@ -191,9 +244,12 @@ pub fn encrypt_compressed(
         Aes256Gcm::new_from_slice(key).map_err(|e| EncryptionError::InvalidKey(e.to_string()))?;
     let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
 
+    // Authenticate the compressed flag we are about to set, so it can't be
+    // cleared in storage to make `decrypt` skip inflation and return garbage.
+    let aad = header_aad(CURRENT_ENVELOPE_VERSION, false, true, aad);
     let payload = aes_gcm::aead::Payload {
         msg: compressed.as_slice(),
-        aad,
+        aad: &aad,
     };
     let ciphertext_with_tag = cipher
         .encrypt(&nonce, payload)
@@ -208,9 +264,9 @@ pub fn encrypt_compressed(
 /// Encrypt plaintext deterministically using AES-256-GCM with an
 /// HMAC-SHA256-derived IV.
 ///
-/// Produces the same ciphertext for identical `(key, plaintext)` inputs,
+/// Produces the same ciphertext for identical `(key, aad, plaintext)` inputs,
 /// enabling equality queries on encrypted columns. The IV is
-/// `HMAC-SHA256(key, plaintext)[..12]`.
+/// `HMAC-SHA256(key, len(aad) || aad || plaintext)[..12]`.
 ///
 /// # Arguments
 /// * `plaintext` - The data to encrypt
@@ -241,6 +297,12 @@ pub fn encrypt_deterministic(
     // identical plaintexts.
     let mut mac = <HmacSha256 as Mac>::new_from_slice(key)
         .map_err(|e| EncryptionError::EncryptionFailed(e.to_string()))?;
+    // Length-prefix the AAD before the plaintext so that (aad, plaintext)
+    // pairs whose concatenations would otherwise be equal — e.g.
+    // ("users", ":x") vs ("users:", "x") — cannot derive the same IV. Without
+    // the prefix the boundary is ambiguous; with it the HMAC input is an
+    // unambiguous encoding of the pair.
+    mac.update(&(aad.len() as u64).to_be_bytes());
     mac.update(aad);
     mac.update(plaintext.as_bytes());
     let tag = mac.finalize().into_bytes();
@@ -250,9 +312,14 @@ pub fn encrypt_deterministic(
         .map_err(|_| EncryptionError::EncryptionFailed("invalid derived IV size".to_string()))?;
     let nonce = Nonce::from(iv_bytes);
 
+    // The IV derivation above intentionally uses the raw caller AAD so the
+    // ciphertext stays stable and queryable. The GCM auth data additionally
+    // binds the version and the deterministic flag; this does not affect the
+    // IV, so determinism (and cross-process query matching) is preserved.
+    let aad = header_aad(CURRENT_ENVELOPE_VERSION, true, false, aad);
     let payload = aes_gcm::aead::Payload {
         msg: plaintext.as_bytes(),
-        aad,
+        aad: &aad,
     };
     let ciphertext_with_tag = cipher
         .encrypt(&nonce, payload)
@@ -285,19 +352,29 @@ fn validate_key(key: &[u8]) -> EncryptionResult<()> {
 /// Returns an error if the hex string is invalid or wrong length
 pub fn parse_hex_key(hex: &str) -> EncryptionResult<Vec<u8>> {
     let hex = hex.trim();
-    if hex.len() != KEY_SIZE * 2 {
+    // Operate on bytes: a hex key is ASCII by definition, and slicing a `str`
+    // on byte offsets (below) would panic on a multibyte char straddling an
+    // even offset. Reject non-ASCII up front so a stray Unicode character
+    // yields a clean error instead of a panic.
+    let bytes = hex.as_bytes();
+    if bytes.len() != KEY_SIZE * 2 {
         return Err(EncryptionError::InvalidKey(format!(
             "hex key must be {} characters (for {} bytes), got {}",
             KEY_SIZE * 2,
             KEY_SIZE,
-            hex.len()
+            bytes.len()
         )));
     }
 
-    (0..hex.len())
-        .step_by(2)
-        .map(|i| {
-            u8::from_str_radix(&hex[i..i + 2], 16)
+    bytes
+        .chunks_exact(2)
+        .map(|pair| {
+            // `pair` is two ASCII-or-not bytes; from_str_radix on the &str view
+            // is safe because chunks_exact never splits — but we must confirm
+            // the pair is valid UTF-8/ASCII first.
+            let s = std::str::from_utf8(pair)
+                .map_err(|_| EncryptionError::InvalidKey("invalid hex: non-ASCII".to_string()))?;
+            u8::from_str_radix(s, 16)
                 .map_err(|e| EncryptionError::InvalidKey(format!("invalid hex: {e}")))
         })
         .collect()
@@ -407,6 +484,17 @@ mod tests {
     fn test_parse_hex_key_invalid_chars() {
         let invalid = "zz0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
         assert!(parse_hex_key(invalid).is_err());
+    }
+
+    #[test]
+    fn test_parse_hex_key_non_ascii_does_not_panic() {
+        // 61 ASCII chars + one 3-byte char = 64 bytes, so the byte-length gate
+        // passes but a naive str byte-slice would split the multibyte char.
+        // Must return an error, not panic.
+        let mut s = "a".repeat(61);
+        s.push('\u{20AC}'); // '€' is 3 bytes -> total 64 bytes
+        assert_eq!(s.len(), 64);
+        assert!(parse_hex_key(&s).is_err());
     }
 
     #[test]
@@ -569,6 +657,92 @@ mod tests {
 
         assert_eq!(decrypt(&a, &key, b"users:email").unwrap(), plaintext);
         assert!(decrypt(&a, &key, b"users:other").is_err());
+    }
+
+    #[test]
+    fn test_v2_envelope_is_current_version() {
+        let key = test_key();
+        let env = encrypt("hello", &key, None, b"").unwrap();
+        let parsed = EncryptedValue::from_json(&env).unwrap();
+        assert_eq!(parsed.h.v, Some(CURRENT_ENVELOPE_VERSION));
+        assert!(CURRENT_ENVELOPE_VERSION >= HEADER_AUTH_MIN_VERSION);
+    }
+
+    #[test]
+    fn test_tampered_compressed_flag_fails_authentication() {
+        let key = test_key();
+
+        // Flip `c` from set to unset on a genuinely compressed value.
+        let plaintext: String = "loco-".repeat(64);
+        let compressed = encrypt_compressed(&plaintext, &key, None, b"").unwrap();
+        let mut parsed = EncryptedValue::from_json(&compressed).unwrap();
+        assert!(parsed.is_compressed());
+        parsed.h.c = None;
+        assert!(
+            decrypt(&parsed.to_json().unwrap(), &key, b"").is_err(),
+            "clearing the compressed flag must fail authentication, not silently skip inflation"
+        );
+
+        // Flip `c` from unset to set on a non-compressed value.
+        let plain = encrypt("short", &key, None, b"").unwrap();
+        let mut parsed = EncryptedValue::from_json(&plain).unwrap();
+        parsed.h.c = Some(true);
+        assert!(
+            decrypt(&parsed.to_json().unwrap(), &key, b"").is_err(),
+            "setting the compressed flag must fail authentication"
+        );
+    }
+
+    #[test]
+    fn test_tampered_deterministic_flag_fails_authentication() {
+        let key = test_key();
+        let plain = encrypt("secret", &key, None, b"").unwrap();
+        let mut parsed = EncryptedValue::from_json(&plain).unwrap();
+        parsed.h.d = Some(true);
+        assert!(
+            decrypt(&parsed.to_json().unwrap(), &key, b"").is_err(),
+            "flipping the deterministic flag must fail authentication"
+        );
+    }
+
+    #[test]
+    fn test_tampered_version_fails_authentication() {
+        let key = test_key();
+        let env = encrypt("secret", &key, None, b"").unwrap();
+        let mut parsed = EncryptedValue::from_json(&env).unwrap();
+        // Downgrade v2 -> v1: the reader would switch to the legacy
+        // user-AAD-only path, which no longer matches the v2 tag.
+        parsed.h.v = Some(1);
+        assert!(
+            decrypt(&parsed.to_json().unwrap(), &key, b"").is_err(),
+            "downgrading the envelope version must fail authentication"
+        );
+    }
+
+    #[test]
+    fn test_legacy_v1_envelope_decrypts_with_user_aad_only() {
+        // A pre-header-auth (v1) value: the tag was computed over the caller
+        // AAD only. The reader must fall back to that path for v < 2 so
+        // existing data written by older builds keeps decrypting.
+        use aes_gcm::aead::Aead;
+        let key = test_key();
+        let cipher = Aes256Gcm::new_from_slice(&key).unwrap();
+        let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
+        let ct_with_tag = cipher
+            .encrypt(
+                &nonce,
+                aes_gcm::aead::Payload {
+                    msg: b"legacy value",
+                    aad: b"",
+                },
+            )
+            .unwrap();
+        let (ct, tag) = ct_with_tag.split_at(ct_with_tag.len() - TAG_SIZE);
+        let mut env = EncryptedValue::new(ct, nonce.as_slice(), tag, None);
+        env.h.v = Some(1); // mark legacy; v < HEADER_AUTH_MIN_VERSION
+        let json = env.to_json().unwrap();
+
+        assert_eq!(decrypt(&json, &key, b"").unwrap(), "legacy value");
     }
 
     #[test]

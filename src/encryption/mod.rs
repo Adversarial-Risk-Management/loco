@@ -9,18 +9,35 @@
 //! - **Automatic encryption on save**: Fields are automatically encrypted using
 //!   `ActiveModelBehavior::before_save`
 //! - **Explicit decryption on read**: Manual decryption call required (Rust idiom)
-//! - **Rails-compatible format**: Uses the Rails `ActiveRecord` Encryption JSON format
-//! - **AEAD security**: Uses AES-256-GCM for authenticated encryption
+//! - **Rails-style envelope**: Uses the same JSON envelope *shape* as Rails
+//!   `ActiveRecord` Encryption (`{"p":…,"h":{"iv":…,"at":…}}`). See the
+//!   compatibility note below — the shape matches but values are not
+//!   wire-compatible across the two stacks.
+//! - **AEAD security**: Uses AES-256-GCM for authenticated encryption, with the
+//!   envelope headers folded into the authenticated data (envelope `v >= 2`)
 //! - **Flexible key management**: Trait-based key provider system
 //! - **Key rotation support**: Configure previous keys for seamless rotation
+//!   (non-deterministic fields only; see the deterministic-key caveat in
+//!   [`config::EncryptionConfig`])
 //! - **Non-deterministic encryption**: Same plaintext produces different ciphertext
 //!
 //! # Differences from Rails `ActiveRecord` Encryption
 //!
-//! - **Encryption**: Automatic (same as Rails) - happens in `before_save` hook
 //! - **Decryption**: **Explicit** (unlike Rails) - requires calling `decrypt_fields()`
 //!   - Rails: `user.ssn` automatically decrypts
 //!   - Loco: `user.ssn` returns encrypted JSON; must call `user.decrypt_fields()` first
+//! - **Wire compatibility**: the envelope *shape* matches Rails, but values do
+//!   not interoperate. The deterministic-IV PRF length-prefixes its input, the
+//!   `i` key-id uses semantic labels (`"primary"`) rather than Rails' key
+//!   fingerprint, and per-field keys are derived with HKDF-SHA256 rather than
+//!   Rails' PBKDF2. Do not plan a cross-stack migration on the shared shape.
+//! - **Compression**: opt-in per field here (see
+//!   [`Encryptable::compressed_fields`](encryptable::Encryptable::compressed_fields)),
+//!   whereas Rails compresses by default. The opt-in default avoids
+//!   CRIME/BREACH-style length leakage on attacker-influenced plaintext unless
+//!   you explicitly accept it.
+//! - **Deterministic key rotation**: unsupported, as in Rails (see
+//!   [`config::EncryptionConfig::deterministic_key`]).
 //!
 //! # Quick Start
 //!
@@ -75,7 +92,7 @@
 //!   "h": {
 //!     "iv": "base64-encoded-iv",
 //!     "at": "base64-encoded-auth-tag",
-//!     "v": 1,
+//!     "v": 2,
 //!     "i": "optional-key-id"
 //!   }
 //! }
