@@ -33,12 +33,43 @@ use crate::{
 /// Paths use [RFC 6901](https://tools.ietf.org/html/rfc6901) JSON pointer
 /// syntax (e.g. `"/user_id"`, `"/org/id"`). Only scalar filter values (string,
 /// number, bool, null) are supported.
+///
+/// A filter matches a job when `value` is found at **any** of `paths` (OR). A
+/// single-path filter is the common case ([`JobDataFilter::new`]); [`any_of`]
+/// matches one value against several alternative paths — useful when the same
+/// logical field lives under different keys across payload shapes.
+///
+/// [`any_of`]: JobDataFilter::any_of
+///
+/// # Security
+///
+/// `paths` are interpolated into SQL (only quote-escaped, not parameterized),
+/// so they must be server-controlled constants — never caller-supplied free
+/// text. The `value` is always bound as a parameter.
 #[derive(Clone, Debug)]
 pub struct JobDataFilter {
-    /// RFC 6901 JSON pointer path, e.g. `"/user_id"` or `"/org/id"`
-    pub path: String,
+    /// One or more RFC 6901 JSON pointer paths; the filter matches if `value`
+    /// is found at any of them.
+    pub paths: Vec<String>,
     /// Scalar value to match
     pub value: serde_json::Value,
+}
+
+impl JobDataFilter {
+    /// Builds a filter matching `value` at a single JSON pointer `path`.
+    #[must_use]
+    pub fn new(path: impl Into<String>, value: serde_json::Value) -> Self {
+        Self {
+            paths: vec![path.into()],
+            value,
+        }
+    }
+
+    /// Builds a filter matching `value` at **any** of `paths` (OR semantics).
+    #[must_use]
+    pub fn any_of(paths: Vec<String>, value: serde_json::Value) -> Self {
+        Self { paths, value }
+    }
 }
 
 /// A composable filter for querying jobs across all dimensions at once.
@@ -48,26 +79,39 @@ pub struct JobDataFilter {
 #[derive(Clone, Debug, Default)]
 pub struct JobFilter {
     pub status: Option<Vec<JobStatus>>,
+    /// Only jobs created at least N days ago (`created_at <= now - N days`).
+    /// Intended for dump/cleanup. Combine with `created_within_days` for a
+    /// bounded window; they are independent filters.
     pub age_days: Option<i64>,
-    pub name: Option<String>,
+    /// Only jobs created within the last N days (`created_at >= now - N days`).
+    pub created_within_days: Option<i64>,
+    /// Match any of these worker names (OR).
+    pub names: Option<Vec<String>>,
     pub data: Option<Vec<JobDataFilter>>,
+    /// Maximum rows to return. `None` means unbounded.
+    pub limit: Option<u64>,
+    /// Rows to skip before returning. `None` means no offset.
+    pub offset: Option<u64>,
 }
 
 /// Validates that a [`JobDataFilter`] has a well-formed RFC 6901 path and a
 /// scalar value.
 fn validate_filter(filter: &JobDataFilter) -> Result<()> {
-    if !filter.path.starts_with('/') {
-        return Err(Error::string(&format!(
-            "JSON pointer path must start with '/': {}",
-            filter.path
-        )));
+    if filter.paths.is_empty() {
+        return Err(Error::string("JobDataFilter requires at least one path"));
     }
-    for segment in filter.path[1..].split('/') {
-        if segment.is_empty() {
+    for path in &filter.paths {
+        if !path.starts_with('/') {
             return Err(Error::string(&format!(
-                "JSON pointer path contains empty segment: {}",
-                filter.path
+                "JSON pointer path must start with '/': {path}"
             )));
+        }
+        for segment in path[1..].split('/') {
+            if segment.is_empty() {
+                return Err(Error::string(&format!(
+                    "JSON pointer path contains empty segment: {path}"
+                )));
+            }
         }
     }
     if filter.value.is_object() || filter.value.is_array() {
@@ -148,6 +192,13 @@ pub struct Job {
     pub created_at: Option<DateTime<Utc>>,
     pub updated_at: Option<DateTime<Utc>>,
     pub tags: Option<Vec<String>>,
+}
+
+/// A page of jobs plus the total count matching the filter across all pages.
+#[derive(Clone, Debug)]
+pub struct JobPage {
+    pub jobs: Vec<Job>,
+    pub total: u64,
 }
 
 // Queue struct now holds both a QueueProvider and QueueRegistrar
@@ -623,6 +674,72 @@ impl Queue {
                 Err(Error::string("provider not configured"))
             }
         }
+    }
+
+    /// Retrieves a page of jobs matching a [`JobFilter`] along with the total
+    /// count matching the filter (ignoring `limit`/`offset`).
+    ///
+    /// Jobs are ordered by `created_at DESC, id DESC` and sliced by the
+    /// filter's `limit`/`offset`. `total` reflects every row matching the
+    /// predicate, so callers can paginate without a second query.
+    ///
+    /// # Errors
+    /// - If no queue provider is configured.
+    /// - If any data filter has an invalid path or non-scalar value.
+    /// - If the underlying provider query fails.
+    pub async fn query_jobs_page(&self, filter: &JobFilter) -> Result<JobPage> {
+        if let Some(data_filters) = &filter.data {
+            for f in data_filters {
+                validate_filter(f)?;
+            }
+        }
+
+        match self {
+            #[cfg(feature = "bg_pg")]
+            Self::Postgres(pool, _, _, _) => {
+                Ok(pg::query_jobs_page(pool, filter).await.map_err(Box::from)?)
+            }
+            #[cfg(feature = "bg_sqlt")]
+            Self::Sqlite(pool, _, _, _) => Ok(sqlt::query_jobs_page(pool, filter).await?),
+            #[cfg(feature = "bg_redis")]
+            Self::Redis(pool, _, _, _) => Ok(redis::query_jobs_page(pool, filter).await?),
+            Self::None => {
+                tracing::error!(
+                    "No queue provider is configured: compile with at least one queue provider \
+                     feature"
+                );
+                Err(Error::string("provider not configured"))
+            }
+        }
+    }
+
+    /// Inserts a job row verbatim, preserving its id, status, and timestamps.
+    ///
+    /// Unlike [`enqueue`](Self::enqueue) (which always creates a fresh `queued`
+    /// job), this writes the [`Job`] exactly as given — used to restore or seed
+    /// jobs in any lifecycle state. The id is not deduplicated.
+    ///
+    /// # Errors
+    /// - If no queue provider is configured.
+    /// - If the underlying provider insert fails.
+    pub async fn insert_job(&self, job: &Job) -> Result<()> {
+        tracing::debug!(job_id = %job.id, job_name = %job.name, "Inserting job verbatim");
+        match self {
+            #[cfg(feature = "bg_pg")]
+            Self::Postgres(pool, _, _, _) => pg::insert_job(pool, job).await.map_err(Box::from)?,
+            #[cfg(feature = "bg_sqlt")]
+            Self::Sqlite(pool, _, _, _) => sqlt::insert_job(pool, job).await?,
+            #[cfg(feature = "bg_redis")]
+            Self::Redis(pool, _, _, _) => redis::insert_job(pool, job).await?,
+            Self::None => {
+                tracing::error!(
+                    "No queue provider is configured: compile with at least one queue provider \
+                     feature"
+                );
+                return Err(Error::string("provider not configured"));
+            }
+        }
+        Ok(())
     }
 
     /// Cancels a specific job by its ID.
@@ -1302,31 +1419,19 @@ mod tests {
     #[test]
     fn validate_filter_rejects_bad_paths() {
         // Path not starting with /
-        let f = JobDataFilter {
-            path: "org/id".to_string(),
-            value: serde_json::json!("x"),
-        };
+        let f = JobDataFilter::new("org/id".to_string(), serde_json::json!("x"));
         assert!(validate_filter(&f).is_err());
 
         // Empty segment
-        let f = JobDataFilter {
-            path: "/a//b".to_string(),
-            value: serde_json::json!("x"),
-        };
+        let f = JobDataFilter::new("/a//b".to_string(), serde_json::json!("x"));
         assert!(validate_filter(&f).is_err());
 
         // Object value
-        let f = JobDataFilter {
-            path: "/a".to_string(),
-            value: serde_json::json!({"nested": true}),
-        };
+        let f = JobDataFilter::new("/a".to_string(), serde_json::json!({"nested": true}));
         assert!(validate_filter(&f).is_err());
 
         // Array value
-        let f = JobDataFilter {
-            path: "/a".to_string(),
-            value: serde_json::json!([1, 2]),
-        };
+        let f = JobDataFilter::new("/a".to_string(), serde_json::json!([1, 2]));
         assert!(validate_filter(&f).is_err());
     }
 
@@ -1338,10 +1443,7 @@ mod tests {
             serde_json::json!(true),
             serde_json::Value::Null,
         ] {
-            let f = JobDataFilter {
-                path: "/a/b".to_string(),
-                value: val,
-            };
+            let f = JobDataFilter::new("/a/b".to_string(), val);
             assert!(validate_filter(&f).is_ok());
         }
     }
@@ -1365,10 +1467,10 @@ mod tests {
         tests_cfg::queue::sqlite_seed_data(&pool).await;
 
         // Filter by user_id = 133 (should match job 01JDM0X8EVAM823JZBGKYNBA99)
-        let filters = vec![JobDataFilter {
-            path: "/user_id".to_string(),
-            value: serde_json::json!(133),
-        }];
+        let filters = vec![JobDataFilter::new(
+            "/user_id".to_string(),
+            serde_json::json!(133),
+        )];
         let jobs = queue
             .get_jobs_by_data(&filters, None, None)
             .await
@@ -1377,10 +1479,10 @@ mod tests {
         assert_eq!(jobs[0].id, "01JDM0X8EVAM823JZBGKYNBA99");
 
         // Filter by email = "user24@example.com" (should match job 01JDM0X8EVAM823JZBGKYNBA87)
-        let filters = vec![JobDataFilter {
-            path: "/email".to_string(),
-            value: serde_json::json!("user24@example.com"),
-        }];
+        let filters = vec![JobDataFilter::new(
+            "/email".to_string(),
+            serde_json::json!("user24@example.com"),
+        )];
         let jobs = queue
             .get_jobs_by_data(&filters, None, None)
             .await
@@ -1389,10 +1491,10 @@ mod tests {
         assert_eq!(jobs[0].id, "01JDM0X8EVAM823JZBGKYNBA87");
 
         // Filter with status constraint
-        let filters = vec![JobDataFilter {
-            path: "/email".to_string(),
-            value: serde_json::json!("user11@example.com"),
-        }];
+        let filters = vec![JobDataFilter::new(
+            "/email".to_string(),
+            serde_json::json!("user11@example.com"),
+        )];
         let jobs = queue
             .get_jobs_by_data(&filters, Some(&vec![JobStatus::Completed]), None)
             .await
@@ -1401,14 +1503,11 @@ mod tests {
 
         // Multiple filters (AND): user_id=133 AND email=user11@example.com
         let filters = vec![
-            JobDataFilter {
-                path: "/user_id".to_string(),
-                value: serde_json::json!(133),
-            },
-            JobDataFilter {
-                path: "/email".to_string(),
-                value: serde_json::json!("user11@example.com"),
-            },
+            JobDataFilter::new("/user_id".to_string(), serde_json::json!(133)),
+            JobDataFilter::new(
+                "/email".to_string(),
+                serde_json::json!("user11@example.com"),
+            ),
         ];
         let jobs = queue
             .get_jobs_by_data(&filters, None, None)
@@ -1418,14 +1517,11 @@ mod tests {
 
         // Multiple filters (AND) that don't both match same job
         let filters = vec![
-            JobDataFilter {
-                path: "/user_id".to_string(),
-                value: serde_json::json!(133),
-            },
-            JobDataFilter {
-                path: "/email".to_string(),
-                value: serde_json::json!("user24@example.com"),
-            },
+            JobDataFilter::new("/user_id".to_string(), serde_json::json!(133)),
+            JobDataFilter::new(
+                "/email".to_string(),
+                serde_json::json!("user24@example.com"),
+            ),
         ];
         let jobs = queue
             .get_jobs_by_data(&filters, None, None)
@@ -1434,10 +1530,10 @@ mod tests {
         assert_eq!(jobs.len(), 0);
 
         // Path doesn't exist in any job → returns empty
-        let filters = vec![JobDataFilter {
-            path: "/nonexistent/path".to_string(),
-            value: serde_json::json!("anything"),
-        }];
+        let filters = vec![JobDataFilter::new(
+            "/nonexistent/path".to_string(),
+            serde_json::json!("anything"),
+        )];
         let jobs = queue
             .get_jobs_by_data(&filters, None, None)
             .await
@@ -1465,11 +1561,11 @@ mod tests {
 
         // Combine name + data + status filters
         let filter = JobFilter {
-            name: Some("UserAccountActivation".to_string()),
-            data: Some(vec![JobDataFilter {
-                path: "/user_id".to_string(),
-                value: serde_json::json!(133),
-            }]),
+            names: Some(vec!["UserAccountActivation".to_string()]),
+            data: Some(vec![JobDataFilter::new(
+                "/user_id".to_string(),
+                serde_json::json!(133),
+            )]),
             status: Some(vec![JobStatus::Queued]),
             ..Default::default()
         };
@@ -1479,11 +1575,11 @@ mod tests {
 
         // Same name + data but wrong status → empty
         let filter = JobFilter {
-            name: Some("UserAccountActivation".to_string()),
-            data: Some(vec![JobDataFilter {
-                path: "/user_id".to_string(),
-                value: serde_json::json!(133),
-            }]),
+            names: Some(vec!["UserAccountActivation".to_string()]),
+            data: Some(vec![JobDataFilter::new(
+                "/user_id".to_string(),
+                serde_json::json!(133),
+            )]),
             status: Some(vec![JobStatus::Completed]),
             ..Default::default()
         };
@@ -1494,5 +1590,208 @@ mod tests {
         let filter = JobFilter::default();
         let jobs = queue.query_jobs(&filter).await.expect("query_jobs");
         assert_eq!(jobs.len(), 14);
+    }
+
+    /// Sets up a fresh sqlite queue seeded with the 14-job fixture.
+    async fn seeded_sqlite_queue(root: &Path) -> Queue {
+        let qcfg = sqlite_config(root);
+        let queue = sqlt::create_provider(&qcfg)
+            .await
+            .expect("create sqlite queue");
+        let pool = sqlx::SqlitePool::connect(&qcfg.uri)
+            .await
+            .expect("connect to sqlite db");
+        queue.setup().await.expect("setup sqlite db");
+        tests_cfg::queue::sqlite_seed_data(&pool).await;
+        queue
+    }
+
+    #[tokio::test]
+    async fn queue_query_jobs_data_any_of_or() {
+        let tree_fs = tree_fs::TreeBuilder::default()
+            .drop(true)
+            .create()
+            .expect("create temp folder");
+        let queue = seeded_sqlite_queue(tree_fs.root.as_path()).await;
+
+        // `user_id: 133` lives under `/user_id`; matching it at ANY of several
+        // candidate paths (only one of which exists) must still find the job.
+        let filter = JobFilter {
+            data: Some(vec![JobDataFilter::any_of(
+                vec!["/missing".to_string(), "/user_id".to_string()],
+                serde_json::json!(133),
+            )]),
+            ..Default::default()
+        };
+        let jobs = queue.query_jobs(&filter).await.expect("query_jobs");
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].id, "01JDM0X8EVAM823JZBGKYNBA99");
+
+        // Value present at none of the paths → no match.
+        let filter = JobFilter {
+            data: Some(vec![JobDataFilter::any_of(
+                vec!["/missing".to_string(), "/also_missing".to_string()],
+                serde_json::json!(133),
+            )]),
+            ..Default::default()
+        };
+        let jobs = queue.query_jobs(&filter).await.expect("query_jobs");
+        assert_eq!(jobs.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn queue_query_jobs_multi_name() {
+        let tree_fs = tree_fs::TreeBuilder::default()
+            .drop(true)
+            .create()
+            .expect("create temp folder");
+        let queue = seeded_sqlite_queue(tree_fs.root.as_path()).await;
+
+        // UserAccountActivation (2) + SendInvoice (2) = 4 jobs.
+        let filter = JobFilter {
+            names: Some(vec![
+                "UserAccountActivation".to_string(),
+                "SendInvoice".to_string(),
+            ]),
+            ..Default::default()
+        };
+        let jobs = queue.query_jobs(&filter).await.expect("query_jobs");
+        assert_eq!(jobs.len(), 4);
+        assert!(jobs
+            .iter()
+            .all(|j| j.name == "UserAccountActivation" || j.name == "SendInvoice"));
+    }
+
+    #[tokio::test]
+    async fn queue_created_within_days_is_opposite_of_age_days() {
+        let tree_fs = tree_fs::TreeBuilder::default()
+            .drop(true)
+            .create()
+            .expect("create temp folder");
+        let queue = seeded_sqlite_queue(tree_fs.root.as_path()).await;
+
+        // Fixture jobs are well over a year old. `created_within_days` keeps
+        // only recent jobs → none; `age_days` keeps only old jobs → all. The
+        // two filters must point in opposite directions.
+        let recent = JobFilter {
+            created_within_days: Some(30),
+            ..Default::default()
+        };
+        assert_eq!(
+            queue.query_jobs(&recent).await.expect("query_jobs").len(),
+            0
+        );
+
+        let old = JobFilter {
+            age_days: Some(1),
+            ..Default::default()
+        };
+        assert_eq!(queue.query_jobs(&old).await.expect("query_jobs").len(), 14);
+    }
+
+    #[tokio::test]
+    async fn queue_query_jobs_page_orders_and_paginates() {
+        let tree_fs = tree_fs::TreeBuilder::default()
+            .drop(true)
+            .create()
+            .expect("create temp folder");
+        let queue = seeded_sqlite_queue(tree_fs.root.as_path()).await;
+
+        // All fixture rows share created_at, so ordering is purely id DESC.
+        let page = queue
+            .query_jobs_page(&JobFilter {
+                limit: Some(5),
+                offset: Some(0),
+                ..Default::default()
+            })
+            .await
+            .expect("query_jobs_page");
+        assert_eq!(page.total, 14, "total ignores limit/offset");
+        assert_eq!(page.jobs.len(), 5);
+        assert_eq!(page.jobs[0].id, "01JDM0X8EVAM823JZBGKYNBA99");
+        assert_eq!(page.jobs[4].id, "01JDM0X8EVAM823JZBGKYNBA95");
+
+        // Second page continues the descending order.
+        let page2 = queue
+            .query_jobs_page(&JobFilter {
+                limit: Some(5),
+                offset: Some(5),
+                ..Default::default()
+            })
+            .await
+            .expect("query_jobs_page");
+        assert_eq!(page2.total, 14);
+        assert_eq!(page2.jobs.len(), 5);
+        assert_eq!(page2.jobs[0].id, "01JDM0X8EVAM823JZBGKYNBA94");
+
+        // Last partial page.
+        let page3 = queue
+            .query_jobs_page(&JobFilter {
+                limit: Some(5),
+                offset: Some(12),
+                ..Default::default()
+            })
+            .await
+            .expect("query_jobs_page");
+        assert_eq!(page3.total, 14);
+        assert_eq!(page3.jobs.len(), 2);
+
+        // Offset past the end returns no rows but still the real total.
+        let empty = queue
+            .query_jobs_page(&JobFilter {
+                limit: Some(5),
+                offset: Some(100),
+                ..Default::default()
+            })
+            .await
+            .expect("query_jobs_page");
+        assert_eq!(empty.total, 14);
+        assert!(empty.jobs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn queue_insert_job_preserves_status_and_timestamps() {
+        let tree_fs = tree_fs::TreeBuilder::default()
+            .drop(true)
+            .create()
+            .expect("create temp folder");
+        let qcfg = sqlite_config(tree_fs.root.as_path());
+        let queue = sqlt::create_provider(&qcfg)
+            .await
+            .expect("create sqlite queue");
+        queue.setup().await.expect("setup sqlite db");
+
+        let created = DateTime::parse_from_rfc3339("2025-03-04T05:06:07Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let updated = DateTime::parse_from_rfc3339("2025-03-04T05:09:10Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let job = Job {
+            id: "01JTESTINSERTJOB00000000001".to_string(),
+            name: "InsertTest".to_string(),
+            data: serde_json::json!({"organization": {"id": "org-123"}, "k": "v"}),
+            status: JobStatus::Completed,
+            run_at: created,
+            interval: None,
+            created_at: Some(created),
+            updated_at: Some(updated),
+            tags: None,
+        };
+
+        // Unlike enqueue, insert_job must write status/timestamps verbatim.
+        queue.insert_job(&job).await.expect("insert_job");
+
+        let got = queue
+            .get_job(&job.id)
+            .await
+            .expect("get_job")
+            .expect("job present");
+        assert_eq!(got.id, job.id);
+        assert_eq!(got.name, job.name);
+        assert_eq!(got.status, JobStatus::Completed);
+        assert_eq!(got.data, job.data);
+        assert_eq!(got.created_at, Some(created));
+        assert_eq!(got.updated_at, Some(updated));
     }
 }

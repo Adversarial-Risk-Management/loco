@@ -662,20 +662,38 @@ fn append_pg_json_filter(
     param_idx: &mut i32,
     bind_values: &mut Vec<String>,
 ) -> Result<()> {
-    let pg_path = pointer_to_pg_path(&filter.path)?;
+    // Match `value` at ANY of the paths (OR). A string value is bound once and
+    // the single `$N` is reused across every path; numeric/bool/null inline per
+    // path. `param_idx` therefore advances at most once per filter, not per path.
+    let mut clauses: Vec<String> = Vec::with_capacity(filter.paths.len());
     if filter.value.is_null() {
-        let _ = write!(
-            query,
-            " AND (task_data #> {pg_path} IS NULL OR task_data #> {pg_path} = 'null'::jsonb)"
-        );
+        for path in &filter.paths {
+            let pg_path = pointer_to_pg_path(path)?;
+            clauses.push(format!(
+                "(task_data #> {pg_path} IS NULL OR task_data #> {pg_path} = 'null'::jsonb)"
+            ));
+        }
     } else if let Some(s) = filter.value.as_str() {
         *param_idx += 1;
-        let _ = write!(query, " AND task_data #>> {pg_path} = ${}", *param_idx);
+        let idx = *param_idx;
+        for path in &filter.paths {
+            let pg_path = pointer_to_pg_path(path)?;
+            clauses.push(format!("task_data #>> {pg_path} = ${idx}"));
+        }
         bind_values.push(s.to_string());
     } else if let Some(n) = filter.value.as_f64() {
-        let _ = write!(query, " AND (task_data #>> {pg_path})::numeric = {n}");
+        for path in &filter.paths {
+            let pg_path = pointer_to_pg_path(path)?;
+            clauses.push(format!("(task_data #>> {pg_path})::numeric = {n}"));
+        }
     } else if let Some(b) = filter.value.as_bool() {
-        let _ = write!(query, " AND (task_data #>> {pg_path})::boolean = {b}");
+        for path in &filter.paths {
+            let pg_path = pointer_to_pg_path(path)?;
+            clauses.push(format!("(task_data #>> {pg_path})::boolean = {b}"));
+        }
+    }
+    if !clauses.is_empty() {
+        let _ = write!(query, " AND ({})", clauses.join(" OR "));
     }
     Ok(())
 }
@@ -734,20 +752,46 @@ pub async fn get_jobs_by_data(
 ///
 /// This function will return an error if the database query fails.
 pub async fn query_jobs(pool: &PgPool, filter: &super::JobFilter) -> Result<Vec<Job>, sqlx::Error> {
-    let mut query = String::from("SELECT * FROM pg_loco_queue WHERE true");
+    let (where_clause, bind_values) =
+        build_pg_filter_where(filter).map_err(|e| sqlx::Error::Protocol(e.to_string()))?;
+    let query =
+        format!("SELECT * FROM pg_loco_queue{where_clause} ORDER BY created_at DESC, id DESC");
+
+    let mut q = sqlx::query(&query);
+    for val in &bind_values {
+        q = q.bind(val.clone());
+    }
+    let rows = q.fetch_all(pool).await?;
+    let jobs = rows.iter().filter_map(|row| to_job(row).ok()).collect();
+    Ok(jobs)
+}
+
+/// Builds the ` WHERE …` fragment (starting with ` WHERE true`) shared by
+/// `query_jobs`, `query_jobs_page`, and the page's count query, plus the ordered
+/// string bind values to apply. A single builder guarantees the page and its
+/// total use an identical predicate, so they can't drift.
+fn build_pg_filter_where(filter: &super::JobFilter) -> Result<(String, Vec<String>)> {
+    let mut query = String::from(" WHERE true");
     let mut param_idx = 0i32;
     let mut bind_values: Vec<String> = Vec::new();
 
-    if let Some(name) = &filter.name {
-        param_idx += 1;
-        let _ = write!(query, " AND name = ${param_idx}");
-        bind_values.push(name.clone());
+    if let Some(names) = &filter.names {
+        if !names.is_empty() {
+            let placeholders: Vec<String> = names
+                .iter()
+                .map(|n| {
+                    param_idx += 1;
+                    bind_values.push(n.clone());
+                    format!("${param_idx}")
+                })
+                .collect();
+            let _ = write!(query, " AND name IN ({})", placeholders.join(","));
+        }
     }
 
     if let Some(data_filters) = &filter.data {
         for f in data_filters {
-            append_pg_json_filter(&mut query, f, &mut param_idx, &mut bind_values)
-                .map_err(|e| sqlx::Error::Protocol(e.to_string()))?;
+            append_pg_json_filter(&mut query, f, &mut param_idx, &mut bind_values)?;
         }
     }
 
@@ -767,13 +811,94 @@ pub async fn query_jobs(pool: &PgPool, filter: &super::JobFilter) -> Result<Vec<
         );
     }
 
-    let mut q = sqlx::query(&query);
+    if let Some(days) = filter.created_within_days {
+        let _ = write!(
+            query,
+            " AND created_at >= NOW() - INTERVAL '1 day' * {days}"
+        );
+    }
+
+    Ok((query, bind_values))
+}
+
+/// Retrieves a page of jobs matching a [`super::JobFilter`] plus the total count
+/// matching the same predicate (ignoring `limit`/`offset`).
+///
+/// # Errors
+///
+/// This function will return an error if the database query fails.
+pub async fn query_jobs_page(
+    pool: &PgPool,
+    filter: &super::JobFilter,
+) -> Result<super::JobPage, sqlx::Error> {
+    let (where_clause, bind_values) =
+        build_pg_filter_where(filter).map_err(|e| sqlx::Error::Protocol(e.to_string()))?;
+
+    let mut page_sql =
+        format!("SELECT * FROM pg_loco_queue{where_clause} ORDER BY created_at DESC, id DESC");
+    if let Some(limit) = filter.limit {
+        let _ = write!(page_sql, " LIMIT {limit}");
+    }
+    if let Some(offset) = filter.offset {
+        let _ = write!(page_sql, " OFFSET {offset}");
+    }
+
+    let mut q = sqlx::query(&page_sql);
     for val in &bind_values {
         q = q.bind(val.clone());
     }
     let rows = q.fetch_all(pool).await?;
-    let jobs = rows.iter().filter_map(|row| to_job(row).ok()).collect();
-    Ok(jobs)
+    let jobs: Vec<Job> = rows.iter().filter_map(|row| to_job(row).ok()).collect();
+
+    // Total over the same predicate, independent of limit/offset. Counts rows
+    // `query_jobs_page` might drop on a parse failure (schema drift only); such
+    // a status is logged by `to_job`.
+    let count_sql = format!("SELECT COUNT(*) FROM pg_loco_queue{where_clause}");
+    let mut cq = sqlx::query_scalar::<_, i64>(&count_sql);
+    for val in &bind_values {
+        cq = cq.bind(val.clone());
+    }
+    let total: i64 = cq.fetch_one(pool).await?;
+
+    Ok(super::JobPage {
+        jobs,
+        total: u64::try_from(total).unwrap_or(0),
+    })
+}
+
+/// Inserts a job row verbatim, preserving its id, status, and timestamps.
+///
+/// Unlike [`enqueue`], which always creates a fresh `queued` job, this writes
+/// every column from `job` as-is. There is no primary key on `id`, so this does
+/// not upsert.
+///
+/// # Errors
+///
+/// This function will return an error if the database query fails.
+pub async fn insert_job(pool: &PgPool, job: &Job) -> Result<(), sqlx::Error> {
+    let tags_json = job
+        .tags
+        .as_ref()
+        .map(|t| serde_json::to_value(t).unwrap_or(serde_json::Value::Null));
+    let created_at = job.created_at.unwrap_or_else(chrono::Utc::now);
+    let updated_at = job.updated_at.unwrap_or_else(chrono::Utc::now);
+
+    sqlx::query(
+        "INSERT INTO pg_loco_queue (id, name, task_data, status, run_at, interval, created_at, \
+         updated_at, tags) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+    )
+    .bind(job.id.clone())
+    .bind(job.name.clone())
+    .bind(job.data.clone())
+    .bind(job.status.to_string())
+    .bind(job.run_at)
+    .bind(job.interval)
+    .bind(created_at)
+    .bind(updated_at)
+    .bind(tags_json)
+    .execute(pool)
+    .await?;
+    Ok(())
 }
 
 /// Converts a row from the database into a [`Job`] object.
@@ -858,6 +983,37 @@ mod tests {
 
     use super::*;
     use crate::tests_cfg::{self, postgres::setup_postgres_container};
+
+    // Pure SQL-builder test — no database required.
+    #[test]
+    fn append_pg_json_filter_or_reuses_single_bind() {
+        let mut query = String::new();
+        let mut param_idx = 0i32;
+        let mut binds: Vec<String> = Vec::new();
+        let filter = super::super::JobDataFilter::any_of(
+            vec![
+                "/organization/id".to_string(),
+                "/org/id".to_string(),
+                "/org_id".to_string(),
+            ],
+            serde_json::json!("org-abc"),
+        );
+
+        append_pg_json_filter(&mut query, &filter, &mut param_idx, &mut binds)
+            .expect("append filter");
+
+        assert_eq!(
+            param_idx, 1,
+            "a string value consumes exactly one bind param"
+        );
+        assert_eq!(binds, vec!["org-abc".to_string()], "value bound once");
+        assert_eq!(
+            query.matches("$1").count(),
+            3,
+            "the single $1 is reused across all three paths: {query}"
+        );
+        assert!(query.contains(" OR "), "paths are OR'd: {query}");
+    }
 
     fn reduction() -> &'static [(&'static str, &'static str)] {
         &[
@@ -1634,11 +1790,11 @@ mod tests {
 
         // Name + data + status
         let filter = super::super::JobFilter {
-            name: Some("UserAccountActivation".to_string()),
-            data: Some(vec![super::super::JobDataFilter {
-                path: "/user_id".to_string(),
-                value: serde_json::json!(133),
-            }]),
+            names: Some(vec!["UserAccountActivation".to_string()]),
+            data: Some(vec![super::super::JobDataFilter::new(
+                "/user_id".to_string(),
+                serde_json::json!(133),
+            )]),
             status: Some(vec![JobStatus::Queued]),
             ..Default::default()
         };
@@ -1648,11 +1804,11 @@ mod tests {
 
         // Wrong status → empty
         let filter = super::super::JobFilter {
-            name: Some("UserAccountActivation".to_string()),
-            data: Some(vec![super::super::JobDataFilter {
-                path: "/user_id".to_string(),
-                value: serde_json::json!(133),
-            }]),
+            names: Some(vec!["UserAccountActivation".to_string()]),
+            data: Some(vec![super::super::JobDataFilter::new(
+                "/user_id".to_string(),
+                serde_json::json!(133),
+            )]),
             status: Some(vec![JobStatus::Completed]),
             ..Default::default()
         };

@@ -749,21 +749,35 @@ fn append_sqlt_json_filter(
     filter: &super::JobDataFilter,
     bind_values: &mut Vec<String>,
 ) -> crate::Result<()> {
-    let sqlt_path = pointer_to_sqlite_path(&filter.path)?;
+    // Match `value` at ANY of the paths (OR). SQLite uses positional `?` binds,
+    // so each clause binds its own path (and value, for strings) in emission
+    // order.
+    let mut clauses: Vec<String> = Vec::with_capacity(filter.paths.len());
     if filter.value.is_null() {
-        let _ = write!(query, " AND json_extract(task_data, ?) IS NULL");
-        bind_values.push(sqlt_path);
+        for path in &filter.paths {
+            clauses.push("json_extract(task_data, ?) IS NULL".to_string());
+            bind_values.push(pointer_to_sqlite_path(path)?);
+        }
     } else if let Some(s) = filter.value.as_str() {
-        let _ = write!(query, " AND json_extract(task_data, ?) = ?");
-        bind_values.push(sqlt_path);
-        bind_values.push(s.to_string());
+        for path in &filter.paths {
+            clauses.push("json_extract(task_data, ?) = ?".to_string());
+            bind_values.push(pointer_to_sqlite_path(path)?);
+            bind_values.push(s.to_string());
+        }
     } else if let Some(b) = filter.value.as_bool() {
         let int_val = i32::from(b);
-        let _ = write!(query, " AND json_extract(task_data, ?) = {int_val}");
-        bind_values.push(sqlt_path);
+        for path in &filter.paths {
+            clauses.push(format!("json_extract(task_data, ?) = {int_val}"));
+            bind_values.push(pointer_to_sqlite_path(path)?);
+        }
     } else if filter.value.is_number() {
-        let _ = write!(query, " AND json_extract(task_data, ?) = {}", filter.value);
-        bind_values.push(sqlt_path);
+        for path in &filter.paths {
+            clauses.push(format!("json_extract(task_data, ?) = {}", filter.value));
+            bind_values.push(pointer_to_sqlite_path(path)?);
+        }
+    }
+    if !clauses.is_empty() {
+        let _ = write!(query, " AND ({})", clauses.join(" OR "));
     }
     Ok(())
 }
@@ -819,12 +833,34 @@ pub async fn get_jobs_by_data(
 ///
 /// This function will return an error if the database query fails.
 pub async fn query_jobs(pool: &SqlitePool, filter: &super::JobFilter) -> crate::Result<Vec<Job>> {
-    let mut query = String::from("SELECT * FROM sqlt_loco_queue WHERE 1 = 1");
+    let (where_clause, bind_values) = build_sqlt_filter_where(filter)?;
+    let query =
+        format!("SELECT * FROM sqlt_loco_queue{where_clause} ORDER BY created_at DESC, id DESC");
+
+    let mut q = sqlx::query(&query);
+    for val in &bind_values {
+        q = q.bind(val.clone());
+    }
+    let rows = q.fetch_all(pool).await?;
+    let jobs = rows.iter().filter_map(|row| to_job(row).ok()).collect();
+    Ok(jobs)
+}
+
+/// Builds the ` WHERE …` fragment (starting with ` WHERE 1 = 1`) shared by
+/// `query_jobs`, `query_jobs_page`, and the page's count query, plus the ordered
+/// positional bind values. One builder keeps the page and its total in sync.
+fn build_sqlt_filter_where(filter: &super::JobFilter) -> crate::Result<(String, Vec<String>)> {
+    let mut query = String::from(" WHERE 1 = 1");
     let mut bind_values: Vec<String> = Vec::new();
 
-    if let Some(name) = &filter.name {
-        let _ = write!(query, " AND name = ?");
-        bind_values.push(name.clone());
+    if let Some(names) = &filter.names {
+        if !names.is_empty() {
+            let placeholders = vec!["?"; names.len()].join(",");
+            let _ = write!(query, " AND name IN ({placeholders})");
+            for n in names {
+                bind_values.push(n.clone());
+            }
+        }
     }
 
     if let Some(data_filters) = &filter.data {
@@ -848,13 +884,96 @@ pub async fn query_jobs(pool: &SqlitePool, filter: &super::JobFilter) -> crate::
         let _ = write!(query, " AND created_at <= '{threshold_date}'");
     }
 
-    let mut q = sqlx::query(&query);
+    if let Some(days) = filter.created_within_days {
+        let cutoff_date = Utc::now() - chrono::Duration::days(days);
+        let threshold_date = cutoff_date.format("%+").to_string();
+        let _ = write!(query, " AND created_at >= '{threshold_date}'");
+    }
+
+    Ok((query, bind_values))
+}
+
+/// Retrieves a page of jobs matching a [`super::JobFilter`] plus the total count
+/// matching the same predicate (ignoring `limit`/`offset`).
+///
+/// # Errors
+///
+/// This function will return an error if the database query fails.
+pub async fn query_jobs_page(
+    pool: &SqlitePool,
+    filter: &super::JobFilter,
+) -> crate::Result<super::JobPage> {
+    let (where_clause, bind_values) = build_sqlt_filter_where(filter)?;
+
+    let mut page_sql =
+        format!("SELECT * FROM sqlt_loco_queue{where_clause} ORDER BY created_at DESC, id DESC");
+    // SQLite requires a LIMIT before OFFSET; `LIMIT -1` means "no limit".
+    match (filter.limit, filter.offset) {
+        (Some(limit), Some(offset)) => {
+            let _ = write!(page_sql, " LIMIT {limit} OFFSET {offset}");
+        }
+        (Some(limit), None) => {
+            let _ = write!(page_sql, " LIMIT {limit}");
+        }
+        (None, Some(offset)) => {
+            let _ = write!(page_sql, " LIMIT -1 OFFSET {offset}");
+        }
+        (None, None) => {}
+    }
+
+    let mut q = sqlx::query(&page_sql);
     for val in &bind_values {
         q = q.bind(val.clone());
     }
     let rows = q.fetch_all(pool).await?;
-    let jobs = rows.iter().filter_map(|row| to_job(row).ok()).collect();
-    Ok(jobs)
+    let jobs: Vec<Job> = rows.iter().filter_map(|row| to_job(row).ok()).collect();
+
+    let count_sql = format!("SELECT COUNT(*) FROM sqlt_loco_queue{where_clause}");
+    let mut cq = sqlx::query_scalar::<_, i64>(&count_sql);
+    for val in &bind_values {
+        cq = cq.bind(val.clone());
+    }
+    let total: i64 = cq.fetch_one(pool).await?;
+
+    Ok(super::JobPage {
+        jobs,
+        total: u64::try_from(total).unwrap_or(0),
+    })
+}
+
+/// Inserts a job row verbatim, preserving its id, status, and timestamps.
+///
+/// Unlike [`enqueue`], which always creates a fresh `queued` job, this writes
+/// every column from `job` as-is.
+///
+/// # Errors
+///
+/// This function will return an error if the database query fails.
+pub async fn insert_job(pool: &SqlitePool, job: &Job) -> Result<()> {
+    let tags_json = match &job.tags {
+        Some(tags) => Some(serde_json::to_value(tags)?),
+        None => None,
+    };
+    let created_at = job.created_at.unwrap_or_else(Utc::now);
+    let updated_at = job.updated_at.unwrap_or_else(Utc::now);
+
+    sqlx::query(
+        "INSERT INTO sqlt_loco_queue (id, name, task_data, status, run_at, interval, created_at, \
+         updated_at, tags) VALUES ($1, $2, $3, $4, DATETIME($5), $6, DATETIME($7), DATETIME($8), \
+         $9)",
+    )
+    .bind(job.id.clone())
+    .bind(job.name.clone())
+    .bind(job.data.clone())
+    .bind(job.status.to_string())
+    .bind(job.run_at)
+    .bind(job.interval)
+    .bind(created_at)
+    .bind(updated_at)
+    .bind(tags_json)
+    .execute(pool)
+    .await?;
+    Ok(())
 }
 
 /// Converts a row from the database into a [`Job`] object.
@@ -1866,10 +1985,10 @@ mod tests {
         tests_cfg::queue::sqlite_seed_data(&pool).await;
 
         // Filter by user_id = 133
-        let filters = vec![super::super::JobDataFilter {
-            path: "/user_id".to_string(),
-            value: serde_json::json!(133),
-        }];
+        let filters = vec![super::super::JobDataFilter::new(
+            "/user_id".to_string(),
+            serde_json::json!(133),
+        )];
         let jobs = super::get_jobs_by_data(&pool, &filters, None, None)
             .await
             .expect("get jobs by data");
@@ -1877,10 +1996,10 @@ mod tests {
         assert_eq!(jobs[0].id, "01JDM0X8EVAM823JZBGKYNBA99");
 
         // Filter by email string
-        let filters = vec![super::super::JobDataFilter {
-            path: "/email".to_string(),
-            value: serde_json::json!("user24@example.com"),
-        }];
+        let filters = vec![super::super::JobDataFilter::new(
+            "/email".to_string(),
+            serde_json::json!("user24@example.com"),
+        )];
         let jobs = super::get_jobs_by_data(&pool, &filters, None, None)
             .await
             .expect("get jobs by data");
@@ -1888,10 +2007,10 @@ mod tests {
         assert_eq!(jobs[0].id, "01JDM0X8EVAM823JZBGKYNBA87");
 
         // Filter with status
-        let filters = vec![super::super::JobDataFilter {
-            path: "/user_id".to_string(),
-            value: serde_json::json!(133),
-        }];
+        let filters = vec![super::super::JobDataFilter::new(
+            "/user_id".to_string(),
+            serde_json::json!(133),
+        )];
         let jobs =
             super::get_jobs_by_data(&pool, &filters, Some(&vec![JobStatus::Completed]), None)
                 .await
@@ -1899,10 +2018,10 @@ mod tests {
         assert_eq!(jobs.len(), 0); // user_id 133 is queued, not completed
 
         // Missing path → empty result
-        let filters = vec![super::super::JobDataFilter {
-            path: "/nonexistent".to_string(),
-            value: serde_json::json!("anything"),
-        }];
+        let filters = vec![super::super::JobDataFilter::new(
+            "/nonexistent".to_string(),
+            serde_json::json!("anything"),
+        )];
         let jobs = super::get_jobs_by_data(&pool, &filters, None, None)
             .await
             .expect("get jobs by data");
@@ -1922,11 +2041,11 @@ mod tests {
 
         // Name + data + status
         let filter = super::super::JobFilter {
-            name: Some("UserAccountActivation".to_string()),
-            data: Some(vec![super::super::JobDataFilter {
-                path: "/user_id".to_string(),
-                value: serde_json::json!(133),
-            }]),
+            names: Some(vec!["UserAccountActivation".to_string()]),
+            data: Some(vec![super::super::JobDataFilter::new(
+                "/user_id".to_string(),
+                serde_json::json!(133),
+            )]),
             status: Some(vec![JobStatus::Queued]),
             ..Default::default()
         };
@@ -1936,11 +2055,11 @@ mod tests {
 
         // Wrong status → empty
         let filter = super::super::JobFilter {
-            name: Some("UserAccountActivation".to_string()),
-            data: Some(vec![super::super::JobDataFilter {
-                path: "/user_id".to_string(),
-                value: serde_json::json!(133),
-            }]),
+            names: Some(vec!["UserAccountActivation".to_string()]),
+            data: Some(vec![super::super::JobDataFilter::new(
+                "/user_id".to_string(),
+                serde_json::json!(133),
+            )]),
             status: Some(vec![JobStatus::Completed]),
             ..Default::default()
         };

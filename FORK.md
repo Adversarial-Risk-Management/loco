@@ -54,6 +54,7 @@ that is easy to rebase and fix up.
 |---|---|---|---|---|
 | Allow running scheduler and server without worker | `separate-sched-flag` | [#1](https://github.com/Adversarial-Risk-Management/loco/pull/1) | [#1742](https://github.com/loco-rs/loco/pull/1742) | merged to `master` |
 | Expose methods for querying worker queue / job IDs | `feature/expose-worker-job-ids` | [#2](https://github.com/Adversarial-Risk-Management/loco/pull/2) | [#1624](https://github.com/loco-rs/loco/pull/1624) | in review |
+| Work-queue pagination, multi-path/multi-name filters, recency window, `insert_job` (builds on `feature/expose-worker-job-ids`) | `feat/work-queue-pagination` | — | — | local (not pushed) |
 | `perform_all_later` for batch job enqueueing | `perform-all-later` | [#3](https://github.com/Adversarial-Risk-Management/loco/pull/3) | — | in review |
 | Multiple recipients in mailer | `feat/multi-recipient-email` | [#4](https://github.com/Adversarial-Risk-Management/loco/pull/4) | — | in review |
 | Fix clippy lints for Rust 1.96 | `clippy-rust-1.96` | [#6](https://github.com/Adversarial-Risk-Management/loco/pull/6) | — | merged to `master` (transient; drop when upstream ships a 1.96 clippy fix) |

@@ -632,10 +632,15 @@ fn should_include_job(job: &Job, status: Option<&Vec<JobStatus>>, age_days: Opti
 }
 
 /// Checks whether a job's `task_data` matches all the given data filters.
+///
+/// Each filter matches when its `value` is found at **any** of its `paths` (OR);
+/// multiple filters combine with AND.
 fn matches_data_filters(job: &Job, filters: &[super::JobDataFilter]) -> bool {
-    filters
-        .iter()
-        .all(|f| job.data.pointer(&f.path) == Some(&f.value))
+    filters.iter().all(|f| {
+        f.paths
+            .iter()
+            .any(|p| job.data.pointer(p) == Some(&f.value))
+    })
 }
 
 /// Retrieves jobs filtered by matching scalar values at JSON pointer paths
@@ -678,8 +683,16 @@ fn matches_filter(job: &Job, filter: &super::JobFilter) -> bool {
     if !should_include_job(job, filter.status.as_ref(), filter.age_days) {
         return false;
     }
-    if let Some(name) = &filter.name {
-        if job.name != *name {
+    if let Some(days) = filter.created_within_days {
+        if let Some(created_at) = job.created_at {
+            let cutoff_date = Utc::now() - chrono::Duration::days(days);
+            if created_at < cutoff_date {
+                return false;
+            }
+        }
+    }
+    if let Some(names) = &filter.names {
+        if !names.is_empty() && !names.contains(&job.name) {
             return false;
         }
     }
@@ -689,6 +702,17 @@ fn matches_filter(job: &Job, filter: &super::JobFilter) -> bool {
         }
     }
     true
+}
+
+/// Orders jobs by `created_at DESC, id DESC`, matching the SQL providers. Jobs
+/// without a `created_at` sort last (treated as the epoch).
+fn sort_jobs_desc(jobs: &mut [Job]) {
+    jobs.sort_by(|a, b| {
+        b.created_at
+            .unwrap_or_default()
+            .cmp(&a.created_at.unwrap_or_default())
+            .then_with(|| b.id.cmp(&a.id))
+    });
 }
 
 /// Retrieves jobs matching all dimensions of a [`super::JobFilter`].
@@ -716,7 +740,52 @@ pub async fn query_jobs(client: &RedisPool, filter: &super::JobFilter) -> Result
         }
     }
 
+    sort_jobs_desc(&mut jobs);
     Ok(jobs)
+}
+
+/// Retrieves a page of jobs matching a [`super::JobFilter`] plus the total count
+/// matching the same predicate (ignoring `limit`/`offset`).
+///
+/// Filtering, ordering, and slicing all happen in memory after fetching jobs.
+///
+/// # Errors
+///
+/// This function will return an error if the Redis query fails.
+pub async fn query_jobs_page(
+    client: &RedisPool,
+    filter: &super::JobFilter,
+) -> Result<super::JobPage> {
+    let mut jobs = query_jobs(client, filter).await?;
+    let total = u64::try_from(jobs.len()).unwrap_or(u64::MAX);
+
+    let offset = filter.offset.unwrap_or(0);
+    let offset_usize = usize::try_from(offset).unwrap_or(usize::MAX);
+    if offset_usize >= jobs.len() {
+        jobs.clear();
+    } else {
+        jobs.drain(..offset_usize);
+        if let Some(limit) = filter.limit {
+            let limit_usize = usize::try_from(limit).unwrap_or(usize::MAX);
+            jobs.truncate(limit_usize);
+        }
+    }
+
+    Ok(super::JobPage { jobs, total })
+}
+
+/// Inserts a job verbatim under its job key, preserving id, status, and
+/// timestamps. Unlike [`enqueue`], it does not push onto a pending queue.
+///
+/// # Errors
+///
+/// This function will return an error if the Redis query fails.
+pub async fn insert_job(client: &RedisPool, job: &Job) -> Result<()> {
+    let mut conn = get_connection(client).await?;
+    let job_key = format!("{JOB_KEY_PREFIX}{}", job.id);
+    let job_json = job.to_json()?;
+    let _: () = conn.set(&job_key, &job_json).await?;
+    Ok(())
 }
 
 /// Clears jobs based on their status from the Redis queue.
@@ -1852,11 +1921,11 @@ mod tests {
 
         // Name + data filter
         let filter = super::super::JobFilter {
-            name: Some("WorkerA".to_string()),
-            data: Some(vec![super::super::JobDataFilter {
-                path: "/user_id".to_string(),
-                value: serde_json::json!(42),
-            }]),
+            names: Some(vec!["WorkerA".to_string()]),
+            data: Some(vec![super::super::JobDataFilter::new(
+                "/user_id".to_string(),
+                serde_json::json!(42),
+            )]),
             status: Some(vec![JobStatus::Queued]),
             ..Default::default()
         };
@@ -1870,7 +1939,7 @@ mod tests {
 
         // Wrong name → empty
         let filter = super::super::JobFilter {
-            name: Some("NoSuchWorker".to_string()),
+            names: Some(vec!["NoSuchWorker".to_string()]),
             ..Default::default()
         };
         let jobs = super::query_jobs(&client, &filter)
