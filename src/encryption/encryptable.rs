@@ -101,24 +101,34 @@ pub trait Encryptable: ActiveModelTrait {
         Vec::new()
     }
 
-    /// Returns the list of field names whose plaintext should be zlib-deflated
-    /// before encryption.
+    /// Returns the field names that should **not** be zlib-compressed before
+    /// encryption.
     ///
-    /// Compression only kicks in when the plaintext is at least
-    /// [`crate::encryption::cipher::COMPRESS_THRESHOLD`] bytes long; smaller
-    /// values are stored uncompressed because the zlib header overhead
-    /// outweighs any savings. The envelope header `h.c` records whether a
-    /// given ciphertext was compressed, so changing the trait return value
-    /// for an existing field is safe — old uncompressed ciphertexts continue
-    /// to decrypt without re-encryption.
+    /// Compression is on by default for every non-deterministic field (as in
+    /// Rails Active Record Encryption); list a field here to opt it out. It
+    /// only ever kicks in when the plaintext is at least
+    /// [`crate::encryption::cipher::COMPRESS_THRESHOLD`] bytes long anyway —
+    /// smaller values are stored uncompressed because the zlib header overhead
+    /// outweighs any savings. The envelope header `h.c` records per-value
+    /// whether a given ciphertext was compressed, so moving a field on or off
+    /// this list is safe: existing ciphertexts continue to decrypt without
+    /// re-encryption regardless of the current setting.
     ///
-    /// Be aware of the security trade-off: compressing user-influenced
-    /// plaintext before encryption can leak length-correlated information
-    /// (CRIME / BREACH-style attacks). Only enable compression on fields
-    /// where the plaintext is not under attacker control, or where length
-    /// leakage is acceptable.
+    /// Deterministic fields are never compressed (deflate output is not stable
+    /// across zlib versions, which would break the equal-plaintext-equal-
+    /// ciphertext property), so they do not need to appear here.
+    ///
+    /// # When to opt out
+    ///
+    /// Compressing plaintext before encrypting it leaks length-correlated
+    /// information: AES-GCM ciphertext is the same length as its input, so the
+    /// stored length reveals how compressible the value was (the CRIME /
+    /// BREACH attack class). Opt a field out when it mixes attacker-influenced
+    /// bytes with secret bytes in the same value and an attacker can observe
+    /// the stored ciphertext length. For values that are wholly secret or
+    /// wholly non-secret, the default (compressed) is fine.
     #[must_use]
-    fn compressed_fields() -> Vec<String> {
+    fn uncompressed_fields() -> Vec<String> {
         Vec::new()
     }
 
@@ -185,7 +195,7 @@ pub trait Encryptable: ActiveModelTrait {
     {
         let fields = Self::encrypted_fields();
         let det_fields = Self::deterministic_fields();
-        let compressed_fields = Self::compressed_fields();
+        let uncompressed_fields = Self::uncompressed_fields();
         // The key id is constant across all fields of a model; fetch it once
         // rather than re-allocating it on every loop iteration.
         let key_id = provider.get_key_id();
@@ -200,17 +210,14 @@ pub trait Encryptable: ActiveModelTrait {
             }
 
             let is_deterministic = det_fields.iter().any(|f| f == field_name);
-            let is_compressed = compressed_fields.iter().any(|f| f == field_name);
+            // Compression is on by default; deterministic fields are never
+            // compressed (deflate output is not stable across zlib versions),
+            // and any field can opt out via `uncompressed_fields`.
+            let is_compressed =
+                !is_deterministic && !uncompressed_fields.iter().any(|f| f == field_name);
             let aad = Self::field_aad(field_name);
 
             let encrypted = if is_deterministic {
-                if is_compressed {
-                    return Err(EncryptionError::NotConfigured(format!(
-                        "field '{field_name}' is marked both deterministic and \
-                         compressed; compression is not supported in deterministic \
-                         mode (zlib output is not stable across libc versions)"
-                    )));
-                }
                 let det_master = provider.get_deterministic_key()?.ok_or_else(|| {
                     EncryptionError::NotConfigured(format!(
                         "field '{field_name}' is marked deterministic but no \

@@ -31,11 +31,11 @@
 //!   `i` key-id uses semantic labels (`"primary"`) rather than Rails' key
 //!   fingerprint, and per-field keys are derived with HKDF-SHA256 rather than
 //!   Rails' PBKDF2. Do not plan a cross-stack migration on the shared shape.
-//! - **Compression**: opt-in per field here (see
-//!   [`Encryptable::compressed_fields`](encryptable::Encryptable::compressed_fields)),
-//!   whereas Rails compresses by default. The opt-in default avoids
-//!   CRIME/BREACH-style length leakage on attacker-influenced plaintext unless
-//!   you explicitly accept it.
+//! - **Compression**: on by default for non-deterministic fields, as in Rails.
+//!   Opt a field out with the `(no_compress)` modifier (see
+//!   [`Encryptable::uncompressed_fields`](encryptable::Encryptable::uncompressed_fields))
+//!   when it mixes attacker-influenced and secret bytes, to avoid
+//!   CRIME/BREACH-style length leakage.
 //! - **Deterministic key rotation**: unsupported, as in Rails (see
 //!   [`config::EncryptionConfig::deterministic_key`]).
 //!
@@ -133,23 +133,30 @@ pub use registry::SharedKeyProvider;
 /// Convenience macro to implement [`Encryptable`](encryptable::Encryptable)
 /// for an `ActiveModel`.
 ///
-/// Each field is either a bare ident (non-deterministic, random IV) or
-/// `name(deterministic)` to opt the field into deterministic encryption so
-/// it can be used in equality queries.
+/// Each field is one of:
+/// - a bare ident — non-deterministic (random IV) and **compressed by
+///   default** (subject to the size threshold);
+/// - `name(deterministic)` — deterministic encryption so the field can be used
+///   in equality queries (never compressed);
+/// - `name(no_compress)` — non-deterministic but with compression disabled (see
+///   the CRIME/BREACH note on
+///   [`Encryptable::uncompressed_fields`](encryptable::Encryptable::uncompressed_fields)).
 ///
 /// # Example
 ///
 /// ```rust,ignore
 /// use loco_rs::impl_encryptable_fields;
 ///
-/// // SSN is non-deterministic; email is deterministic so we can do
-/// // `WHERE email = encrypt_query_value::<users::Entity>("email", &input, &ctx)?`.
-/// impl_encryptable_fields!(users::ActiveModel, [ssn, email(deterministic)]);
+/// // ssn: compressed by default. email: deterministic (and not compressed) so
+/// // `WHERE email = encrypt_query_value::<users::Entity>("email", &input, &ctx)?`
+/// // works. bio: opted out of compression.
+/// impl_encryptable_fields!(users::ActiveModel, [ssn, email(deterministic), bio(no_compress)]);
 /// ```
 ///
 /// The generated impl produces `encrypted_fields()` containing every name,
-/// and `deterministic_fields()` containing only those marked
-/// `(deterministic)`. Unknown modifiers are rejected at compile time.
+/// `deterministic_fields()` containing only those marked `(deterministic)`,
+/// and `uncompressed_fields()` containing only those marked `(no_compress)`.
+/// Unknown modifiers are rejected at compile time.
 ///
 /// # Binding ciphertexts to a `(table, column)` location (AAD)
 ///
@@ -207,26 +214,26 @@ macro_rules! __impl_encryptable_fields_inner {
 
             fn deterministic_fields() -> Vec<String> {
                 let mut det: Vec<String> = Vec::new();
-                let mut comp: Vec<String> = Vec::new();
+                let mut uncomp: Vec<String> = Vec::new();
                 $(
                     $crate::__impl_encryptable_field_meta!(
-                        det, comp, $field $(, $modifier)?
+                        det, uncomp, $field $(, $modifier)?
                     );
                 )*
-                let _ = comp;
+                let _ = uncomp;
                 det
             }
 
-            fn compressed_fields() -> Vec<String> {
+            fn uncompressed_fields() -> Vec<String> {
                 let mut det: Vec<String> = Vec::new();
-                let mut comp: Vec<String> = Vec::new();
+                let mut uncomp: Vec<String> = Vec::new();
                 $(
                     $crate::__impl_encryptable_field_meta!(
-                        det, comp, $field $(, $modifier)?
+                        det, uncomp, $field $(, $modifier)?
                     );
                 )*
                 let _ = det;
-                comp
+                uncomp
             }
 
             fn field_aad(field_name: &str) -> Vec<u8> {
@@ -267,32 +274,33 @@ macro_rules! __impl_encryptable_fields_inner {
 }
 
 /// Internal helper for [`impl_encryptable_fields!`] — classifies a single
-/// field's modifier into either the deterministic-list or compressed-list
-/// accumulator, and rejects unknown modifiers at compile time.
+/// field's modifier into either the deterministic-list or the
+/// compression-opt-out list accumulator, and rejects unknown modifiers at
+/// compile time.
 #[macro_export]
 #[doc(hidden)]
 macro_rules! __impl_encryptable_field_meta {
-    ($det:ident, $comp:ident, $field:ident, deterministic) => {
+    ($det:ident, $uncomp:ident, $field:ident, deterministic) => {
         $det.push(stringify!($field).to_string());
-        let _ = &$comp;
+        let _ = &$uncomp;
     };
-    ($det:ident, $comp:ident, $field:ident, compress) => {
-        $comp.push(stringify!($field).to_string());
+    ($det:ident, $uncomp:ident, $field:ident, no_compress) => {
+        $uncomp.push(stringify!($field).to_string());
         let _ = &$det;
     };
-    ($det:ident, $comp:ident, $field:ident, $other:ident) => {
+    ($det:ident, $uncomp:ident, $field:ident, $other:ident) => {
         compile_error!(concat!(
             "unknown encryption modifier `",
             stringify!($other),
             "` on field `",
             stringify!($field),
-            "` (expected `deterministic` or `compress`)"
+            "` (expected `deterministic` or `no_compress`)"
         ));
-        let _ = (&$det, &$comp);
+        let _ = (&$det, &$uncomp);
     };
-    ($det:ident, $comp:ident, $field:ident) => {
-        // bare field — neither deterministic nor compressed
-        let _ = (&$det, &$comp);
+    ($det:ident, $uncomp:ident, $field:ident) => {
+        // bare field — non-deterministic and compressed by default
+        let _ = (&$det, &$uncomp);
     };
 }
 
@@ -477,15 +485,18 @@ mod tests {
     #[test]
     fn impl_encryptable_field_meta_helper_classifies_modifiers() {
         let mut det: Vec<String> = Vec::new();
-        let mut comp: Vec<String> = Vec::new();
-        crate::__impl_encryptable_field_meta!(det, comp, ssn);
-        crate::__impl_encryptable_field_meta!(det, comp, email, deterministic);
-        crate::__impl_encryptable_field_meta!(det, comp, bio, compress);
-        crate::__impl_encryptable_field_meta!(det, comp, phone);
-        crate::__impl_encryptable_field_meta!(det, comp, recovery_email, deterministic);
-        crate::__impl_encryptable_field_meta!(det, comp, journal, compress);
+        let mut uncomp: Vec<String> = Vec::new();
+        crate::__impl_encryptable_field_meta!(det, uncomp, ssn);
+        crate::__impl_encryptable_field_meta!(det, uncomp, email, deterministic);
+        crate::__impl_encryptable_field_meta!(det, uncomp, bio, no_compress);
+        crate::__impl_encryptable_field_meta!(det, uncomp, phone);
+        crate::__impl_encryptable_field_meta!(det, uncomp, recovery_email, deterministic);
+        crate::__impl_encryptable_field_meta!(det, uncomp, journal, no_compress);
 
+        // Deterministic and opt-out lists hold only the explicitly marked
+        // fields; bare fields (ssn, phone) are compressed by default and
+        // appear in neither.
         assert_eq!(det, vec!["email".to_string(), "recovery_email".to_string()]);
-        assert_eq!(comp, vec!["bio".to_string(), "journal".to_string()]);
+        assert_eq!(uncomp, vec!["bio".to_string(), "journal".to_string()]);
     }
 }

@@ -15,7 +15,7 @@ top = false
 flair =[]
 +++
 
-Loco ships with column-level encryption for your models. You declare which fields hold sensitive data, and Loco transparently encrypts them before they hit the database and decrypts them when you read them back. The design is modeled after Rails' Active Record Encryption, with one notable difference: Loco uses HKDF-SHA256 instead of PBKDF2 for per-field key derivation.
+Loco ships with column-level encryption for your models. You declare which fields hold sensitive data, and Loco encrypts them before they hit the database. Encryption happens automatically when you save; decryption is **explicit** — you call `decrypt_fields_ctx` on a loaded model rather than having the getter decrypt for you. This is the one workflow difference from Rails' Active Record Encryption, whose attribute readers decrypt transparently. The cryptographic design otherwise follows Rails, with one notable difference: Loco uses HKDF-SHA256 instead of PBKDF2 for per-field key derivation.
 
 ## What it protects against
 
@@ -135,21 +135,27 @@ let user = users::Entity::find()
 
 The trade-off is real. Deterministic ciphertexts leak which rows share the same plaintext: an attacker with read access to the table can group rows by encrypted email even if they cannot decrypt any of them. For low-cardinality fields (think `country_code`) this is close to giving up the plaintext entirely. Reserve deterministic mode for fields where you actually need equality lookups — typically uniqueness checks, login flows, or foreign-key-style joins on natural keys — and keep everything else random.
 
-## Compressing large encrypted fields
+## Compression
 
-Long, redundant payloads — JSON blobs, biographies, free-form journal entries — can take significant database space once encrypted. Loco supports zlib `deflate` compression of the plaintext before encryption, opt-in per field. Mark a field with the `(compress)` modifier:
+Long, redundant payloads — JSON blobs, biographies, free-form journal entries — can take significant database space once encrypted. Loco zlib-`deflate`s the plaintext before encryption **by default**, matching Rails. You don't need to do anything to get it; bare fields are compressed:
 
 ```rust
 impl_encryptable_fields!(profiles::ActiveModel, [
-    bio(compress),
-    notes(compress),
-    email(deterministic),
+    bio,                  // compressed by default
+    notes(no_compress),   // opted out
+    email(deterministic), // deterministic fields are never compressed
 ]);
 ```
 
-Compression only kicks in when the plaintext is at least 140 bytes (the same threshold Rails uses); shorter values are stored uncompressed because the zlib header overhead would outweigh any savings. The envelope's `h.c` flag records whether a given ciphertext was compressed, so decryption transparently inflates when needed. Old, uncompressed rows continue to decrypt without re-encryption.
+Compression only kicks in when the plaintext is at least 140 bytes (the same threshold Rails uses); shorter values are stored uncompressed because the zlib header overhead would outweigh any savings. The envelope's `h.c` flag records per-value whether a given ciphertext was compressed, so decryption transparently inflates when needed and moving a field on or off the opt-out list never strands existing rows — old ciphertexts decrypt regardless of the current setting.
 
-Two caveats. First, compression and deterministic mode are mutually exclusive on the same field — deflate output is not stable across zlib versions, so a deterministic-then-compressed pipeline cannot guarantee identical ciphertext for identical plaintext. The macro and the runtime both reject the combination. Second, compressing user-influenced plaintext before encrypting it can leak length-correlated information (the CRIME / BREACH attack class). For database-at-rest storage this is generally fine, but treat it the way you would treat HTTP compression: not for fields whose content is partly attacker-controlled and partly secret.
+Deterministic fields are never compressed: deflate output is not stable across zlib versions, so compressing first would break the equal-plaintext-equal-ciphertext property that deterministic mode exists to provide. You don't need to opt them out explicitly.
+
+### When to opt out: CRIME/BREACH
+
+Compressing plaintext before encrypting it leaks length-correlated information. AES-GCM ciphertext is the same length as its input, so the stored length reveals how *compressible* the value was — and encryption doesn't hide length. This becomes an attack (the CRIME / BREACH class) when a single field mixes **attacker-influenced** bytes with **secret** bytes and the attacker can observe the stored ciphertext length: they vary their input, watch which guesses make the value compress smaller, and recover the secret a piece at a time.
+
+For database-at-rest storage this is usually a weak threat — an attacker rarely gets the tight adaptive guess-and-measure loop the network attacks rely on. But opt a field out with `(no_compress)` when it concatenates user-controlled input with a secret (for example a note that embeds an internal token) and that ciphertext's length is observable. Fields that are wholly secret or wholly non-secret are fine left on the default.
 
 ## Key rotation
 

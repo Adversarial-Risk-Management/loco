@@ -68,11 +68,12 @@ async fn long_compressed_field_round_trips() {
 #[tokio::test]
 async fn long_bio_envelope_marks_compressed_and_shrinks_payload() {
     let ctx = ctx().await;
-    // Highly redundant payload so deflate has plenty to work with.
+    // Highly redundant payloads so deflate would have plenty to work with.
     let bio: String = "the same line over and over and over\n".repeat(80);
-    let note: String = "untouched".into();
+    let note: String = "the same note over and over and over\n".repeat(80);
     let saved = insert(&ctx, &bio, &note).await;
 
+    // `bio` is compressed by default.
     let bio_env = raw(&ctx.db, saved.id, "bio").await;
     let parsed = EncryptedValue::from_json(&bio_env).unwrap();
     assert!(parsed.is_compressed(), "bio should be marked h.c=true");
@@ -85,11 +86,19 @@ async fn long_bio_envelope_marks_compressed_and_shrinks_payload() {
         bio.len()
     );
 
-    // The note field is not on the compress list, so its envelope must not
-    // claim compression even though the plaintext is short.
+    // `note` opts out via `(no_compress)`: even this long, redundant payload
+    // must be stored uncompressed, proving the opt-out is honored rather than
+    // the threshold merely being missed.
     let note_env = raw(&ctx.db, saved.id, "note").await;
     let note_parsed = EncryptedValue::from_json(&note_env).unwrap();
-    assert!(!note_parsed.is_compressed());
+    assert!(
+        !note_parsed.is_compressed(),
+        "note opted out of compression and must not be deflated"
+    );
+    assert!(
+        note_parsed.ciphertext().unwrap().len() >= note.len(),
+        "uncompressed note ciphertext should be ~plaintext size, not shrunk"
+    );
 }
 
 #[tokio::test]

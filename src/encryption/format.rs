@@ -55,7 +55,7 @@ pub const CURRENT_ENVELOPE_VERSION: u8 = 2;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EncryptedHeaders {
     /// Envelope schema version. Missing on legacy pre-versioned writes;
-    /// new writes always emit `v = 1`.
+    /// new writes always emit [`CURRENT_ENVELOPE_VERSION`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub v: Option<u8>,
 

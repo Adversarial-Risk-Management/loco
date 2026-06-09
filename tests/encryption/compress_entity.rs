@@ -19,5 +19,6 @@ pub enum Relation {}
 
 impl ActiveModelBehavior for ActiveModel {}
 
-// `bio` is encrypted-and-compressed; `note` is just encrypted.
-impl_encryptable_fields!(ActiveModel, [bio(compress), note]);
+// `bio` is compressed by default; `note` opts out of compression with
+// `(no_compress)`, so it is stored at plaintext size even when large.
+impl_encryptable_fields!(ActiveModel, [bio, note(no_compress)]);
