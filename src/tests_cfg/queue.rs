@@ -20,7 +20,7 @@ pub async fn postgres_seed_data(pool: &sqlx::PgPool) {
     let yaml_tasks =
         std::fs::read_to_string(queue_jobs_fixture_path()).expect("Failed to read YAML file");
 
-    let tasks: Vec<bgworker::pg::Job> =
+    let tasks: Vec<bgworker::Job> =
         serde_yaml::from_str(&yaml_tasks).expect("Failed to parse YAML");
     for task in tasks {
         sqlx::query(
@@ -50,7 +50,7 @@ pub async fn sqlite_seed_data(pool: &sqlx::Pool<sqlx::Sqlite>) {
     let yaml_tasks =
         std::fs::read_to_string(queue_jobs_fixture_path()).expect("Failed to read YAML file");
 
-    let tasks: Vec<bgworker::sqlt::Job> =
+    let tasks: Vec<bgworker::Job> =
         serde_yaml::from_str(&yaml_tasks).expect("Failed to parse YAML");
     for task in tasks {
         sqlx::query(

@@ -6,6 +6,7 @@ use std::{
 };
 
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 #[cfg(feature = "cli")]
 use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
@@ -26,6 +27,78 @@ use crate::{
     },
     Error, Result,
 };
+
+/// A filter for querying jobs by values within `task_data`.
+///
+/// Paths use [RFC 6901](https://tools.ietf.org/html/rfc6901) JSON pointer
+/// syntax (e.g. `"/user_id"`, `"/org/id"`). Only scalar filter values (string,
+/// number, bool, null) are supported.
+#[derive(Clone, Debug)]
+pub struct JobDataFilter {
+    /// RFC 6901 JSON pointer path, e.g. `"/user_id"` or `"/org/id"`
+    pub path: String,
+    /// Scalar value to match
+    pub value: serde_json::Value,
+}
+
+/// A composable filter for querying jobs across all dimensions at once.
+///
+/// All fields are optional; only set fields are applied. Filters combine with
+/// AND semantics.
+#[derive(Clone, Debug, Default)]
+pub struct JobFilter {
+    pub status: Option<Vec<JobStatus>>,
+    pub age_days: Option<i64>,
+    pub name: Option<String>,
+    pub data: Option<Vec<JobDataFilter>>,
+}
+
+/// Validates that a [`JobDataFilter`] has a well-formed RFC 6901 path and a
+/// scalar value.
+fn validate_filter(filter: &JobDataFilter) -> Result<()> {
+    if !filter.path.starts_with('/') {
+        return Err(Error::string(&format!(
+            "JSON pointer path must start with '/': {}",
+            filter.path
+        )));
+    }
+    for segment in filter.path[1..].split('/') {
+        if segment.is_empty() {
+            return Err(Error::string(&format!(
+                "JSON pointer path contains empty segment: {}",
+                filter.path
+            )));
+        }
+    }
+    if filter.value.is_object() || filter.value.is_array() {
+        return Err(Error::string(&format!(
+            "filter value must be a scalar (string, number, bool, or null), got: {}",
+            filter.value
+        )));
+    }
+    Ok(())
+}
+
+/// Extracts a value from job data using a JSON pointer path.
+///
+/// This is a thin wrapper around [`serde_json::Value::pointer`].
+///
+/// # Examples
+/// ```
+/// use serde_json::json;
+/// use loco_rs::bgworker::extract_job_data_value;
+///
+/// let data = json!({"org": {"id": "abc123"}});
+/// assert_eq!(extract_job_data_value(&data, "/org/id"), Some(&json!("abc123")));
+/// assert_eq!(extract_job_data_value(&data, "/missing"), None);
+/// ```
+#[must_use]
+pub fn extract_job_data_value<'a>(
+    data: &'a serde_json::Value,
+    pointer: &str,
+) -> Option<&'a serde_json::Value> {
+    data.pointer(pointer)
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[cfg_attr(feature = "cli", derive(ValueEnum))]
@@ -61,6 +134,20 @@ impl std::fmt::Display for JobStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         to_variant_name(self).expect("only enum supported").fmt(f)
     }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct Job {
+    pub id: String,
+    pub name: String,
+    #[serde(rename = "task_data")]
+    pub data: serde_json::Value,
+    pub status: JobStatus,
+    pub run_at: DateTime<Utc>,
+    pub interval: Option<i64>,
+    pub created_at: Option<DateTime<Utc>>,
+    pub updated_at: Option<DateTime<Utc>>,
+    pub tags: Option<Vec<String>>,
 }
 
 // Queue struct now holds both a QueueProvider and QueueRegistrar
@@ -368,29 +455,19 @@ impl Queue {
         &self,
         status: Option<&Vec<JobStatus>>,
         age_days: Option<i64>,
-    ) -> Result<serde_json::Value> {
+    ) -> Result<Vec<Job>> {
         tracing::info!(status = ?status, age_days = ?age_days, "Retrieving jobs");
         match self {
             #[cfg(feature = "bg_pg")]
-            Self::Postgres(pool, _, _, _) => {
-                let jobs = pg::get_jobs(pool, status, age_days)
-                    .await
-                    .map_err(Box::from)?;
-                Ok(serde_json::to_value(jobs)?)
-            }
+            Self::Postgres(pool, _, _, _) => Ok(pg::get_jobs(pool, status, age_days)
+                .await
+                .map_err(Box::from)?),
             #[cfg(feature = "bg_sqlt")]
-            Self::Sqlite(pool, _, _, _) => {
-                let jobs = sqlt::get_jobs(pool, status, age_days)
-                    .await
-                    .map_err(Box::from)?;
-
-                Ok(serde_json::to_value(jobs)?)
-            }
+            Self::Sqlite(pool, _, _, _) => Ok(sqlt::get_jobs(pool, status, age_days)
+                .await
+                .map_err(Box::from)?),
             #[cfg(feature = "bg_redis")]
-            Self::Redis(pool, _, _, _) => {
-                let jobs = redis::get_jobs(pool, status, age_days).await?;
-                Ok(serde_json::to_value(jobs)?)
-            }
+            Self::Redis(pool, _, _, _) => Ok(redis::get_jobs(pool, status, age_days).await?),
             Self::None => {
                 tracing::error!(
                     "No queue provider is configured: compile with at least one queue provider \
@@ -406,33 +483,17 @@ impl Queue {
     /// # Errors
     /// - If no queue provider is configured, it will return an error indicating the lack of configuration.
     /// - Any error in the underlying provider's query logic will propagate from the respective function.
-    pub async fn get_job(&self, job_id: &str) -> Result<Option<serde_json::Value>> {
+    pub async fn get_job(&self, job_id: &str) -> Result<Option<Job>> {
         tracing::debug!(job_id = job_id, "Retrieving job by ID");
         match self {
             #[cfg(feature = "bg_pg")]
             Self::Postgres(pool, _, _, _) => {
-                let job = pg::get_job(pool, job_id).await.map_err(Box::from)?;
-                match job {
-                    Some(j) => Ok(Some(serde_json::to_value(j)?)),
-                    None => Ok(None),
-                }
+                Ok(pg::get_job(pool, job_id).await.map_err(Box::from)?)
             }
             #[cfg(feature = "bg_sqlt")]
-            Self::Sqlite(pool, _, _, _) => {
-                let job = sqlt::get_job(pool, job_id).await?;
-                match job {
-                    Some(j) => Ok(Some(serde_json::to_value(j)?)),
-                    None => Ok(None),
-                }
-            }
+            Self::Sqlite(pool, _, _, _) => Ok(sqlt::get_job(pool, job_id).await?),
             #[cfg(feature = "bg_redis")]
-            Self::Redis(pool, _, _, _) => {
-                let job = redis::get_job(pool, job_id).await?;
-                match job {
-                    Some(j) => Ok(Some(serde_json::to_value(j)?)),
-                    None => Ok(None),
-                }
-            }
+            Self::Redis(pool, _, _, _) => Ok(redis::get_job(pool, job_id).await?),
             Self::None => {
                 tracing::error!(
                     "No queue provider is configured: compile with at least one queue provider feature"
@@ -452,7 +513,7 @@ impl Queue {
         worker_name: &str,
         status: Option<&Vec<JobStatus>>,
         age_days: Option<i64>,
-    ) -> Result<serde_json::Value> {
+    ) -> Result<Vec<Job>> {
         tracing::info!(
             worker_name = worker_name,
             status = ?status,
@@ -463,24 +524,101 @@ impl Queue {
         match self {
             #[cfg(feature = "bg_pg")]
             Self::Postgres(pool, _, _, _) => {
-                let jobs = pg::get_jobs_by_name(pool, worker_name, status, age_days)
+                Ok(pg::get_jobs_by_name(pool, worker_name, status, age_days)
                     .await
-                    .map_err(Box::from)?;
-                Ok(serde_json::to_value(jobs)?)
+                    .map_err(Box::from)?)
             }
             #[cfg(feature = "bg_sqlt")]
             Self::Sqlite(pool, _, _, _) => {
-                let jobs = sqlt::get_jobs_by_name(pool, worker_name, status, age_days).await?;
-                Ok(serde_json::to_value(jobs)?)
+                Ok(sqlt::get_jobs_by_name(pool, worker_name, status, age_days).await?)
             }
             #[cfg(feature = "bg_redis")]
             Self::Redis(pool, _, _, _) => {
-                let jobs = redis::get_jobs_by_name(pool, worker_name, status, age_days).await?;
-                Ok(serde_json::to_value(jobs)?)
+                Ok(redis::get_jobs_by_name(pool, worker_name, status, age_days).await?)
             }
             Self::None => {
                 tracing::error!(
                     "No queue provider is configured: compile with at least one queue provider feature"
+                );
+                Err(Error::string("provider not configured"))
+            }
+        }
+    }
+
+    /// Retrieves jobs filtered by matching scalar values at JSON pointer paths
+    /// within `task_data`.
+    ///
+    /// Multiple filters combine with AND semantics. Use JSON pointer syntax for
+    /// paths (e.g. `"/org/id"`).
+    ///
+    /// # Errors
+    /// - If no queue provider is configured.
+    /// - If any filter has an invalid path or non-scalar value.
+    /// - If the underlying provider query fails.
+    pub async fn get_jobs_by_data(
+        &self,
+        filters: &[JobDataFilter],
+        status: Option<&Vec<JobStatus>>,
+        age_days: Option<i64>,
+    ) -> Result<Vec<Job>> {
+        for filter in filters {
+            validate_filter(filter)?;
+        }
+
+        match self {
+            #[cfg(feature = "bg_pg")]
+            Self::Postgres(pool, _, _, _) => {
+                Ok(pg::get_jobs_by_data(pool, filters, status, age_days)
+                    .await
+                    .map_err(Box::from)?)
+            }
+            #[cfg(feature = "bg_sqlt")]
+            Self::Sqlite(pool, _, _, _) => {
+                Ok(sqlt::get_jobs_by_data(pool, filters, status, age_days).await?)
+            }
+            #[cfg(feature = "bg_redis")]
+            Self::Redis(pool, _, _, _) => {
+                Ok(redis::get_jobs_by_data(pool, filters, status, age_days).await?)
+            }
+            Self::None => {
+                tracing::error!(
+                    "No queue provider is configured: compile with at least one queue provider \
+                     feature"
+                );
+                Err(Error::string("provider not configured"))
+            }
+        }
+    }
+
+    /// Retrieves jobs matching all dimensions of a [`JobFilter`] in a single
+    /// query.
+    ///
+    /// Returns a flat JSON array (like `get_jobs`). No pagination.
+    ///
+    /// # Errors
+    /// - If no queue provider is configured.
+    /// - If any data filter has an invalid path or non-scalar value.
+    /// - If the underlying provider query fails.
+    pub async fn query_jobs(&self, filter: &JobFilter) -> Result<Vec<Job>> {
+        if let Some(data_filters) = &filter.data {
+            for f in data_filters {
+                validate_filter(f)?;
+            }
+        }
+
+        match self {
+            #[cfg(feature = "bg_pg")]
+            Self::Postgres(pool, _, _, _) => {
+                Ok(pg::query_jobs(pool, filter).await.map_err(Box::from)?)
+            }
+            #[cfg(feature = "bg_sqlt")]
+            Self::Sqlite(pool, _, _, _) => Ok(sqlt::query_jobs(pool, filter).await?),
+            #[cfg(feature = "bg_redis")]
+            Self::Redis(pool, _, _, _) => Ok(redis::query_jobs(pool, filter).await?),
+            Self::None => {
+                tracing::error!(
+                    "No queue provider is configured: compile with at least one queue provider \
+                     feature"
                 );
                 Err(Error::string("provider not configured"))
             }
@@ -697,16 +835,15 @@ impl Queue {
         match &self {
             #[cfg(feature = "bg_pg")]
             Self::Postgres(_, _, _, _) => {
-                let jobs: Vec<pg::Job> = serde_yaml::from_reader(File::open(path)?)?;
+                let jobs: Vec<Job> = serde_yaml::from_reader(File::open(path)?)?;
                 for job in jobs {
                     self.enqueue(job.name.clone(), None, job.data, None).await?;
                 }
-
                 Ok(())
             }
             #[cfg(feature = "bg_sqlt")]
             Self::Sqlite(_, _, _, _) => {
-                let jobs: Vec<sqlt::Job> = serde_yaml::from_reader(File::open(path)?)?;
+                let jobs: Vec<Job> = serde_yaml::from_reader(File::open(path)?)?;
                 for job in jobs {
                     self.enqueue(job.name.clone(), None, job.data, None).await?;
                 }
@@ -714,7 +851,7 @@ impl Queue {
             }
             #[cfg(feature = "bg_redis")]
             Self::Redis(_, _, _, _) => {
-                let jobs: Vec<redis::Job> = serde_yaml::from_reader(File::open(path)?)?;
+                let jobs: Vec<Job> = serde_yaml::from_reader(File::open(path)?)?;
                 for job in jobs {
                     self.enqueue(job.name.clone(), None, job.data, None).await?;
                 }
@@ -1063,7 +1200,7 @@ mod tests {
             .expect("get job");
         assert!(job.is_some());
         let job = job.unwrap();
-        assert_eq!(job["id"], "01JDM0X8EVAM823JZBGKYNBA99");
+        assert_eq!(job.id, "01JDM0X8EVAM823JZBGKYNBA99");
 
         // Test getting a non-existent job
         let job = queue.get_job("nonexistent").await.expect("get job");
@@ -1093,7 +1230,6 @@ mod tests {
             .get_jobs_by_name("UserAccountActivation", None, None)
             .await
             .expect("get jobs by name");
-        let jobs = jobs.as_array().expect("jobs should be array");
         assert_eq!(jobs.len(), 2);
 
         // Test getting jobs by name with status filter
@@ -1105,7 +1241,6 @@ mod tests {
             )
             .await
             .expect("get jobs by name with status");
-        let jobs = jobs.as_array().expect("jobs should be array");
         assert_eq!(jobs.len(), 1);
     }
 
@@ -1140,7 +1275,7 @@ mod tests {
             .await
             .expect("get job")
             .unwrap();
-        assert_eq!(job["status"], "cancelled");
+        assert_eq!(job.status, JobStatus::Cancelled);
 
         // Try to cancel again - should return false
         let cancelled_again = queue
@@ -1148,5 +1283,216 @@ mod tests {
             .await
             .expect("cancel job");
         assert!(!cancelled_again);
+    }
+
+    #[test]
+    fn extract_job_data_value_nested() {
+        let data = serde_json::json!({"org": {"id": "abc123", "nested": {"deep": 42}}});
+        assert_eq!(
+            extract_job_data_value(&data, "/org/id"),
+            Some(&serde_json::json!("abc123"))
+        );
+        assert_eq!(
+            extract_job_data_value(&data, "/org/nested/deep"),
+            Some(&serde_json::json!(42))
+        );
+        assert_eq!(extract_job_data_value(&data, "/missing"), None);
+    }
+
+    #[test]
+    fn validate_filter_rejects_bad_paths() {
+        // Path not starting with /
+        let f = JobDataFilter {
+            path: "org/id".to_string(),
+            value: serde_json::json!("x"),
+        };
+        assert!(validate_filter(&f).is_err());
+
+        // Empty segment
+        let f = JobDataFilter {
+            path: "/a//b".to_string(),
+            value: serde_json::json!("x"),
+        };
+        assert!(validate_filter(&f).is_err());
+
+        // Object value
+        let f = JobDataFilter {
+            path: "/a".to_string(),
+            value: serde_json::json!({"nested": true}),
+        };
+        assert!(validate_filter(&f).is_err());
+
+        // Array value
+        let f = JobDataFilter {
+            path: "/a".to_string(),
+            value: serde_json::json!([1, 2]),
+        };
+        assert!(validate_filter(&f).is_err());
+    }
+
+    #[test]
+    fn validate_filter_accepts_scalars() {
+        for val in [
+            serde_json::json!("hello"),
+            serde_json::json!(42),
+            serde_json::json!(true),
+            serde_json::Value::Null,
+        ] {
+            let f = JobDataFilter {
+                path: "/a/b".to_string(),
+                value: val,
+            };
+            assert!(validate_filter(&f).is_ok());
+        }
+    }
+
+    #[tokio::test]
+    async fn queue_get_jobs_by_data() {
+        let tree_fs = tree_fs::TreeBuilder::default()
+            .drop(true)
+            .create()
+            .expect("create temp folder");
+        let qcfg = sqlite_config(tree_fs.root.as_path());
+        let queue = sqlt::create_provider(&qcfg)
+            .await
+            .expect("create sqlite queue");
+
+        let pool = sqlx::SqlitePool::connect(&qcfg.uri)
+            .await
+            .expect("connect to sqlite db");
+
+        queue.setup().await.expect("setup sqlite db");
+        tests_cfg::queue::sqlite_seed_data(&pool).await;
+
+        // Filter by user_id = 133 (should match job 01JDM0X8EVAM823JZBGKYNBA99)
+        let filters = vec![JobDataFilter {
+            path: "/user_id".to_string(),
+            value: serde_json::json!(133),
+        }];
+        let jobs = queue
+            .get_jobs_by_data(&filters, None, None)
+            .await
+            .expect("get jobs by data");
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].id, "01JDM0X8EVAM823JZBGKYNBA99");
+
+        // Filter by email = "user24@example.com" (should match job 01JDM0X8EVAM823JZBGKYNBA87)
+        let filters = vec![JobDataFilter {
+            path: "/email".to_string(),
+            value: serde_json::json!("user24@example.com"),
+        }];
+        let jobs = queue
+            .get_jobs_by_data(&filters, None, None)
+            .await
+            .expect("get jobs by data");
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].id, "01JDM0X8EVAM823JZBGKYNBA87");
+
+        // Filter with status constraint
+        let filters = vec![JobDataFilter {
+            path: "/email".to_string(),
+            value: serde_json::json!("user11@example.com"),
+        }];
+        let jobs = queue
+            .get_jobs_by_data(&filters, Some(&vec![JobStatus::Completed]), None)
+            .await
+            .expect("get jobs by data");
+        assert_eq!(jobs.len(), 0); // user11 is queued, not completed
+
+        // Multiple filters (AND): user_id=133 AND email=user11@example.com
+        let filters = vec![
+            JobDataFilter {
+                path: "/user_id".to_string(),
+                value: serde_json::json!(133),
+            },
+            JobDataFilter {
+                path: "/email".to_string(),
+                value: serde_json::json!("user11@example.com"),
+            },
+        ];
+        let jobs = queue
+            .get_jobs_by_data(&filters, None, None)
+            .await
+            .expect("get jobs by data");
+        assert_eq!(jobs.len(), 1);
+
+        // Multiple filters (AND) that don't both match same job
+        let filters = vec![
+            JobDataFilter {
+                path: "/user_id".to_string(),
+                value: serde_json::json!(133),
+            },
+            JobDataFilter {
+                path: "/email".to_string(),
+                value: serde_json::json!("user24@example.com"),
+            },
+        ];
+        let jobs = queue
+            .get_jobs_by_data(&filters, None, None)
+            .await
+            .expect("get jobs by data");
+        assert_eq!(jobs.len(), 0);
+
+        // Path doesn't exist in any job → returns empty
+        let filters = vec![JobDataFilter {
+            path: "/nonexistent/path".to_string(),
+            value: serde_json::json!("anything"),
+        }];
+        let jobs = queue
+            .get_jobs_by_data(&filters, None, None)
+            .await
+            .expect("get jobs by data");
+        assert_eq!(jobs.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn queue_query_jobs_combined() {
+        let tree_fs = tree_fs::TreeBuilder::default()
+            .drop(true)
+            .create()
+            .expect("create temp folder");
+        let qcfg = sqlite_config(tree_fs.root.as_path());
+        let queue = sqlt::create_provider(&qcfg)
+            .await
+            .expect("create sqlite queue");
+
+        let pool = sqlx::SqlitePool::connect(&qcfg.uri)
+            .await
+            .expect("connect to sqlite db");
+
+        queue.setup().await.expect("setup sqlite db");
+        tests_cfg::queue::sqlite_seed_data(&pool).await;
+
+        // Combine name + data + status filters
+        let filter = JobFilter {
+            name: Some("UserAccountActivation".to_string()),
+            data: Some(vec![JobDataFilter {
+                path: "/user_id".to_string(),
+                value: serde_json::json!(133),
+            }]),
+            status: Some(vec![JobStatus::Queued]),
+            ..Default::default()
+        };
+        let jobs = queue.query_jobs(&filter).await.expect("query_jobs");
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].id, "01JDM0X8EVAM823JZBGKYNBA99");
+
+        // Same name + data but wrong status → empty
+        let filter = JobFilter {
+            name: Some("UserAccountActivation".to_string()),
+            data: Some(vec![JobDataFilter {
+                path: "/user_id".to_string(),
+                value: serde_json::json!(133),
+            }]),
+            status: Some(vec![JobStatus::Completed]),
+            ..Default::default()
+        };
+        let jobs = queue.query_jobs(&filter).await.expect("query_jobs");
+        assert_eq!(jobs.len(), 0);
+
+        // Empty filter → all jobs
+        let filter = JobFilter::default();
+        let jobs = queue.query_jobs(&filter).await.expect("query_jobs");
+        assert_eq!(jobs.len(), 14);
     }
 }

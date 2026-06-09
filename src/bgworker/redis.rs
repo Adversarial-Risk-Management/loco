@@ -4,7 +4,7 @@ use std::{
     time::Duration,
 };
 
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use futures_util::FutureExt;
 use redis::{aio::MultiplexedConnection as Connection, AsyncCommands, Client, Script};
 use serde::{Deserialize, Serialize};
@@ -14,7 +14,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, trace};
 use ulid::Ulid;
 
-use super::{BackgroundWorker, JobStatus, Queue};
+use super::{BackgroundWorker, Job, JobStatus, Queue};
 use crate::{config::RedisQueueConfig, Error, Result};
 
 pub type RedisPool = Client;
@@ -25,6 +25,29 @@ const QUEUE_KEY_PREFIX: &str = "queue:";
 const JOB_KEY_PREFIX: &str = "job:";
 const PROCESSING_KEY_PREFIX: &str = "processing:";
 
+/// Iterates the Redis keyspace with `SCAN` instead of the blocking `KEYS`
+/// command.  Returns all keys matching `pattern`.
+async fn scan_keys(conn: &mut Connection, pattern: &str) -> Result<Vec<String>> {
+    let mut cursor = 0u64;
+    let mut keys = Vec::new();
+    loop {
+        let (new_cursor, batch): (u64, Vec<String>) = redis::cmd("SCAN")
+            .arg(cursor)
+            .arg("MATCH")
+            .arg(pattern)
+            .arg("COUNT")
+            .arg(100)
+            .query_async(conn)
+            .await?;
+        keys.extend(batch);
+        cursor = new_cursor;
+        if cursor == 0 {
+            break;
+        }
+    }
+    Ok(keys)
+}
+
 type JobHandler = Box<
     dyn Fn(
             JobId,
@@ -33,20 +56,6 @@ type JobHandler = Box<
         + Send
         + Sync,
 >;
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct Job {
-    pub id: JobId,
-    pub name: String,
-    #[serde(rename = "task_data")]
-    pub data: JobData,
-    pub status: JobStatus,
-    pub run_at: DateTime<Utc>,
-    pub interval: Option<i64>,
-    pub created_at: Option<DateTime<Utc>>,
-    pub updated_at: Option<DateTime<Utc>>,
-    pub tags: Option<Vec<String>>,
-}
 
 // Implementation for job creation and serialization
 impl Job {
@@ -474,24 +483,17 @@ pub async fn get_jobs_by_name(
 ) -> Result<Vec<Job>> {
     let mut conn = get_connection(client).await?;
 
-    // Get all job keys
     let job_pattern = format!("{JOB_KEY_PREFIX}*");
-    let job_keys: Vec<String> = redis::cmd("KEYS")
-        .arg(&job_pattern)
-        .query_async(&mut conn)
-        .await?;
+    let job_keys = scan_keys(&mut conn, &job_pattern).await?;
 
-    // Collect all matching jobs
     let mut jobs = Vec::new();
     for job_key in job_keys {
         let job_json: Option<String> = conn.get(&job_key).await?;
         if let Some(json) = job_json {
             if let Ok(job) = Job::from_json(&json) {
-                // Filter by name
                 if job.name != name {
                     continue;
                 }
-                // Use the same filter logic as get_jobs
                 if should_include_job(&job, status, age_days) {
                     jobs.push(job);
                 }
@@ -526,10 +528,7 @@ pub async fn cancel_job(client: &RedisPool, id: &str) -> Result<bool> {
 
                 // Remove from queue if present
                 let queue_pattern = format!("{QUEUE_KEY_PREFIX}*");
-                let queue_keys: Vec<String> = redis::cmd("KEYS")
-                    .arg(&queue_pattern)
-                    .query_async(&mut conn)
-                    .await?;
+                let queue_keys = scan_keys(&mut conn, &queue_pattern).await?;
 
                 for queue_key in queue_keys {
                     let _: () = conn.lrem(&queue_key, 1, id).await?;
@@ -630,6 +629,94 @@ fn should_include_job(job: &Job, status: Option<&Vec<JobStatus>>, age_days: Opti
         }
     }
     true
+}
+
+/// Checks whether a job's `task_data` matches all the given data filters.
+fn matches_data_filters(job: &Job, filters: &[super::JobDataFilter]) -> bool {
+    filters
+        .iter()
+        .all(|f| job.data.pointer(&f.path) == Some(&f.value))
+}
+
+/// Retrieves jobs filtered by matching scalar values at JSON pointer paths
+/// within `task_data`.
+///
+/// Filtering happens in memory after fetching all jobs from Redis.
+///
+/// # Errors
+///
+/// This function will return an error if the Redis query fails.
+pub async fn get_jobs_by_data(
+    client: &RedisPool,
+    filters: &[super::JobDataFilter],
+    status: Option<&Vec<JobStatus>>,
+    age_days: Option<i64>,
+) -> Result<Vec<Job>> {
+    let mut conn = get_connection(client).await?;
+    let mut jobs = Vec::new();
+
+    let job_pattern = format!("{JOB_KEY_PREFIX}*");
+    let job_keys = scan_keys(&mut conn, &job_pattern).await?;
+
+    for job_key in job_keys {
+        let job_json: Option<String> = conn.get(&job_key).await?;
+        if let Some(json) = job_json {
+            if let Ok(job) = Job::from_json(&json) {
+                if should_include_job(&job, status, age_days) && matches_data_filters(&job, filters)
+                {
+                    jobs.push(job);
+                }
+            }
+        }
+    }
+
+    Ok(jobs)
+}
+
+/// Checks whether a job matches all dimensions of a [`super::JobFilter`].
+fn matches_filter(job: &Job, filter: &super::JobFilter) -> bool {
+    if !should_include_job(job, filter.status.as_ref(), filter.age_days) {
+        return false;
+    }
+    if let Some(name) = &filter.name {
+        if job.name != *name {
+            return false;
+        }
+    }
+    if let Some(data_filters) = &filter.data {
+        if !matches_data_filters(job, data_filters) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Retrieves jobs matching all dimensions of a [`super::JobFilter`].
+///
+/// Filtering happens in memory after fetching all jobs from Redis.
+///
+/// # Errors
+///
+/// This function will return an error if the Redis query fails.
+pub async fn query_jobs(client: &RedisPool, filter: &super::JobFilter) -> Result<Vec<Job>> {
+    let mut conn = get_connection(client).await?;
+    let mut jobs = Vec::new();
+
+    let job_pattern = format!("{JOB_KEY_PREFIX}*");
+    let job_keys = scan_keys(&mut conn, &job_pattern).await?;
+
+    for job_key in job_keys {
+        let job_json: Option<String> = conn.get(&job_key).await?;
+        if let Some(json) = job_json {
+            if let Ok(job) = Job::from_json(&json) {
+                if matches_filter(&job, filter) {
+                    jobs.push(job);
+                }
+            }
+        }
+    }
+
+    Ok(jobs)
 }
 
 /// Clears jobs based on their status from the Redis queue.
@@ -1741,5 +1828,61 @@ mod tests {
                 assert!(created_at <= Utc::now() - chrono::Duration::days(10));
             }
         }
+    }
+
+    #[tokio::test]
+    async fn test_can_query_jobs_combined() {
+        let (client, _container) = setup_redis().await;
+
+        // Enqueue jobs with known data
+        let args1 = serde_json::json!({"user_id": 42, "email": "a@test.com"});
+        enqueue(&client, "WorkerA".to_string(), None, args1, None)
+            .await
+            .expect("enqueue");
+
+        let args2 = serde_json::json!({"user_id": 42, "email": "b@test.com"});
+        enqueue(&client, "WorkerB".to_string(), None, args2, None)
+            .await
+            .expect("enqueue");
+
+        let args3 = serde_json::json!({"user_id": 99, "email": "c@test.com"});
+        enqueue(&client, "WorkerA".to_string(), None, args3, None)
+            .await
+            .expect("enqueue");
+
+        // Name + data filter
+        let filter = super::super::JobFilter {
+            name: Some("WorkerA".to_string()),
+            data: Some(vec![super::super::JobDataFilter {
+                path: "/user_id".to_string(),
+                value: serde_json::json!(42),
+            }]),
+            status: Some(vec![JobStatus::Queued]),
+            ..Default::default()
+        };
+        let jobs = super::query_jobs(&client, &filter)
+            .await
+            .expect("query_jobs");
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].name, "WorkerA");
+        assert_eq!(jobs[0].data["user_id"], 42);
+        assert_eq!(jobs[0].data["email"], "a@test.com");
+
+        // Wrong name → empty
+        let filter = super::super::JobFilter {
+            name: Some("NoSuchWorker".to_string()),
+            ..Default::default()
+        };
+        let jobs = super::query_jobs(&client, &filter)
+            .await
+            .expect("query_jobs");
+        assert_eq!(jobs.len(), 0);
+
+        // Empty filter → all jobs
+        let filter = super::super::JobFilter::default();
+        let jobs = super::query_jobs(&client, &filter)
+            .await
+            .expect("query_jobs");
+        assert_eq!(jobs.len(), 3);
     }
 }

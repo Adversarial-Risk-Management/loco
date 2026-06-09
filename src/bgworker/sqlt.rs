@@ -4,7 +4,7 @@ use std::{
     time::Duration,
 };
 
-use super::{BackgroundWorker, JobStatus, Queue};
+use super::{BackgroundWorker, Job, JobStatus, Queue};
 use crate::{config::SqliteQueueConfig, Error, Result};
 use chrono::{DateTime, Utc};
 use futures_util::FutureExt;
@@ -31,20 +31,6 @@ type JobHandler = Box<
         + Send
         + Sync,
 >;
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct Job {
-    pub id: JobId,
-    pub name: String,
-    #[serde(rename = "task_data")]
-    pub data: JobData,
-    pub status: JobStatus,
-    pub run_at: DateTime<Utc>,
-    pub interval: Option<i64>,
-    pub created_at: Option<DateTime<Utc>>,
-    pub updated_at: Option<DateTime<Utc>>,
-    pub tags: Option<Vec<String>>,
-}
 
 pub struct JobRegistry {
     handlers: Arc<HashMap<String, JobHandler>>,
@@ -651,7 +637,7 @@ pub async fn get_jobs_by_name(
     status: Option<&Vec<JobStatus>>,
     age_days: Option<i64>,
 ) -> Result<Vec<Job>> {
-    let mut query = format!("SELECT * FROM sqlt_loco_queue WHERE name = '{name}'");
+    let mut query = String::from("SELECT * FROM sqlt_loco_queue WHERE name = ?");
 
     if let Some(status) = status {
         let status_in = status
@@ -669,7 +655,7 @@ pub async fn get_jobs_by_name(
     }
 
     debug!(name = name, status = ?status, age_days = ?age_days, "Retrieving jobs by name");
-    let rows = sqlx::query(&query).fetch_all(pool).await?;
+    let rows = sqlx::query(&query).bind(name).fetch_all(pool).await?;
     let jobs = rows.iter().filter_map(|row| to_job(row).ok()).collect();
     debug!(job_count = rows.len(), "Retrieved jobs from database");
     Ok(jobs)
@@ -733,6 +719,141 @@ pub async fn get_jobs(
     let rows = sqlx::query(&query).fetch_all(pool).await?;
     let jobs = rows.iter().filter_map(|row| to_job(row).ok()).collect();
     debug!(job_count = rows.len(), "Retrieved jobs from database");
+    Ok(jobs)
+}
+
+/// Converts a JSON pointer path (e.g. `/org/id` or `/items/0/name`) to a
+/// `SQLite` `json_extract` path (e.g. `'$.org.id'` or `'$.items[0].name'`).
+///
+/// Handles RFC 6901 tilde escaping: `~0` → `~`, `~1` → `/`.
+#[allow(clippy::unnecessary_wraps)]
+fn pointer_to_sqlite_path(pointer: &str) -> crate::Result<String> {
+    let mut result = String::from("$");
+    for segment in pointer[1..].split('/') {
+        let decoded = segment.replace("~1", "/").replace("~0", "~");
+        if decoded.chars().all(|c| c.is_ascii_digit()) {
+            let _ = write!(result, "[{decoded}]");
+        } else {
+            let _ = write!(result, ".{decoded}");
+        }
+    }
+    Ok(result)
+}
+
+/// Appends a SQL WHERE clause fragment for a single [`super::JobDataFilter`] to
+/// `query`. The JSON path and string values are parameterized via `?`
+/// placeholders — the caller must bind the collected `bind_values` in order
+/// when executing the query.
+fn append_sqlt_json_filter(
+    query: &mut String,
+    filter: &super::JobDataFilter,
+    bind_values: &mut Vec<String>,
+) -> crate::Result<()> {
+    let sqlt_path = pointer_to_sqlite_path(&filter.path)?;
+    if filter.value.is_null() {
+        let _ = write!(query, " AND json_extract(task_data, ?) IS NULL");
+        bind_values.push(sqlt_path);
+    } else if let Some(s) = filter.value.as_str() {
+        let _ = write!(query, " AND json_extract(task_data, ?) = ?");
+        bind_values.push(sqlt_path);
+        bind_values.push(s.to_string());
+    } else if let Some(b) = filter.value.as_bool() {
+        let int_val = i32::from(b);
+        let _ = write!(query, " AND json_extract(task_data, ?) = {int_val}");
+        bind_values.push(sqlt_path);
+    } else if filter.value.is_number() {
+        let _ = write!(query, " AND json_extract(task_data, ?) = {}", filter.value);
+        bind_values.push(sqlt_path);
+    }
+    Ok(())
+}
+
+/// Retrieves jobs filtered by matching scalar values at JSON pointer paths
+/// within `task_data`.
+///
+/// # Errors
+///
+/// This function will return an error if the database query fails.
+pub async fn get_jobs_by_data(
+    pool: &SqlitePool,
+    filters: &[super::JobDataFilter],
+    status: Option<&Vec<JobStatus>>,
+    age_days: Option<i64>,
+) -> crate::Result<Vec<Job>> {
+    let mut query = String::from("SELECT * FROM sqlt_loco_queue WHERE 1 = 1");
+    let mut bind_values: Vec<String> = Vec::new();
+
+    for filter in filters {
+        append_sqlt_json_filter(&mut query, filter, &mut bind_values)?;
+    }
+
+    if let Some(status) = status {
+        let status_in = status
+            .iter()
+            .map(|s| format!("'{s}'"))
+            .collect::<Vec<String>>()
+            .join(",");
+        let _ = write!(query, " AND status IN ({status_in})");
+    }
+
+    if let Some(age_days) = age_days {
+        let cutoff_date = Utc::now() - chrono::Duration::days(age_days);
+        let threshold_date = cutoff_date.format("%+").to_string();
+        let _ = write!(query, " AND created_at <= '{threshold_date}'");
+    }
+
+    debug!(filters = ?filters, status = ?status, age_days = ?age_days, "Retrieving jobs by data filter");
+    let mut q = sqlx::query(&query);
+    for val in &bind_values {
+        q = q.bind(val.clone());
+    }
+    let rows = q.fetch_all(pool).await?;
+    let jobs = rows.iter().filter_map(|row| to_job(row).ok()).collect();
+    Ok(jobs)
+}
+
+/// Retrieves jobs matching all dimensions of a [`super::JobFilter`] in a single
+/// query.
+///
+/// # Errors
+///
+/// This function will return an error if the database query fails.
+pub async fn query_jobs(pool: &SqlitePool, filter: &super::JobFilter) -> crate::Result<Vec<Job>> {
+    let mut query = String::from("SELECT * FROM sqlt_loco_queue WHERE 1 = 1");
+    let mut bind_values: Vec<String> = Vec::new();
+
+    if let Some(name) = &filter.name {
+        let _ = write!(query, " AND name = ?");
+        bind_values.push(name.clone());
+    }
+
+    if let Some(data_filters) = &filter.data {
+        for f in data_filters {
+            append_sqlt_json_filter(&mut query, f, &mut bind_values)?;
+        }
+    }
+
+    if let Some(status) = &filter.status {
+        let status_in = status
+            .iter()
+            .map(|s| format!("'{s}'"))
+            .collect::<Vec<String>>()
+            .join(",");
+        let _ = write!(query, " AND status IN ({status_in})");
+    }
+
+    if let Some(age_days) = filter.age_days {
+        let cutoff_date = Utc::now() - chrono::Duration::days(age_days);
+        let threshold_date = cutoff_date.format("%+").to_string();
+        let _ = write!(query, " AND created_at <= '{threshold_date}'");
+    }
+
+    let mut q = sqlx::query(&query);
+    for val in &bind_values {
+        q = q.bind(val.clone());
+    }
+    let rows = q.fetch_all(pool).await?;
+    let jobs = rows.iter().filter_map(|row| to_job(row).ok()).collect();
     Ok(jobs)
 }
 
@@ -1706,5 +1827,129 @@ mod tests {
             .await
             .expect("cancel job");
         assert!(!cancelled_nonexistent);
+    }
+
+    #[test]
+    fn pointer_to_sqlite_path_basic() {
+        assert_eq!(
+            super::pointer_to_sqlite_path("/org/id").unwrap(),
+            "$.org.id"
+        );
+    }
+
+    #[test]
+    fn pointer_to_sqlite_path_array_index() {
+        assert_eq!(
+            super::pointer_to_sqlite_path("/items/0/name").unwrap(),
+            "$.items[0].name"
+        );
+    }
+
+    #[test]
+    fn pointer_to_sqlite_path_tilde_escaping() {
+        // ~0 → ~, ~1 → /
+        assert_eq!(
+            super::pointer_to_sqlite_path("/a~0b/c~1d").unwrap(),
+            "$.a~b.c/d"
+        );
+    }
+
+    #[tokio::test]
+    async fn can_get_jobs_by_data() {
+        let tree_fs = tree_fs::TreeBuilder::default()
+            .drop(true)
+            .create()
+            .expect("create temp folder");
+        let pool = init(&tree_fs.root).await;
+
+        assert!(initialize_database(&pool).await.is_ok());
+        tests_cfg::queue::sqlite_seed_data(&pool).await;
+
+        // Filter by user_id = 133
+        let filters = vec![super::super::JobDataFilter {
+            path: "/user_id".to_string(),
+            value: serde_json::json!(133),
+        }];
+        let jobs = super::get_jobs_by_data(&pool, &filters, None, None)
+            .await
+            .expect("get jobs by data");
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].id, "01JDM0X8EVAM823JZBGKYNBA99");
+
+        // Filter by email string
+        let filters = vec![super::super::JobDataFilter {
+            path: "/email".to_string(),
+            value: serde_json::json!("user24@example.com"),
+        }];
+        let jobs = super::get_jobs_by_data(&pool, &filters, None, None)
+            .await
+            .expect("get jobs by data");
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].id, "01JDM0X8EVAM823JZBGKYNBA87");
+
+        // Filter with status
+        let filters = vec![super::super::JobDataFilter {
+            path: "/user_id".to_string(),
+            value: serde_json::json!(133),
+        }];
+        let jobs =
+            super::get_jobs_by_data(&pool, &filters, Some(&vec![JobStatus::Completed]), None)
+                .await
+                .expect("get jobs by data");
+        assert_eq!(jobs.len(), 0); // user_id 133 is queued, not completed
+
+        // Missing path → empty result
+        let filters = vec![super::super::JobDataFilter {
+            path: "/nonexistent".to_string(),
+            value: serde_json::json!("anything"),
+        }];
+        let jobs = super::get_jobs_by_data(&pool, &filters, None, None)
+            .await
+            .expect("get jobs by data");
+        assert_eq!(jobs.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn can_query_jobs_combined() {
+        let tree_fs = tree_fs::TreeBuilder::default()
+            .drop(true)
+            .create()
+            .expect("create temp folder");
+        let pool = init(&tree_fs.root).await;
+
+        assert!(initialize_database(&pool).await.is_ok());
+        tests_cfg::queue::sqlite_seed_data(&pool).await;
+
+        // Name + data + status
+        let filter = super::super::JobFilter {
+            name: Some("UserAccountActivation".to_string()),
+            data: Some(vec![super::super::JobDataFilter {
+                path: "/user_id".to_string(),
+                value: serde_json::json!(133),
+            }]),
+            status: Some(vec![JobStatus::Queued]),
+            ..Default::default()
+        };
+        let jobs = super::query_jobs(&pool, &filter).await.expect("query_jobs");
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].id, "01JDM0X8EVAM823JZBGKYNBA99");
+
+        // Wrong status → empty
+        let filter = super::super::JobFilter {
+            name: Some("UserAccountActivation".to_string()),
+            data: Some(vec![super::super::JobDataFilter {
+                path: "/user_id".to_string(),
+                value: serde_json::json!(133),
+            }]),
+            status: Some(vec![JobStatus::Completed]),
+            ..Default::default()
+        };
+        let jobs = super::query_jobs(&pool, &filter).await.expect("query_jobs");
+        assert_eq!(jobs.len(), 0);
+
+        // Empty filter → all jobs
+        let filter = super::super::JobFilter::default();
+        let jobs = super::query_jobs(&pool, &filter).await.expect("query_jobs");
+        assert_eq!(jobs.len(), 14);
     }
 }

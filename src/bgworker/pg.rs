@@ -4,7 +4,7 @@ use std::{
     time::Duration,
 };
 
-use super::{BackgroundWorker, JobStatus, Queue};
+use super::{BackgroundWorker, Job, JobStatus, Queue};
 use crate::{config::PostgresQueueConfig, Error, Result};
 use chrono::{DateTime, Utc};
 use futures_util::FutureExt;
@@ -31,20 +31,6 @@ type JobHandler = Box<
         + Send
         + Sync,
 >;
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct Job {
-    pub id: JobId,
-    pub name: String,
-    #[serde(rename = "task_data")]
-    pub data: JobData,
-    pub status: JobStatus,
-    pub run_at: DateTime<Utc>,
-    pub interval: Option<i64>,
-    pub created_at: Option<DateTime<Utc>>,
-    pub updated_at: Option<DateTime<Utc>>,
-    pub tags: Option<Vec<String>>,
-}
 
 pub struct JobRegistry {
     handlers: Arc<HashMap<String, JobHandler>>,
@@ -601,7 +587,7 @@ pub async fn get_jobs_by_name(
     status: Option<&Vec<JobStatus>>,
     age_days: Option<i64>,
 ) -> Result<Vec<Job>, sqlx::Error> {
-    let mut query = format!("SELECT * FROM pg_loco_queue WHERE name = '{name}'");
+    let mut query = String::from("SELECT * FROM pg_loco_queue WHERE name = $1");
 
     if let Some(status) = status {
         let status_in = status
@@ -620,7 +606,7 @@ pub async fn get_jobs_by_name(
     }
 
     debug!(name = name, status = ?status, age_days = ?age_days, "Retrieving jobs by name");
-    let rows = sqlx::query(&query).fetch_all(pool).await?;
+    let rows = sqlx::query(&query).bind(name).fetch_all(pool).await?;
     let jobs = rows.iter().filter_map(|row| to_job(row).ok()).collect();
     debug!(job_count = rows.len(), "Retrieved jobs from database");
     Ok(jobs)
@@ -647,6 +633,149 @@ pub async fn cancel_job(pool: &PgPool, id: &str) -> Result<bool, sqlx::Error> {
 
     Ok(result.rows_affected() > 0)
 }
+/// Converts a JSON pointer path (e.g. `/org/id`) to a `PostgreSQL` `#>>` path
+/// literal (e.g. `'{org,id}'`).
+///
+/// Handles RFC 6901 tilde escaping: `~0` → `~`, `~1` → `/`.
+#[allow(clippy::unnecessary_wraps)]
+fn pointer_to_pg_path(pointer: &str) -> Result<String> {
+    let segments: Vec<String> = pointer[1..]
+        .split('/')
+        .map(|s| s.replace("~1", "/").replace("~0", "~"))
+        .collect();
+    Ok(format!(
+        "'{{{}}}'",
+        segments
+            .iter()
+            .map(|s| s.replace('\'', "''"))
+            .collect::<Vec<_>>()
+            .join(",")
+    ))
+}
+
+/// Appends a SQL WHERE clause fragment for a single [`super::JobDataFilter`] to
+/// `query`. String values are parameterized via `$N` placeholders — the caller
+/// must bind the collected `bind_values` in order when executing the query.
+fn append_pg_json_filter(
+    query: &mut String,
+    filter: &super::JobDataFilter,
+    param_idx: &mut i32,
+    bind_values: &mut Vec<String>,
+) -> Result<()> {
+    let pg_path = pointer_to_pg_path(&filter.path)?;
+    if filter.value.is_null() {
+        let _ = write!(
+            query,
+            " AND (task_data #> {pg_path} IS NULL OR task_data #> {pg_path} = 'null'::jsonb)"
+        );
+    } else if let Some(s) = filter.value.as_str() {
+        *param_idx += 1;
+        let _ = write!(query, " AND task_data #>> {pg_path} = ${}", *param_idx);
+        bind_values.push(s.to_string());
+    } else if let Some(n) = filter.value.as_f64() {
+        let _ = write!(query, " AND (task_data #>> {pg_path})::numeric = {n}");
+    } else if let Some(b) = filter.value.as_bool() {
+        let _ = write!(query, " AND (task_data #>> {pg_path})::boolean = {b}");
+    }
+    Ok(())
+}
+
+/// Retrieves jobs filtered by matching scalar values at JSON pointer paths
+/// within `task_data`.
+///
+/// # Errors
+///
+/// This function will return an error if the database query fails.
+pub async fn get_jobs_by_data(
+    pool: &PgPool,
+    filters: &[super::JobDataFilter],
+    status: Option<&Vec<JobStatus>>,
+    age_days: Option<i64>,
+) -> Result<Vec<Job>, sqlx::Error> {
+    let mut query = String::from("SELECT * FROM pg_loco_queue WHERE true");
+    let mut param_idx = 0i32;
+    let mut bind_values: Vec<String> = Vec::new();
+
+    for filter in filters {
+        append_pg_json_filter(&mut query, filter, &mut param_idx, &mut bind_values)
+            .map_err(|e| sqlx::Error::Protocol(e.to_string()))?;
+    }
+
+    if let Some(status) = status {
+        let status_in = status
+            .iter()
+            .map(|s| format!("'{s}'"))
+            .collect::<Vec<String>>()
+            .join(",");
+        let _ = write!(query, " AND status in ({status_in})");
+    }
+
+    if let Some(age_days) = age_days {
+        let _ = write!(
+            query,
+            " AND created_at <= NOW() - INTERVAL '1 day' * {age_days}"
+        );
+    }
+
+    debug!(filters = ?filters, status = ?status, age_days = ?age_days, "Retrieving jobs by data filter");
+    let mut q = sqlx::query(&query);
+    for val in &bind_values {
+        q = q.bind(val.clone());
+    }
+    let rows = q.fetch_all(pool).await?;
+    let jobs = rows.iter().filter_map(|row| to_job(row).ok()).collect();
+    Ok(jobs)
+}
+
+/// Retrieves jobs matching all dimensions of a [`super::JobFilter`] in a single
+/// query.
+///
+/// # Errors
+///
+/// This function will return an error if the database query fails.
+pub async fn query_jobs(pool: &PgPool, filter: &super::JobFilter) -> Result<Vec<Job>, sqlx::Error> {
+    let mut query = String::from("SELECT * FROM pg_loco_queue WHERE true");
+    let mut param_idx = 0i32;
+    let mut bind_values: Vec<String> = Vec::new();
+
+    if let Some(name) = &filter.name {
+        param_idx += 1;
+        let _ = write!(query, " AND name = ${param_idx}");
+        bind_values.push(name.clone());
+    }
+
+    if let Some(data_filters) = &filter.data {
+        for f in data_filters {
+            append_pg_json_filter(&mut query, f, &mut param_idx, &mut bind_values)
+                .map_err(|e| sqlx::Error::Protocol(e.to_string()))?;
+        }
+    }
+
+    if let Some(status) = &filter.status {
+        let status_in = status
+            .iter()
+            .map(|s| format!("'{s}'"))
+            .collect::<Vec<String>>()
+            .join(",");
+        let _ = write!(query, " AND status in ({status_in})");
+    }
+
+    if let Some(age_days) = filter.age_days {
+        let _ = write!(
+            query,
+            " AND created_at <= NOW() - INTERVAL '1 day' * {age_days}"
+        );
+    }
+
+    let mut q = sqlx::query(&query);
+    for val in &bind_values {
+        q = q.bind(val.clone());
+    }
+    let rows = q.fetch_all(pool).await?;
+    let jobs = rows.iter().filter_map(|row| to_job(row).ok()).collect();
+    Ok(jobs)
+}
+
 /// Converts a row from the database into a [`Job`] object.
 ///
 /// This function takes a row from the `Postgres` database and manually extracts the necessary
@@ -1496,5 +1625,43 @@ mod tests {
             .await
             .expect("cancel job");
         assert!(!cancelled_nonexistent);
+    }
+
+    #[tokio::test]
+    async fn can_query_jobs_combined() {
+        let (pool, _container) = setup_pg_test().await;
+        tests_cfg::queue::postgres_seed_data(&pool).await;
+
+        // Name + data + status
+        let filter = super::super::JobFilter {
+            name: Some("UserAccountActivation".to_string()),
+            data: Some(vec![super::super::JobDataFilter {
+                path: "/user_id".to_string(),
+                value: serde_json::json!(133),
+            }]),
+            status: Some(vec![JobStatus::Queued]),
+            ..Default::default()
+        };
+        let jobs = super::query_jobs(&pool, &filter).await.expect("query_jobs");
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].id, "01JDM0X8EVAM823JZBGKYNBA99");
+
+        // Wrong status → empty
+        let filter = super::super::JobFilter {
+            name: Some("UserAccountActivation".to_string()),
+            data: Some(vec![super::super::JobDataFilter {
+                path: "/user_id".to_string(),
+                value: serde_json::json!(133),
+            }]),
+            status: Some(vec![JobStatus::Completed]),
+            ..Default::default()
+        };
+        let jobs = super::query_jobs(&pool, &filter).await.expect("query_jobs");
+        assert_eq!(jobs.len(), 0);
+
+        // Empty filter → all jobs
+        let filter = super::super::JobFilter::default();
+        let jobs = super::query_jobs(&pool, &filter).await.expect("query_jobs");
+        assert_eq!(jobs.len(), 14);
     }
 }
