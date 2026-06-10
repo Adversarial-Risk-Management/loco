@@ -61,5 +61,6 @@ that is easy to rebase and fix up.
 | Fork docs + tooling | `fork-meta` | [#5](https://github.com/Adversarial-Risk-Management/loco/pull/5) | — | merged to `master` |
 | Testing deps: axum-test 20, testcontainers 0.27 (RUSTSEC-2025-0111), scraper 0.27, rstest 0.26, reqwest 0.13 | `deps/testing` | [#8](https://github.com/Adversarial-Risk-Management/loco/pull/8) | — | merged to `master` (drop if upstream bumps these) |
 | Runtime dep majors: thiserror 2, tower 0.5, heck 0.5, jsonwebtoken 10, rand 0.10, toml 1 | `deps/runtime-majors` | [#9](https://github.com/Adversarial-Risk-Management/loco/pull/9) | — | merged to `master` (drop if upstream bumps these) |
+| loco-new deps: rand 0.9, thin-vec 0.2.18 (dependabot + API migration) | `dependabot/cargo/cargo-01ced5c6fb` | [#11](https://github.com/Adversarial-Risk-Management/loco/pull/11) | — | merged to `master` (drop if upstream bumps these) |
 
 Keep this table current whenever a patch is added, merged, or upstreamed.
