@@ -59,5 +59,6 @@ that is easy to rebase and fix up.
 | Fix clippy lints for Rust 1.96 | `clippy-rust-1.96` | [#6](https://github.com/Adversarial-Risk-Management/loco/pull/6) | — | merged to `master` (transient; drop when upstream ships a 1.96 clippy fix) |
 | Fix clippy lints for Rust 1.96 in loco-new | `clippy-rust-1.96-loco-new` | [#10](https://github.com/Adversarial-Risk-Management/loco/pull/10) | — | in review (transient; drop when upstream ships a 1.96 clippy fix) |
 | Fork docs + tooling | `fork-meta` | [#5](https://github.com/Adversarial-Risk-Management/loco/pull/5) | — | merged to `master` |
+| Testing deps: axum-test 20, testcontainers 0.27 (RUSTSEC-2025-0111), scraper 0.27, rstest 0.26, reqwest 0.13 | `deps/testing` | [#8](https://github.com/Adversarial-Risk-Management/loco/pull/8) | — | in review (drop if upstream bumps these) |
 
 Keep this table current whenever a patch is added, merged, or upstreamed.

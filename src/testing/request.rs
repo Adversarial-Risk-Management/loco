@@ -265,8 +265,7 @@ where
     let server = TestServer::new_with_config(
         routes.into_make_service_with_connect_info::<SocketAddr>(),
         test_server_config,
-    )
-    .unwrap();
+    );
 
     callback(server, boot.app_context.clone()).await;
 }
