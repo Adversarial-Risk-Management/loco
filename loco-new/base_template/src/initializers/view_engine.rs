@@ -8,7 +8,10 @@ use loco_rs::{
 };
 use tracing::info;
 
-const I18N_DIR: &str = "assets/i18n";
+// The locales directory must contain only per-locale subdirectories (e.g.
+// `en-US/`); fluent-templates treats loose `.ftl` files in the scanned
+// directory as locales of their own, so shared resources live one level up.
+const I18N_DIR: &str = "assets/i18n/locales";
 const I18N_SHARED: &str = "assets/i18n/shared.ftl";
 #[allow(clippy::module_name_repetitions)]
 pub struct ViewEngineInitializer;
