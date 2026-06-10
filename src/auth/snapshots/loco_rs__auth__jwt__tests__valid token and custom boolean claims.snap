@@ -1,5 +1,6 @@
 ---
 source: src/auth/jwt.rs
+assertion_line: 151
 expression: jwt.validate(&token)
 ---
 Ok(
@@ -17,6 +18,12 @@ Ok(
             x5c: None,
             x5t: None,
             x5t_s256: None,
+            crit: None,
+            enc: None,
+            zip: None,
+            url: None,
+            nonce: None,
+            extras: {},
         },
         claims: UserClaims {
             pid: "pid",

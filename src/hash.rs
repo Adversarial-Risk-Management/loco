@@ -3,7 +3,7 @@ use argon2::{
     password_hash::{rand_core::OsRng, SaltString},
     Argon2, Params, PasswordHash, PasswordHasher, PasswordVerifier, Version,
 };
-use rand::{distr::Alphanumeric, rng, Rng};
+use rand::{distr::Alphanumeric, rng, RngExt};
 
 /// Hashes a plain text password and returns the hashed result.
 ///

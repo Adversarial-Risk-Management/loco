@@ -69,7 +69,7 @@ sea-orm = { version = "1.1.0", features = [
     "macros",
 ], optional = true }
 
-tokio = { version = "1.45", default-features = false }
+tokio = { version = "1.52", default-features = false }
 tokio-util = "0.7"
 # the rest
 
@@ -77,7 +77,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = "0.9"
 serde_variant = "0.1.2"
-toml = "0.8"
+toml = "1"
 
 async-trait = { workspace = true }
 
@@ -111,8 +111,8 @@ tower-http = { workspace = true }
 byte-unit = "4.0.19"
 
 argon2 = { version = "0.5", features = ["std"] }
-rand = { version = "0.9", features = ["std"] }
-jsonwebtoken = { version = "9.3.0", optional = true }
+rand = { version = "0.10", features = ["std"] }
+jsonwebtoken = { version = "10.4.0", features = ["rust_crypto"], optional = true }
 validator = { version = "0.20.0", features = ["derive"] }
 futures-util = "0.3"
 tower = { workspace = true }
@@ -166,12 +166,12 @@ colored = { version = "3.0" }
 chrono = { version = "0.4", features = ["serde"] }
 tracing = "0.1.40"
 regex = "1"
-thiserror = "1"
+thiserror = "2"
 serde = "1"
 serde_json = "1"
 async-trait = { version = "0.1.74" }
 axum = { version = "0.8.1", features = ["macros", "multipart"] }
-tower = "0.4"
+tower = "0.5"
 tower-http = { version = "0.6.8", features = [
     "trace",
     "catch-panic",
@@ -182,7 +182,7 @@ tower-http = { version = "0.6.8", features = [
     "set-header",
     "compression-full",
 ] }
-heck = "0.4.0"
+heck = "0.5.0"
 duct = { version = "1.0.0" }
 
 [dependencies.sea-orm-migration]

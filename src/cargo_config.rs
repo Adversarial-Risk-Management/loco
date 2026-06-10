@@ -230,6 +230,37 @@ version = "0.1.0"
     }
 
     #[test]
+    fn test_toml_1_1_multiline_inline_table() {
+        let tree = setup_test_dir(Some(
+            r#"
+[package]
+name = "test-app"
+version = "0.1.0"
+
+[dependencies]
+some-dep = {
+  version = "1",
+  features = [
+    "a",
+    "b",
+  ],
+}
+
+[package.metadata.db.entity]
+with-serde = "serialize"
+"#,
+        ));
+
+        let config = CargoConfig::from_path(tree.root.join("Cargo.toml"))
+            .expect("Failed to parse Cargo.toml with TOML 1.1 multi-line inline table");
+
+        let entities = config
+            .get_db_entities()
+            .expect("No db entities found in Cargo.toml");
+        assert_eq!(entities["with-serde"].as_str(), Some("serialize"));
+    }
+
+    #[test]
     fn test_invalid_toml() {
         let tree = setup_test_dir(Some(
             r"
