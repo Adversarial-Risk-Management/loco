@@ -55,7 +55,7 @@ that is easy to rebase and fix up.
 | Allow running scheduler and server without worker | `separate-sched-flag` | [#1](https://github.com/Adversarial-Risk-Management/loco/pull/1) | [#1742](https://github.com/loco-rs/loco/pull/1742) | merged to `master` |
 | Expose methods for querying worker queue / job IDs | `feature/expose-worker-job-ids` | [#2](https://github.com/Adversarial-Risk-Management/loco/pull/2) | [#1624](https://github.com/loco-rs/loco/pull/1624) | in review |
 | `perform_all_later` for batch job enqueueing | `perform-all-later` | [#3](https://github.com/Adversarial-Risk-Management/loco/pull/3) | — | in review |
-| Multiple recipients in mailer | `feat/multi-recipient-email` | [#4](https://github.com/Adversarial-Risk-Management/loco/pull/4) | — | in review |
+| Multiple recipients in mailer (`to`/`cc`/`bcc` → `Vec<String>`; flexible `string`-or-`seq` deserializer keeps legacy single-string `Email` payloads readable) | `feat/multi-recipient-email` | [#4](https://github.com/Adversarial-Risk-Management/loco/pull/4) | — | in review |
 | Fix clippy lints for Rust 1.96 | `clippy-rust-1.96` | [#6](https://github.com/Adversarial-Risk-Management/loco/pull/6) | — | merged to `master` (transient; drop when upstream ships a 1.96 clippy fix) |
 | Fix loco-new CI: Rust 1.96 clippy + fluent-templates 0.13.3 i18n layout | `clippy-rust-1.96-loco-new` | [#10](https://github.com/Adversarial-Risk-Management/loco/pull/10), [#12](https://github.com/Adversarial-Risk-Management/loco/pull/12) | — | merged to `master` (drop when upstream fixes loco-new CI) |
 | Fork docs + tooling | `fork-meta` | [#5](https://github.com/Adversarial-Risk-Management/loco/pull/5) | — | merged to `master` |

@@ -5,10 +5,15 @@
 mod email_sender;
 mod template;
 
+use std::fmt;
+
 use async_trait::async_trait;
 pub use email_sender::EmailSender;
 use include_dir::Dir;
-use serde::{Deserialize, Serialize};
+use serde::{
+    de::{SeqAccess, Visitor},
+    Deserialize, Deserializer, Serialize,
+};
 use tracing::error;
 
 use self::template::Template;
@@ -16,6 +21,53 @@ use super::{app::AppContext, Result};
 use crate::prelude::BackgroundWorker;
 
 pub const DEFAULT_FROM_SENDER: &str = "System <system@example.com>";
+
+/// Deserializes a recipient list that may be encoded as either a single string
+/// (the legacy single-recipient format), a sequence of strings, or `null`.
+///
+/// This keeps [`Email`] payloads that were serialized before `to`/`cc`/`bcc`
+/// became `Vec<String>` deserializable: a bare `"a@b.com"` becomes
+/// `vec!["a@b.com"]`, and `null`/missing become an empty vector. Combine with
+/// `#[serde(default)]` so an absent field also yields an empty vector.
+fn de_recipients<'de, D>(deserializer: D) -> std::result::Result<Vec<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct RecipientsVisitor;
+
+    impl<'de> Visitor<'de> for RecipientsVisitor {
+        type Value = Vec<String>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("a string, a list of strings, or null")
+        }
+
+        fn visit_unit<E>(self) -> std::result::Result<Self::Value, E> {
+            Ok(Vec::new())
+        }
+
+        fn visit_str<E>(self, value: &str) -> std::result::Result<Self::Value, E> {
+            Ok(if value.is_empty() {
+                Vec::new()
+            } else {
+                vec![value.to_owned()]
+            })
+        }
+
+        fn visit_seq<A>(self, mut seq: A) -> std::result::Result<Self::Value, A::Error>
+        where
+            A: SeqAccess<'de>,
+        {
+            let mut out = Vec::new();
+            while let Some(item) = seq.next_element::<String>()? {
+                out.push(item);
+            }
+            Ok(out)
+        }
+    }
+
+    deserializer.deserialize_any(RecipientsVisitor)
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct EmailHeaders {
@@ -29,11 +81,11 @@ pub struct EmailHeaders {
 #[derive(Debug, Clone, Default)]
 pub struct Args {
     pub from: Option<String>,
-    pub to: String,
+    pub to: Vec<String>,
     pub reply_to: Option<String>,
     pub locals: serde_json::Value,
-    pub bcc: Option<String>,
-    pub cc: Option<String>,
+    pub bcc: Vec<String>,
+    pub cc: Vec<String>,
     pub headers: Option<EmailHeaders>,
 }
 
@@ -43,7 +95,8 @@ pub struct Email {
     /// Mailbox to `From` header
     pub from: Option<String>,
     /// Mailbox to `To` header
-    pub to: String,
+    #[serde(default, deserialize_with = "de_recipients")]
+    pub to: Vec<String>,
     /// Mailbox to `ReplyTo` header
     pub reply_to: Option<String>,
     /// Subject header to message
@@ -53,9 +106,11 @@ pub struct Email {
     /// HTML template
     pub html: String,
     /// BCC header to message
-    pub bcc: Option<String>,
+    #[serde(default, deserialize_with = "de_recipients")]
+    pub bcc: Vec<String>,
     /// CC header to message
-    pub cc: Option<String>,
+    #[serde(default, deserialize_with = "de_recipients")]
+    pub cc: Vec<String>,
     /// Custom headers for the email (e.g., References, In-Reply-To, Message-ID)
     pub headers: Option<EmailHeaders>,
 }
@@ -152,5 +207,49 @@ impl BackgroundWorker<Email> for MailerWorker {
             error!(err = err.to_string(), "mailer error");
             Err(err)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A mailer job serialized before `to`/`cc`/`bcc` became `Vec<String>` —
+    /// `to` as a bare string, `cc`/`bcc` as `null` — must still deserialize so
+    /// jobs queued by an older binary are not dropped after an upgrade.
+    #[test]
+    fn deserializes_legacy_single_recipient_payload() {
+        let legacy = serde_json::json!({
+            "from": "system@example.com",
+            "to": "user@example.com",
+            "reply_to": null,
+            "subject": "Hi",
+            "text": "text",
+            "html": "<p>text</p>",
+            "bcc": null,
+            "cc": null,
+            "headers": null
+        });
+
+        let email: Email = serde_json::from_value(legacy).expect("legacy payload must deserialize");
+        assert_eq!(email.to, vec!["user@example.com".to_string()]);
+        assert!(email.cc.is_empty());
+        assert!(email.bcc.is_empty());
+    }
+
+    /// A payload missing `cc`/`bcc` entirely also deserializes (empty vecs).
+    #[test]
+    fn deserializes_payload_with_missing_recipient_fields() {
+        let payload = serde_json::json!({
+            "to": ["a@example.com", "b@example.com"],
+            "subject": "Hi",
+            "text": "text",
+            "html": "<p>text</p>"
+        });
+
+        let email: Email = serde_json::from_value(payload).expect("payload must deserialize");
+        assert_eq!(email.to.len(), 2);
+        assert!(email.cc.is_empty());
+        assert!(email.bcc.is_empty());
     }
 }
