@@ -289,7 +289,19 @@ pub async fn enqueue(
     Ok(id)
 }
 
-/// Enqueue multiple jobs in a single batch INSERT.
+/// Maximum number of jobs per INSERT statement. Each row binds 6 parameters,
+/// so this stays well under Postgres's 65535 bind-parameter cap and bounds the
+/// statement size (mirrors Sidekiq's bulk-push chunking). Larger batches are
+/// split across multiple statements that all run inside one transaction, so the
+/// whole batch is still enqueued atomically regardless of how many chunks it
+/// spans.
+const ENQUEUE_BATCH_CHUNK_SIZE: usize = 5_000;
+
+/// Enqueue multiple jobs in a single atomic batch.
+///
+/// Every job is inserted inside one transaction: either all of them are
+/// enqueued or none are. A failure mid-batch rolls back, so the batch leaves
+/// nothing behind and is safe to retry without duplicating jobs.
 ///
 /// # Errors
 ///
@@ -304,29 +316,33 @@ pub async fn enqueue_batch(
 
     let now = Utc::now();
     let mut ids = Vec::with_capacity(jobs.len());
-    let mut query_builder = sqlx::query_builder::QueryBuilder::<sqlx::Postgres>::new(
-        "INSERT INTO pg_loco_queue (id, task_data, name, run_at, interval, tags) ",
-    );
-
-    query_builder.push_values(jobs.iter(), |mut b, (name, data, tags)| {
-        let id = Ulid::new().to_string();
-        let data_json = serde_json::to_value(data).unwrap_or(serde_json::Value::Null);
-        let tags_json = tags
-            .as_ref()
-            .map(|t| serde_json::to_value(t).unwrap_or(serde_json::Value::Null));
-
-        b.push_bind(id.clone())
-            .push_bind(data_json)
-            .push_bind(name.clone())
-            .push_bind(now)
-            .push_bind(None::<i64>)
-            .push_bind(tags_json);
-
-        ids.push(id);
-    });
 
     debug!(count = jobs.len(), "Batch enqueueing jobs");
-    query_builder.build().execute(pool).await?;
+    let mut tx = pool.begin().await?;
+    for chunk in jobs.chunks(ENQUEUE_BATCH_CHUNK_SIZE) {
+        let mut query_builder = sqlx::query_builder::QueryBuilder::<sqlx::Postgres>::new(
+            "INSERT INTO pg_loco_queue (id, task_data, name, run_at, interval, tags) ",
+        );
+
+        query_builder.push_values(chunk.iter(), |mut b, (name, data, tags)| {
+            let id = Ulid::new().to_string();
+            let tags_json = tags
+                .as_ref()
+                .map(|t| serde_json::to_value(t).unwrap_or(serde_json::Value::Null));
+
+            b.push_bind(id.clone())
+                .push_bind(data.clone())
+                .push_bind(name.clone())
+                .push_bind(now)
+                .push_bind(None::<i64>)
+                .push_bind(tags_json);
+
+            ids.push(id);
+        });
+
+        query_builder.build().execute(&mut *tx).await?;
+    }
+    tx.commit().await?;
 
     Ok(ids)
 }

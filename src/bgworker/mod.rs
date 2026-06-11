@@ -164,46 +164,34 @@ impl Queue {
             count = args_list.len(),
             "Batch enqueueing background jobs"
         );
+
+        // Serialize each arg once here; a failure is surfaced rather than
+        // silently enqueuing a null payload.
+        let serialize = |a: A| -> Result<serde_json::Value> { Ok(serde_json::to_value(a)?) };
+
         match self {
             #[cfg(feature = "bg_redis")]
             Self::Redis(pool, _, _, _) => {
-                let jobs: Vec<(serde_json::Value, Option<Vec<String>>)> = args_list
+                let jobs = args_list
                     .into_iter()
-                    .map(|a| {
-                        (
-                            serde_json::to_value(a).unwrap_or(serde_json::Value::Null),
-                            tags.clone(),
-                        )
-                    })
-                    .collect();
+                    .map(|a| serialize(a).map(|v| (v, tags.clone())))
+                    .collect::<Result<Vec<_>>>()?;
                 redis::enqueue_batch(pool, class, queue, jobs).await?;
             }
             #[cfg(feature = "bg_pg")]
             Self::Postgres(pool, _, _, _) => {
-                let jobs: Vec<(String, serde_json::Value, Option<Vec<String>>)> = args_list
+                let jobs = args_list
                     .into_iter()
-                    .map(|a| {
-                        (
-                            class.clone(),
-                            serde_json::to_value(a).unwrap_or(serde_json::Value::Null),
-                            tags.clone(),
-                        )
-                    })
-                    .collect();
+                    .map(|a| serialize(a).map(|v| (class.clone(), v, tags.clone())))
+                    .collect::<Result<Vec<_>>>()?;
                 pg::enqueue_batch(pool, jobs).await.map_err(Box::from)?;
             }
             #[cfg(feature = "bg_sqlt")]
             Self::Sqlite(pool, _, _, _) => {
-                let jobs: Vec<(String, serde_json::Value, Option<Vec<String>>)> = args_list
+                let jobs = args_list
                     .into_iter()
-                    .map(|a| {
-                        (
-                            class.clone(),
-                            serde_json::to_value(a).unwrap_or(serde_json::Value::Null),
-                            tags.clone(),
-                        )
-                    })
-                    .collect();
+                    .map(|a| serialize(a).map(|v| (class.clone(), v, tags.clone())))
+                    .collect::<Result<Vec<_>>>()?;
                 sqlt::enqueue_batch(pool, jobs).await.map_err(Box::from)?;
             }
             _ => {}
@@ -719,9 +707,20 @@ pub trait BackgroundWorker<A: Send + Sync + serde::Serialize + 'static>: Send + 
 
     /// Enqueue multiple jobs at once, reducing database round trips.
     ///
-    /// In `ForegroundBlocking` mode, jobs are executed sequentially.
-    /// In `BackgroundAsync` mode, jobs are spawned concurrently.
-    /// In `BackgroundQueue` mode, jobs are inserted in a single batch.
+    /// In `BackgroundQueue` mode the jobs are inserted in a single batch (one
+    /// statement per chunk). In `ForegroundBlocking` mode the jobs run
+    /// sequentially. In `BackgroundAsync` mode a task is spawned per job
+    /// (concurrently).
+    ///
+    /// Mirrors [`Self::perform_later`]: enqueuing is fire-and-forget and no job
+    /// identifiers are returned, since two of the three modes have no persisted
+    /// queue ID to report.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `BackgroundQueue` mode is selected but no queue
+    /// provider is populated in the context, or if enqueuing a batch (queue
+    /// mode) or performing a job (foreground mode) fails.
     async fn perform_all_later(ctx: &AppContext, args_list: Vec<A>) -> crate::Result<()>
     where
         Self: Sized,
@@ -737,10 +736,10 @@ pub trait BackgroundWorker<A: Send + Sync + serde::Serialize + 'static>: Send + 
                     p.enqueue_batch(Self::class_name(), Self::queue(), args_list, tags_option)
                         .await?;
                 } else {
-                    tracing::error!(
+                    return Err(Error::string(
                         "perform_all_later: background queue is selected, but queue was not \
-                         populated in context"
-                    );
+                         populated in context",
+                    ));
                 }
             }
             WorkerMode::ForegroundBlocking => {
