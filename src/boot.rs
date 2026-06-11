@@ -24,7 +24,7 @@ use crate::{
     env_vars,
     environment::Environment,
     errors::Error,
-    mailer::{EmailSender, MailerWorker},
+    mailer::{EmailSender, MailerWorker, MultiMailerWorker},
     prelude::BackgroundWorker,
     scheduler::{self, Scheduler},
     storage::{self, Storage},
@@ -530,6 +530,9 @@ async fn register_workers<H: Hooks>(app_context: &AppContext) -> Result<()> {
     if app_context.config.workers.mode == WorkerMode::BackgroundQueue {
         if let Some(queue) = &app_context.queue_provider {
             queue.register(MailerWorker::build(app_context)).await?;
+            queue
+                .register(MultiMailerWorker::build(app_context))
+                .await?;
             H::connect_workers(app_context, queue).await?;
         } else {
             return Err(Error::QueueProviderMissing);
