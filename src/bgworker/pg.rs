@@ -243,6 +243,8 @@ pub async fn initialize_database(pool: &PgPool) -> Result<()> {
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 tags JSONB
             );
+
+            CREATE INDEX IF NOT EXISTS idx_pg_loco_queue_status_run_at ON pg_loco_queue (status, run_at);
             ",
         JobStatus::Queued
     ))
@@ -287,6 +289,64 @@ pub async fn enqueue(
     .execute(pool)
     .await?;
     Ok(id)
+}
+
+/// Maximum number of jobs per INSERT statement. Each row binds 6 parameters,
+/// so this stays well under Postgres's 65535 bind-parameter cap and bounds the
+/// statement size (mirrors Sidekiq's bulk-push chunking). Larger batches are
+/// split across multiple statements that all run inside one transaction, so the
+/// whole batch is still enqueued atomically regardless of how many chunks it
+/// spans.
+const ENQUEUE_BATCH_CHUNK_SIZE: usize = 5_000;
+
+/// Enqueue multiple jobs in a single atomic batch.
+///
+/// Every job is inserted inside one transaction: either all of them are
+/// enqueued or none are. A failure mid-batch rolls back, so the batch leaves
+/// nothing behind and is safe to retry without duplicating jobs.
+///
+/// # Errors
+///
+/// This function will return an error if it fails
+pub async fn enqueue_batch(
+    pool: &PgPool,
+    jobs: Vec<(String, JobData, Option<Vec<String>>)>,
+) -> Result<Vec<JobId>> {
+    if jobs.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let now = Utc::now();
+    let mut ids = Vec::with_capacity(jobs.len());
+
+    debug!(count = jobs.len(), "Batch enqueueing jobs");
+    let mut tx = pool.begin().await?;
+    for chunk in jobs.chunks(ENQUEUE_BATCH_CHUNK_SIZE) {
+        let mut query_builder = sqlx::query_builder::QueryBuilder::<sqlx::Postgres>::new(
+            "INSERT INTO pg_loco_queue (id, task_data, name, run_at, interval, tags) ",
+        );
+
+        query_builder.push_values(chunk.iter(), |mut b, (name, data, tags)| {
+            let id = Ulid::new().to_string();
+            let tags_json = tags
+                .as_ref()
+                .map(|t| serde_json::to_value(t).unwrap_or(serde_json::Value::Null));
+
+            b.push_bind(id.clone())
+                .push_bind(data.clone())
+                .push_bind(name.clone())
+                .push_bind(now)
+                .push_bind(None::<i64>)
+                .push_bind(tags_json);
+
+            ids.push(id);
+        });
+
+        query_builder.build().execute(&mut *tx).await?;
+    }
+    tx.commit().await?;
+
+    Ok(ids)
 }
 
 async fn dequeue(client: &PgPool, worker_tags: &[String]) -> Result<Option<Job>> {

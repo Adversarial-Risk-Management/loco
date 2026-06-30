@@ -290,6 +290,47 @@ pub async fn enqueue(
     Ok(())
 }
 
+/// Enqueue multiple jobs in a single atomic pipeline operation.
+///
+/// The pipeline runs as a `MULTI`/`EXEC` transaction, so either every job's
+/// payload and queue entry are written or none are. A failure leaves nothing
+/// behind and the batch is safe to retry without duplicating jobs.
+///
+/// # Errors
+///
+/// This function will return an error if it fails
+pub async fn enqueue_batch(
+    client: &RedisPool,
+    class: String,
+    queue: Option<String>,
+    jobs: Vec<(serde_json::Value, Option<Vec<String>>)>,
+) -> Result<Vec<JobId>> {
+    if jobs.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut conn = get_connection(client).await?;
+    let queue_name = queue.unwrap_or_else(|| "default".to_string());
+    let queue_key = format!("{QUEUE_KEY_PREFIX}{queue_name}");
+
+    let mut ids = Vec::with_capacity(jobs.len());
+    let mut pipe = redis::pipe();
+    pipe.atomic();
+    for (args_json, tags) in jobs {
+        let job_id = Ulid::new().to_string();
+        let mut job = Job::new(job_id, class.clone(), args_json);
+        job.tags = tags;
+        let job_json = job.to_json()?;
+        let job_key = format!("{JOB_KEY_PREFIX}{}", job.id);
+        pipe.set(&job_key, &job_json).ignore();
+        pipe.rpush(&queue_key, &job.id).ignore();
+        ids.push(job.id);
+    }
+
+    pipe.query_async::<()>(&mut conn).await?;
+    Ok(ids)
+}
+
 const DEQUEUE_SCRIPT: &str = r#"
 local queue_key = KEYS[1]
 local processing_key = KEYS[2]
