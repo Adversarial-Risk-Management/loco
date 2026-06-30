@@ -77,10 +77,15 @@ Creating multiple drivers:
 ```rust
 use crate::storage::{drivers, Storage};
 
-let aws_1 = drivers::aws::new("users");
-let azure = drivers::azure::new("users");
-let aws_2 = drivers::aws::new("users-mirror");
+let aws_1 = drivers::aws::new("users", "us-east-1");
+let azure = drivers::azure::new("users", "account_name", "https://account_name.blob.core.windows.net");
+let aws_2 = drivers::aws::new("users-mirror", "us-east-1");
 ```
+
+Cloud drivers use ambient/default authentication in `new()` and explicit secrets in
+`with_credentials(...)`. For example, AWS uses the default AWS credential chain, GCP uses
+Application Default Credentials, and Azure loads credentials from Azure environment variables.
+Use `with_credentials(...)` when you need to pass credentials directly.
 
 #### Mirror Strategy:
 You can keep multiple services in sync by defining a mirror service. A mirror service **replicates** uploads, deletes, rename and copy across two or more subordinate services. The download behavior redundantly retrieves data, meaning if the file retrieval fails from the primary, the first file found in the secondaries is returned.
@@ -216,4 +221,3 @@ async fn can_register() {
     .await;
 }
 ```
-
