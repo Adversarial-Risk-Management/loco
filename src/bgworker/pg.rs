@@ -243,6 +243,8 @@ pub async fn initialize_database(pool: &PgPool) -> Result<()> {
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 tags JSONB
             );
+
+            CREATE INDEX IF NOT EXISTS idx_pg_loco_queue_status_run_at ON pg_loco_queue (status, run_at);
             ",
         JobStatus::Queued
     ))
