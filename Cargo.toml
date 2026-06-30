@@ -83,6 +83,12 @@ async-trait = { workspace = true }
 
 axum = { workspace = true }
 axum-extra = { version = "0.10", features = ["cookie"] }
+# `cookie` 0.18.1 (pulled in by axum-extra's `cookie` feature) calls the 1-arg
+# `time::Parsable::parse`, which `time` 0.3.52 turned into a 2-arg method. Cap
+# `time` below 0.3.52 so a fresh resolve (the root Cargo.lock is gitignored, so
+# CI always re-resolves) stays on a compatible release. Transient — drop once
+# `cookie` ships a release built against `time` 0.3.52+.
+time = ">=0.3, <0.3.52"
 regex = { workspace = true }
 # mailer
 tera = { workspace = true }
