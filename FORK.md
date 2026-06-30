@@ -58,5 +58,6 @@ that is easy to rebase and fix up.
 | Multiple recipients in mailer | `feat/multi-recipient-email` | [#4](https://github.com/Adversarial-Risk-Management/loco/pull/4) | — | in review |
 | Fix clippy lints for Rust 1.96 | `clippy-rust-1.96` | [#6](https://github.com/Adversarial-Risk-Management/loco/pull/6) | — | merged to `master` (transient; drop when upstream ships a 1.96 clippy fix) |
 | Fork docs + tooling | `fork-meta` | [#5](https://github.com/Adversarial-Risk-Management/loco/pull/5) | — | merged to `master` |
+| Default auth for GCP/Azure storage drivers (`new()` uses ambient creds; `with_credentials(...)` for explicit, credential last) | `feat/storage-default-auth` | [#14](https://github.com/Adversarial-Risk-Management/loco/pull/14) | candidate | in review |
 
 Keep this table current whenever a patch is added, merged, or upstreamed.

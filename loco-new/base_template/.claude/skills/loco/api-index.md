@@ -1318,10 +1318,12 @@ since they restate the trait's own API.
 - `fn` **with_credentials_and_endpoint**`(bucket_name: &str, region: &str, endpoint: &str, credentials: Credential) -> StorageResult<Box<dyn StoreDriver>>` — Create new AWS s3 storage with bucket, region and credentials and URL
 ## `storage::drivers::azure`
 
-- `fn` **new**`(container_name: &str, account_name: &str, access_key: &str, endpoint: &str) -> StorageResult<Box<dyn StoreDriver>>` — Create new Azure storage
+- `fn` **new**`(container_name: &str, account_name: &str, endpoint: &str) -> StorageResult<Box<dyn StoreDriver>>` — Create new Azure storage using authentication from the environment
+- `fn` **with_credentials**`(container_name: &str, account_name: &str, endpoint: &str, access_key: &str) -> StorageResult<Box<dyn StoreDriver>>` — Create new Azure storage with an explicit account key
 ## `storage::drivers::gcp`
 
-- `fn` **new**`(bucket_name: &str, credential_path: &str) -> StorageResult<Box<dyn StoreDriver>>` — Create new GCP storage
+- `fn` **new**`(bucket_name: &str) -> StorageResult<Box<dyn StoreDriver>>` — Create new GCP storage using Application Default Credentials
+- `fn` **with_credentials**`(bucket_name: &str, credential_path: &str) -> StorageResult<Box<dyn StoreDriver>>` — Create new GCP storage with an explicit service-account credential file
 ## `storage::drivers::local`
 
 - `fn` **new**`() -> Box<dyn StoreDriver>` — Create new filesystem storage rooted at the current working directory

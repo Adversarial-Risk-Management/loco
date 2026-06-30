@@ -48,8 +48,8 @@ Every driver is built by a plain constructor function under `loco_rs::storage::d
 | In-memory | none | `drivers::mem::new()` | Good for tests; data doesn't survive process exit |
 | Null | none | `drivers::null::new()` | The framework default; every op errors |
 | AWS S3 | `storage_aws_s3` | `drivers::aws::new(bucket, region) -> StorageResult<...>`<br>`drivers::aws::with_credentials(bucket, region, cred) -> StorageResult<...>`<br>`drivers::aws::with_credentials_and_endpoint(bucket, region, endpoint, cred) -> StorageResult<...>` | `Credential { key_id, secret_key, token: Option<String> }` |
-| Azure Blob | `storage_azure` | `drivers::azure::new(container, account_name, access_key, endpoint) -> StorageResult<...>` | |
-| Google Cloud Storage | `storage_gcp` | `drivers::gcp::new(bucket, credential_path) -> StorageResult<...>` | `credential_path` points to a service-account JSON key file |
+| Azure Blob | `storage_azure` | `drivers::azure::new(container, account_name, endpoint) -> StorageResult<...>` — credentials from Azure environment variables<br>`drivers::azure::with_credentials(container, account_name, endpoint, access_key) -> StorageResult<...>` | |
+| Google Cloud Storage | `storage_gcp` | `drivers::gcp::new(bucket) -> StorageResult<...>` — Application Default Credentials<br>`drivers::gcp::with_credentials(bucket, credential_path) -> StorageResult<...>` | `credential_path` points to a service-account JSON key file |
 
 All the cloud constructors return `StorageResult<Box<dyn StoreDriver>>` (they can fail to build the underlying OpenDAL operator), so propagate the error with `?`:
 
@@ -94,7 +94,7 @@ use loco_rs::storage::{
 };
 
 let primary = drivers::aws::new("bucket-primary", "us-east-1")?;
-let mirror = drivers::azure::new("container", "account", "access-key", "https://account.blob.core.windows.net")?;
+let mirror = drivers::azure::new("container", "account", "https://account.blob.core.windows.net")?;
 
 let strategy: Box<dyn StorageStrategy> = Box::new(ReplicatedStrategy::mirror(
     "primary",
