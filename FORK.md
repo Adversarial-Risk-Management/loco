@@ -63,5 +63,6 @@ that is easy to rebase and fix up.
 | Runtime dep majors: thiserror 2, tower 0.5, heck 0.5, jsonwebtoken 10, rand 0.10, toml 1 | `deps/runtime-majors` | [#9](https://github.com/Adversarial-Risk-Management/loco/pull/9) | — | merged to `master` (drop if upstream bumps these) |
 | loco-new deps: rand 0.9, thin-vec 0.2.18 (dependabot + API migration) | `dependabot/cargo/cargo-01ced5c6fb` | [#11](https://github.com/Adversarial-Risk-Management/loco/pull/11) | — | merged to `master` (drop if upstream bumps these) |
 | Cap `time` below 0.3.52 (cookie 0.18.1 via axum-extra breaks against time 0.3.52's `Parsable::parse` signature change) | `deps/time-cap` | [#15](https://github.com/Adversarial-Risk-Management/loco/pull/15) | — | in review (transient; drop when cookie ships a time-0.3.52+ release) |
+| Default auth for GCP/Azure storage drivers (`new()` uses ambient creds; `with_credentials(...)` for explicit, credential last) | `feat/storage-default-auth` | [#14](https://github.com/Adversarial-Risk-Management/loco/pull/14) | candidate | in review |
 
 Keep this table current whenever a patch is added, merged, or upstreamed.
