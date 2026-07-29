@@ -244,6 +244,53 @@ pub async fn enqueue(
     Ok(job_id)
 }
 
+/// Enqueue multiple jobs in a single atomic pipeline operation. `tags` and
+/// `priority` apply to every job.
+///
+/// The pipeline runs as a `MULTI`/`EXEC` transaction, so either every job's
+/// payload and queue entry are written or none are. A failure leaves nothing
+/// behind and the batch is safe to retry without duplicating jobs.
+///
+/// # Errors
+///
+/// This function will return an error if it fails
+pub async fn enqueue_batch(
+    client: &RedisPool,
+    class: String,
+    queue: Option<String>,
+    args_list: Vec<serde_json::Value>,
+    tags: Option<Vec<String>>,
+    priority: Option<i32>,
+) -> Result<Vec<JobId>> {
+    if args_list.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut conn = get_connection(client).await?;
+    let queue_name = queue.unwrap_or_else(|| "default".to_string());
+    let queue_key = format!("{QUEUE_KEY_PREFIX}{queue_name}");
+    let priority = priority.unwrap_or(0);
+    let score = calculate_score(priority);
+
+    let mut ids = Vec::with_capacity(args_list.len());
+    let mut pipe = redis::pipe();
+    pipe.atomic();
+    for args_json in args_list {
+        let job_id = Ulid::new().to_string();
+        let mut job = Job::new(job_id, class.clone(), args_json);
+        job.tags = tags.clone();
+        job.priority = priority;
+        let job_json = job.to_json()?;
+        let job_key = format!("{JOB_KEY_PREFIX}{}", job.id);
+        pipe.set(&job_key, &job_json).ignore();
+        pipe.zadd(&queue_key, &job.id, score).ignore();
+        ids.push(job.id);
+    }
+
+    pipe.query_async::<()>(&mut conn).await?;
+    Ok(ids)
+}
+
 /// Redis ZSET score for a job, derived from priority only.
 ///
 /// We deliberately use only the priority in the score to preserve exact
@@ -980,6 +1027,17 @@ impl QueueProvider for RedisQueue {
         Ok(Some(
             enqueue(&self.client, class, queue, args, tags, priority).await?,
         ))
+    }
+
+    async fn enqueue_batch(
+        &self,
+        class: String,
+        queue: Option<String>,
+        args_list: Vec<JsonValue>,
+        tags: Option<Vec<String>>,
+        priority: Option<i32>,
+    ) -> Result<Vec<JobId>> {
+        enqueue_batch(&self.client, class, queue, args_list, tags, priority).await
     }
 
     async fn register_handler(&self, name: String, handler: JobHandler) -> Result<()> {

@@ -165,6 +165,36 @@ pub trait QueueProvider: Send + Sync {
         priority: Option<i32>,
     ) -> Result<Option<String>>;
 
+    /// Add multiple jobs to the queue in one batch. See [`Queue::enqueue_batch`]
+    /// for the full contract.
+    ///
+    /// The default implementation enqueues jobs one at a time and is NOT
+    /// atomic; the built-in Postgres/`SQLite`/Redis providers override it with
+    /// a single-transaction (or `MULTI`/`EXEC`) batch so a mid-batch failure
+    /// leaves nothing behind.
+    ///
+    /// # Errors
+    /// This function will return an error if the enqueue operation fails.
+    async fn enqueue_batch(
+        &self,
+        class: String,
+        queue: Option<String>,
+        args_list: Vec<JsonValue>,
+        tags: Option<Vec<String>>,
+        priority: Option<i32>,
+    ) -> Result<Vec<JobId>> {
+        let mut ids = Vec::with_capacity(args_list.len());
+        for args in args_list {
+            if let Some(id) = self
+                .enqueue(class.clone(), queue.clone(), args, tags.clone(), priority)
+                .await?
+            {
+                ids.push(id);
+            }
+        }
+        Ok(ids)
+    }
+
     /// Registers a pre-erased job handler under `name`.
     ///
     /// # Errors
@@ -468,6 +498,50 @@ impl Queue {
             .await
     }
 
+    /// Add multiple jobs to the queue in a single batch operation, returning
+    /// the assigned job IDs (empty when no provider is configured).
+    ///
+    /// This reduces round trips compared to calling [`Queue::enqueue`] in a
+    /// loop — dispatchers that fan out hundreds of jobs (e.g. a notification
+    /// generator) otherwise pay one INSERT per job. The built-in providers
+    /// enqueue the whole batch atomically: either every job is enqueued or
+    /// none are, so a failed batch is safe to retry without duplicating jobs.
+    ///
+    /// `tags` and `priority` apply to every job in the batch; priority
+    /// semantics match [`Queue::enqueue`].
+    ///
+    /// # Errors
+    ///
+    /// This function will return an error if serialization or the enqueue
+    /// operation fails.
+    pub async fn enqueue_batch<A: Serialize + Send + Sync>(
+        &self,
+        class: String,
+        queue: Option<String>,
+        args_list: Vec<A>,
+        tags: Option<Vec<String>>,
+        priority: Option<i32>,
+    ) -> Result<Vec<JobId>> {
+        if args_list.is_empty() {
+            return Ok(Vec::new());
+        }
+        tracing::debug!(
+            worker = class,
+            queue = ?queue,
+            count = args_list.len(),
+            "Batch enqueueing background jobs"
+        );
+        // Serialize every payload up front; a failure is surfaced before
+        // anything is enqueued rather than silently enqueuing a null payload.
+        let args_list = args_list
+            .into_iter()
+            .map(|a| Ok(serde_json::to_value(a)?))
+            .collect::<Result<Vec<_>>>()?;
+        self.0
+            .enqueue_batch(class, queue, args_list, tags, priority)
+            .await
+    }
+
     /// Register a worker
     ///
     /// # Errors
@@ -766,6 +840,100 @@ pub trait BackgroundWorker<A: Send + Sync + serde::Serialize + 'static>: Send + 
             }
         };
         Ok(job_id)
+    }
+
+    /// Enqueue (or run) multiple jobs at once at the default priority and
+    /// return their IDs.
+    ///
+    /// Convenience wrapper over
+    /// [`BackgroundWorker::perform_all_later_with_priority`] with no explicit
+    /// priority.
+    async fn perform_all_later(ctx: &AppContext, args_list: Vec<A>) -> crate::Result<Vec<String>>
+    where
+        Self: Sized,
+    {
+        Self::perform_all_later_with_priority(ctx, args_list, None).await
+    }
+
+    /// Enqueue (or run) multiple jobs at once with an explicit priority and
+    /// return their IDs, reducing round trips compared to calling
+    /// [`BackgroundWorker::perform_later`] in a loop.
+    ///
+    /// In `BackgroundQueue` mode the whole batch is enqueued atomically (one
+    /// statement per chunk inside one transaction) and the IDs are the ones
+    /// assigned by the queue provider. In `ForegroundBlocking` mode the jobs
+    /// run sequentially; in `BackgroundAsync` mode a task is spawned per job.
+    /// In both non-queue modes (or when no provider is configured) fresh IDs
+    /// are generated so callers always get stable handles back, matching
+    /// [`BackgroundWorker::perform_later_with_priority`].
+    ///
+    /// `priority` applies to every job in the batch; higher values are
+    /// dequeued first (see [`Queue::enqueue`]).
+    async fn perform_all_later_with_priority(
+        ctx: &AppContext,
+        args_list: Vec<A>,
+        priority: Option<i32>,
+    ) -> crate::Result<Vec<String>>
+    where
+        Self: Sized,
+    {
+        if args_list.is_empty() {
+            return Ok(Vec::new());
+        }
+        let job_ids = match &ctx.config.workers.mode {
+            WorkerMode::BackgroundQueue => {
+                if let Some(p) = &ctx.queue_provider {
+                    let tags = Self::tags();
+                    let tags_option = if tags.is_empty() { None } else { Some(tags) };
+                    p.enqueue_batch(
+                        Self::class_name(),
+                        Self::queue(),
+                        args_list,
+                        tags_option,
+                        priority,
+                    )
+                    .await?
+                } else {
+                    tracing::error!(
+                        "perform_all_later: background queue is selected, but queue was not \
+                         populated in context"
+                    );
+                    args_list
+                        .iter()
+                        .map(|_| uuid::Uuid::new_v4().to_string())
+                        .collect()
+                }
+            }
+            WorkerMode::ForegroundBlocking => {
+                let worker = Self::build(ctx);
+                let mut ids = Vec::with_capacity(args_list.len());
+                for args in args_list {
+                    worker.perform(args).await?;
+                    ids.push(uuid::Uuid::new_v4().to_string());
+                }
+                ids
+            }
+            WorkerMode::BackgroundAsync => {
+                // One task per job, matching perform_later's fire-and-forget
+                // semantics — handles are dropped, not awaited.
+                args_list
+                    .into_iter()
+                    .map(|args| {
+                        let dx = ctx.clone();
+                        tokio::spawn(async move {
+                            if let Err(err) = Self::build(&dx).perform(args).await {
+                                tracing::error!(
+                                    err = err.to_string(),
+                                    "worker failed to perform job"
+                                );
+                            }
+                        });
+                        uuid::Uuid::new_v4().to_string()
+                    })
+                    .collect()
+            }
+        };
+        Ok(job_ids)
     }
 
     async fn perform(&self, args: A) -> crate::Result<()>;

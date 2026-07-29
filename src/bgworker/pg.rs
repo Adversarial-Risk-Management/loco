@@ -81,6 +81,25 @@ impl QueueProvider for PgQueue {
         ))
     }
 
+    async fn enqueue_batch(
+        &self,
+        class: String,
+        _queue: Option<String>,
+        args_list: Vec<serde_json::Value>,
+        tags: Option<Vec<String>>,
+        priority: Option<i32>,
+    ) -> Result<Vec<JobId>> {
+        enqueue_batch(
+            &self.pool,
+            &class,
+            args_list,
+            chrono::Utc::now(),
+            tags,
+            priority,
+        )
+        .await
+    }
+
     async fn register_handler(&self, name: String, handler: JobHandler) -> Result<()> {
         let mut registry = self.registry.lock().await;
         registry.insert_handler(name, handler)
@@ -289,6 +308,69 @@ pub async fn enqueue(
     .execute(pool)
     .await?;
     Ok(id)
+}
+
+/// Maximum number of jobs per INSERT statement. Each row binds 7 parameters,
+/// so this stays well under Postgres's 65535 bind-parameter cap and bounds the
+/// statement size (mirrors Sidekiq's bulk-push chunking). Larger batches are
+/// split across multiple statements that all run inside one transaction, so
+/// the whole batch is still enqueued atomically regardless of how many chunks
+/// it spans.
+const ENQUEUE_BATCH_CHUNK_SIZE: usize = 5_000;
+
+/// Enqueue multiple jobs in a single atomic batch. `tags` and `priority`
+/// apply to every job.
+///
+/// Every job is inserted inside one transaction: either all of them are
+/// enqueued or none are. A failure mid-batch rolls back, so the batch leaves
+/// nothing behind and is safe to retry without duplicating jobs.
+///
+/// # Errors
+///
+/// This function will return an error if it fails
+pub async fn enqueue_batch(
+    pool: &PgPool,
+    name: &str,
+    args_list: Vec<JobData>,
+    run_at: DateTime<Utc>,
+    tags: Option<Vec<String>>,
+    priority: Option<i32>,
+) -> Result<Vec<JobId>> {
+    if args_list.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let tags_json = match &tags {
+        Some(tags) => Some(serde_json::to_value(tags)?),
+        None => None,
+    };
+    let priority = priority.unwrap_or(0);
+    let mut ids = Vec::with_capacity(args_list.len());
+
+    debug!(count = args_list.len(), job_name = %name, "Batch enqueueing jobs");
+    let mut tx = pool.begin().await?;
+    for chunk in args_list.chunks(ENQUEUE_BATCH_CHUNK_SIZE) {
+        let mut query_builder = sqlx::query_builder::QueryBuilder::<sqlx::Postgres>::new(
+            "INSERT INTO pg_loco_queue (id, task_data, name, run_at, interval, tags, priority) ",
+        );
+
+        query_builder.push_values(chunk.iter(), |mut b, data| {
+            let id = Ulid::new().to_string();
+            b.push_bind(id.clone())
+                .push_bind(data.clone())
+                .push_bind(name.to_string())
+                .push_bind(run_at)
+                .push_bind(None::<i64>)
+                .push_bind(tags_json.clone())
+                .push_bind(priority);
+            ids.push(id);
+        });
+
+        query_builder.build().execute(&mut *tx).await?;
+    }
+    tx.commit().await?;
+
+    Ok(ids)
 }
 
 async fn dequeue(client: &PgPool, worker_tags: &[String]) -> Result<Option<Job>> {
