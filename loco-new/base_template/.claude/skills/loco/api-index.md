@@ -162,6 +162,7 @@ since they restate the trait's own API.
 - `fn` **clear_by_status**`(self: &Self, status: Vec<JobStatus>) -> Result<()>` — Clears jobs based on their status for the configured queue provider
 - `fn` **clear_jobs_older_than**`(self: &Self, age_days: i64, status: &Vec<JobStatus>) -> Result<()>` — Clears jobs older than a specified number of days for the configured queue provider
 - `fn` **describe**`(self: &Self) -> String`
+- `fn` **downcast_provider**`(self: &Self) -> Option<&T>` — Downcasts the configured provider to its concrete backend type
 - `fn` **dump**`(self: &Self, path: &Path, status: Option<&Vec<JobStatus>>, age_days: Option<i64>) -> Result<PathBuf>` — Dumps the list of jobs to a YAML file at the specified path
 - `fn` **empty**`() -> Self` — A [`Queue`] with no configured provider. Replaces the old
 - `fn` **enqueue**`(self: &Self, class: String, queue: Option<String>, args: A, tags: Option<Vec<String>>, priority: Option<i32>) -> Result<Option<String>>` — Add a job to the queue
@@ -178,6 +179,7 @@ since they restate the trait's own API.
 
 ### `QueueProvider`
 
+- `fn` **as_any**`(self: &Self) -> &dyn Any` — Returns `self` as [`Any`] so the erased provider can be downcast back
 - `fn` **cancel_jobs_by_name**`(self: &Self, name: &str) -> Pin<Box<dyn Future + Send>>` — Cancels queued jobs by name
 - `fn` **clear**`(self: &Self) -> Pin<Box<dyn Future + Send>>` — Clears all jobs from this provider
 - `fn` **clear_by_status**`(self: &Self, status: Vec<JobStatus>) -> Pin<Box<dyn Future + Send>>` — Clears jobs matching any of the given statuses

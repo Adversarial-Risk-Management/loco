@@ -1201,6 +1201,10 @@ impl QueueProvider for RedisQueue {
         self.token.cancel();
         Ok(())
     }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 }
 
 /// Builds the [`RedisQueue`] provider (client, registry, run options, token)
