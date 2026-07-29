@@ -1,4 +1,5 @@
 use std::{
+    any::Any,
     fs::File,
     io::Write,
     path::{Path, PathBuf},
@@ -253,6 +254,10 @@ pub trait QueueProvider: Send + Sync {
     /// Does not currently return an error, but implementations might, so
     /// using Result here as return type.
     fn shutdown(&self) -> Result<()>;
+
+    /// Returns `self` as [`Any`] so the erased provider can be downcast back
+    /// to its concrete backend type. See [`Queue::downcast_provider`].
+    fn as_any(&self) -> &dyn Any;
 }
 
 /// Process worker task handles and handle any errors.
@@ -389,6 +394,10 @@ impl QueueProvider for NoopQueue {
     fn shutdown(&self) -> Result<()> {
         Ok(())
     }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
 }
 
 /// A handle to a background job queue.
@@ -410,6 +419,25 @@ impl Queue {
     #[must_use]
     pub fn empty() -> Self {
         Self(Arc::new(NoopQueue))
+    }
+
+    /// Downcasts the configured provider to its concrete backend type.
+    ///
+    /// The [`Queue`] facade is deliberately provider-agnostic, but some
+    /// applications need backend-specific access it does not expose — e.g.
+    /// the Postgres pool behind [`pg::PgQueue`] to run custom (paginated or
+    /// tenant-scoped) queries against the job table:
+    ///
+    /// ```rust,ignore
+    /// let pool = queue
+    ///     .downcast_provider::<loco_rs::bgworker::pg::PgQueue>()
+    ///     .map(|pg| &pg.pool);
+    /// ```
+    ///
+    /// Returns `None` when the configured provider is not `T`.
+    #[must_use]
+    pub fn downcast_provider<T: QueueProvider + 'static>(&self) -> Option<&T> {
+        self.0.as_any().downcast_ref::<T>()
     }
 
     /// Add a job to the queue.

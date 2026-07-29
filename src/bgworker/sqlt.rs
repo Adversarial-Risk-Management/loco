@@ -171,6 +171,10 @@ impl QueueProvider for SqliteQueue {
         self.token.cancel();
         Ok(())
     }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 }
 
 async fn connect(cfg: &SqliteQueueConfig) -> Result<SqlitePool> {
