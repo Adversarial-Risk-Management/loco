@@ -10,9 +10,10 @@ untouched so they never conflict on sync.
 - **`master` mirrors upstream `master` exactly.** No fork commits ever land on it; syncing is a
   fast-forward.
 - **One branch per upstream version line carries the patches** — `0.16.x-arm`, `1.0.x-arm`, … Each
-  is `master`-at-that-version + one commit per patch, kept linear so any single patch can be
-  cherry-picked (e.g. backported from `1.0.x-arm` to `0.16.x-arm`) in isolation. The newest line
-  branch is the integration branch we build and release from.
+  starts at an upstream **release tag** (`1.0.x-arm` starts even with `v1.0.0`) and carries one
+  commit per patch, kept linear so any single patch can be cherry-picked (e.g. backported from
+  `1.0.x-arm` to `0.16.x-arm`) in isolation. The newest line branch is the integration branch we
+  build and release from.
 - **One branch per patch for review.** A new patch gets its own branch and PR targeting the
   active version-line branch, plus a row in the ledger below. Squash-merge keeps it one commit.
 - **Never commit fork-only changes straight to `master`** — it must stay a pure upstream mirror.
@@ -41,8 +42,11 @@ The `fork-sync` Claude Code skill (`.claude/skills/fork-sync/`) automates this; 
 2. Fast-forward `master` to `upstream/master` (`git checkout master && git merge --ff-only
    upstream/master`). If it won't fast-forward, something fork-only landed on `master` — fix
    that instead of merging.
-3. Same upstream version line: rebase the active `N.x-arm` branch onto the new `master`,
-   dropping any patch upstream has absorbed (record it in the ledger). New upstream version
+3. Same upstream version line (e.g. upstream tags `v1.0.1`): **merge the new release tag into
+   `N.x-arm`** (`git merge v1.0.1`) — append-only, no force-push, existing patch commits stay
+   cherry-pickable — dropping any patch upstream has absorbed (record it in the ledger). Rebasing
+   the patch stack onto the tag is the alternative when a linear history is worth a force-push.
+   New upstream version
    line: start `M.x-arm` from `master` and cherry-pick each still-needed patch commit from the
    previous line, one commit per patch.
 4. Rebase open patch branches in the ledger onto the active line branch; run `cargo fmt --all`
