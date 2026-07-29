@@ -27,8 +27,10 @@ the remote.
 ### 2. Bring upstream into master and the version-line branch
 - Fast-forward `master`: `git checkout master && git merge --ff-only upstream/master`. If it
   refuses, something fork-only landed on `master` — surface that instead of merging.
-- Same upstream version line: rebase the active `N.x-arm` branch onto the new `master`, dropping
-  any patch upstream absorbed (record it in the ledger).
+- Same upstream version line: merge the new upstream release tag into the active `N.x-arm`
+  branch (`git merge v1.0.1`; append-only, no force-push), dropping any patch upstream absorbed
+  (record it in the ledger). Rebase onto the tag instead only when a linear history is worth a
+  force-push.
 - New upstream version line: create `M.x-arm` from `master` and cherry-pick each still-needed
   patch commit from the previous line branch, one commit per patch, so every patch stays
   individually backportable.
