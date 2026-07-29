@@ -169,6 +169,10 @@ impl QueueProvider for PgQueue {
         self.token.cancel();
         Ok(())
     }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 }
 
 async fn connect(cfg: &PostgresQueueConfig) -> Result<PgPool> {
