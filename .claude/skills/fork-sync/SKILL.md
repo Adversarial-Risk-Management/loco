@@ -1,6 +1,6 @@
 ---
 name: fork-sync
-description: Sync this fork with upstream loco-rs/loco and cut a fork release. Use when asked to "sync upstream", "pull in upstream changes", "rebase our patches", "cut a fork release", or "tag a new arm version". Fetches upstream, merges into master, rebases every patch branch in the FORK.md ledger, runs the CI style gate, and proposes the next v<upstream>-arm.N tag. Dry-run by default; mutating steps require explicit confirmation.
+description: Sync this fork with upstream loco-rs/loco and cut a fork release. Use when asked to "sync upstream", "pull in upstream changes", "rebase our patches", "cut a fork release", or "tag a new arm version". Fetches upstream, fast-forwards master (a pure upstream mirror), rebases the active version-line branch and every patch branch in the FORK.md ledger, runs the CI style gate, and proposes the next v<upstream>-arm.N tag on the line branch. Dry-run by default; mutating steps require explicit confirmation.
 ---
 
 # Fork sync & release
@@ -24,15 +24,18 @@ the remote.
 - Report the commit delta: `git log --oneline master..upstream/master`.
 - Parse the ledger table in `FORK.md` to get the list of `(patch, branch)` rows.
 
-### 2. Bring upstream into master
-- Merge upstream into `master`: `git merge upstream/master` (a real merge commit; do NOT
-  squash — this preserves the squashed patch commits already on `master`).
-- Resolve conflicts if any. `CHANGELOG.md` conflicts: keep both upstream and our content as
-  appropriate, but remember we add **no** fork entries to it.
+### 2. Bring upstream into master and the version-line branch
+- Fast-forward `master`: `git checkout master && git merge --ff-only upstream/master`. If it
+  refuses, something fork-only landed on `master` — surface that instead of merging.
+- Same upstream version line: rebase the active `N.x-arm` branch onto the new `master`, dropping
+  any patch upstream absorbed (record it in the ledger).
+- New upstream version line: create `M.x-arm` from `master` and cherry-pick each still-needed
+  patch commit from the previous line branch, one commit per patch, so every patch stays
+  individually backportable.
 
-### 3. Rebase each patch branch onto the new master
-For every branch in the ledger that is not yet merged into `master`:
-- `git rebase --onto master <old-base> <branch>` (or plain `git rebase master <branch>`).
+### 3. Rebase each open patch branch onto the active line branch
+For every branch in the ledger that is not yet merged into the line branch:
+- `git rebase --onto <line-branch> <old-base> <branch>` (or plain `git rebase <line-branch> <branch>`).
 - Drop any CHANGELOG-only commits and resolve `CHANGELOG.md` conflicts by keeping master's
   version (we don't carry changelog edits in patches).
 - Run the **CI style gate** and fix fallout (newer toolchains add lints):
@@ -46,13 +49,14 @@ For every branch in the ledger that is not yet merged into `master`:
 
 ### 4. Confirm, then push (mutating — needs explicit OK)
 - Force-push each rebased branch (`git push --force-with-lease origin <branch>`).
-- Push `master`.
-- Open/refresh PRs as needed; squash-merge any patch that is ready and should ship in `master`.
+- Push `master` (fast-forward) and force-push the rebased line branch (`--force-with-lease`).
+- Open/refresh PRs as needed; squash-merge any patch that is ready into the active line branch.
 
 ### 5. Tag the release (mutating — needs explicit OK)
 - Compute the tag: `v<new-upstream-version>-arm.1` (reset N to 1 for a new upstream version;
   bump N for fork-only changes on the same base). Confirm the exact tag with the user.
-- `git tag <tag> master && git push origin <tag>`.
+- `git tag <tag> <line-branch> && git push origin <tag>` (tags are cut on the version-line
+  branch tip, not master).
 
 ### 6. Update the ledger
 - Edit the patch-ledger table in `FORK.md`: update statuses, add new rows, mark merged/upstreamed
