@@ -145,7 +145,12 @@ impl TestSupport for PostgresTest {
                 let pool = Pool::<Postgres>::connect(&connection_string)
                     .await
                     .expect("db connection should success");
-                let query = format!("drop database if exists {table_name};");
+                // WITH (FORCE) — Postgres 13+ — terminates sessions still
+                // attached to the test database. Apps legitimately hold
+                // connections outside loco's own pool (e.g. a session store
+                // on a different sqlx major), and a plain DROP fails with
+                // SQLSTATE 55006 while any of them remain.
+                let query = format!("drop database if exists {table_name} with (force);");
                 sqlx::query(AssertSqlSafe(query))
                     .execute(&pool)
                     .await
