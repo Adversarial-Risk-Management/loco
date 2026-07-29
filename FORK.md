@@ -7,13 +7,15 @@ untouched so they never conflict on sync.
 
 ## Model
 
-- **`master` = upstream `master` + our patches.** It is the integration branch we build and
-  release from. Its delta from upstream is only our patch commits (one squashed commit per
-  patch).
-- **One branch per patch.** Each carried change lives on its own branch and has its own PR into
-  `master`. Branches are kept rebased on the current `master`.
-- **Never commit fork-only changes straight to `master`.** Add a patch branch + PR, and a row in
-  the ledger below.
+- **`master` mirrors upstream `master` exactly.** No fork commits ever land on it; syncing is a
+  fast-forward.
+- **One branch per upstream version line carries the patches** — `0.16.x-arm`, `1.0.x-arm`, … Each
+  is `master`-at-that-version + one commit per patch, kept linear so any single patch can be
+  cherry-picked (e.g. backported from `1.0.x-arm` to `0.16.x-arm`) in isolation. The newest line
+  branch is the integration branch we build and release from.
+- **One branch per patch for review.** A new patch gets its own branch and PR targeting the
+  active version-line branch, plus a row in the ledger below. Squash-merge keeps it one commit.
+- **Never commit fork-only changes straight to `master`** — it must stay a pure upstream mirror.
 - **`git fetch upstream` only tracks upstream `master`** (narrowed refspec) so we don't mirror
   hundreds of upstream branches locally.
 
@@ -25,28 +27,34 @@ Fork releases are **git tags**, not Cargo version bumps:
 v<upstream-version>-arm.<N>
 ```
 
-e.g. `v0.16.4-arm.1`. The workspace `Cargo.toml` version stays at upstream's value; downstream
-consumers pin the fork by git tag or rev. Reset `N` to `1` on each new upstream version; bump
-`N` for additional fork-only changes on the same upstream base. Do **not** record releases in
-`CHANGELOG.md` (that file is upstream's and would conflict) — the tag + the ledger below are the
-record.
+e.g. `v0.16.4-arm.1`, `v1.0.0-arm.1`. Tags are cut on the **version-line branch** tip. The
+workspace `Cargo.toml` version stays at upstream's value; downstream consumers pin the fork by
+git tag or rev. Reset `N` to `1` on each new upstream version; bump `N` for additional fork-only
+changes on the same upstream base. Do **not** record releases in `CHANGELOG.md` (that file is
+upstream's and would conflict) — the tag + the ledger below are the record.
 
 ## Syncing with upstream
 
 The `fork-sync` Claude Code skill (`.claude/skills/fork-sync/`) automates this; the manual steps:
 
 1. `git fetch upstream`
-2. Merge `upstream/master` into `master` (a real merge commit; the squashed patch commits on
-   `master` are preserved).
-3. Rebase each patch branch in the ledger onto the new `master`; run `cargo fmt --all` and
-   `cargo clippy --all-features -- -D warnings -W clippy::pedantic -W clippy::nursery
-   -W rust-2018-idioms` on each (this is the CI `style` gate); force-push.
-4. Squash-merge any patch branch not yet in `master`.
-5. Tag `v<new-upstream-version>-arm.1` on the `master` tip and push the tag.
-6. Update the ledger.
+2. Fast-forward `master` to `upstream/master` (`git checkout master && git merge --ff-only
+   upstream/master`). If it won't fast-forward, something fork-only landed on `master` — fix
+   that instead of merging.
+3. Same upstream version line: rebase the active `N.x-arm` branch onto the new `master`,
+   dropping any patch upstream has absorbed (record it in the ledger). New upstream version
+   line: start `M.x-arm` from `master` and cherry-pick each still-needed patch commit from the
+   previous line, one commit per patch.
+4. Rebase open patch branches in the ledger onto the active line branch; run `cargo fmt --all`
+   and `cargo clippy --all-features -- -D warnings -W clippy::pedantic -W clippy::nursery
+   -W rust-2018-idioms` on each (this is the CI `style` gate); force-push (`--force-with-lease`).
+5. Squash-merge any patch branch that is ready into the active line branch.
+6. Tag `v<upstream-version>-arm.<N>` on the line-branch tip and push the tag.
+7. Update the ledger.
 
 The fork is configured for **squash-merge only**, so each merged patch is a single clean commit
-that is easy to rebase and fix up.
+on the line branch that is easy to rebase, cherry-pick across version lines, and drop when
+upstream absorbs it.
 
 ## Patch ledger
 
