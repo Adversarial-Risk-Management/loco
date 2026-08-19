@@ -63,6 +63,42 @@ use super::{
 };
 use crate::app::AppContext;
 
+/// Column value types that can carry an encryption envelope.
+///
+/// [`impl_encryptable_fields!`](crate::impl_encryptable_fields) routes every
+/// field read/write through this trait, so the macro works for both `String`
+/// (a `NOT NULL` column) and `Option<String>` (a nullable column — what
+/// `cargo loco generate model x:string:encrypted` produces by default). A
+/// `None` in an `Option<String>` field means SQL `NULL`: there is no
+/// plaintext, so nothing is encrypted and the value is stored as `NULL`.
+pub trait EncryptableValue: Sized {
+    /// The plaintext to encrypt, or `None` when the column value is NULL.
+    fn plaintext(&self) -> Option<&str>;
+
+    /// Rebuild the column value from an encrypted (or decrypted) string.
+    fn from_string(value: String) -> Self;
+}
+
+impl EncryptableValue for String {
+    fn plaintext(&self) -> Option<&str> {
+        Some(self)
+    }
+
+    fn from_string(value: String) -> Self {
+        value
+    }
+}
+
+impl EncryptableValue for Option<String> {
+    fn plaintext(&self) -> Option<&str> {
+        self.as_deref()
+    }
+
+    fn from_string(value: String) -> Self {
+        Some(value)
+    }
+}
+
 /// Trait for marking a model as having encryptable fields
 ///
 /// Implement this on your `ActiveModel` to specify which fields should be encrypted.

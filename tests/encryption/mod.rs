@@ -6,4 +6,6 @@ mod compress_entity;
 mod compress_tests;
 mod entity;
 mod helpers;
+mod nullable_entity;
+mod nullable_tests;
 mod tests;

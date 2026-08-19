@@ -120,7 +120,8 @@ pub use cipher::{
 };
 pub use config::{EncryptionConfig, KeyDerivationConfig};
 pub use encryptable::{
-    decrypt_field, encrypt_field, encrypt_query_value, Encryptable, ModelDecryption,
+    decrypt_field, encrypt_field, encrypt_query_value, Encryptable, EncryptableValue,
+    ModelDecryption,
 };
 pub use errors::{EncryptionError, EncryptionResult};
 pub use format::{
@@ -249,7 +250,10 @@ macro_rules! __impl_encryptable_fields_inner {
                     $(
                         stringify!($field) => {
                             match &self.$field {
-                                sea_orm::ActiveValue::Set(v) => Some(v.clone()),
+                                sea_orm::ActiveValue::Set(v) => {
+                                    $crate::encryption::EncryptableValue::plaintext(v)
+                                        .map(str::to_string)
+                                }
                                 _ => None,
                             }
                         }
@@ -262,7 +266,9 @@ macro_rules! __impl_encryptable_fields_inner {
                 match field_name {
                     $(
                         stringify!($field) => {
-                            self.$field = sea_orm::ActiveValue::Set(value);
+                            self.$field = sea_orm::ActiveValue::Set(
+                                $crate::encryption::EncryptableValue::from_string(value),
+                            );
                         }
                     )*
                     _ => {}

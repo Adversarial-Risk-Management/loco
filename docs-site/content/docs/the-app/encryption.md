@@ -85,6 +85,8 @@ impl_encryptable_fields!(super::_entities::users::ActiveModel, [
 
 The macro takes the `ActiveModel` type and a list of fields. A bare identifier marks a field as randomly-encrypted; wrapping it as `field(deterministic)` opts that field into deterministic mode. The macro generates the trait implementations Loco needs to find, encrypt, and decrypt those columns at runtime. Plain fields like `name` are untouched.
 
+Both `String` (`ssn:string!:encrypted`) and nullable `Option<String>` (`ssn:string:encrypted`, the generator's default) columns work. A `None` in a nullable field is stored as SQL `NULL` — nothing is encrypted, and it decrypts back to `None`.
+
 ## Saving and reading encrypted models
 
 Encryption is explicit at the call site. You build an `ActiveModel` as usual, then call `encrypt_fields_ctx` before saving:
