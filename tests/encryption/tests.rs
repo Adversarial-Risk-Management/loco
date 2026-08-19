@@ -11,7 +11,7 @@ use sea_orm::{
 
 use super::{
     entity::{self, ActiveModel, Column, Entity, Model},
-    helpers::{ctx_with_encryption, KEY_A, KEY_B},
+    helpers::{ctx_with_encryption, raw_string_column, KEY_A, KEY_B},
 };
 
 /// Insert a row through `encrypt_fields_ctx` and read the raw column value back
@@ -34,21 +34,6 @@ async fn insert_with_encryption(
         .encrypt_fields_ctx(ctx)
         .expect("encrypt fields via context");
     am.insert(&ctx.db).await.expect("insert encrypted row")
-}
-
-async fn raw_string_column(db: &sea_orm::DatabaseConnection, id: i32, column: &str) -> String {
-    let backend = db.get_database_backend();
-    let stmt = Statement::from_sql_and_values(
-        backend,
-        format!("SELECT {column} FROM secret_documents WHERE id = ?"),
-        [id.into()],
-    );
-    let row = db
-        .query_one_raw(stmt)
-        .await
-        .expect("raw query")
-        .expect("row exists");
-    row.try_get::<String>("", column).expect("string column")
 }
 
 #[tokio::test]

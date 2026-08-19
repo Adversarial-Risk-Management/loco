@@ -33,8 +33,10 @@ Encryption is configured per environment in your `config/<env>.yaml`:
 encryption:
   primary_key: {{ get_env(name="LOCO_ENCRYPTION_PRIMARY_KEY") }}
   deterministic_key: {{ get_env(name="LOCO_ENCRYPTION_DETERMINISTIC_KEY", default="") }}
+  # Quote list entries: an unset env var would otherwise render an empty
+  # (null) YAML item, which fails config parsing. Empty strings are skipped.
   previous_keys:
-    - {{ get_env(name="LOCO_ENCRYPTION_KEY_2025_01", default="") }}
+    - "{{ get_env(name='LOCO_ENCRYPTION_KEY_2025_01', default='') }}"
   key_derivation:
     enabled: true
     salt: {{ get_env(name="LOCO_ENCRYPTION_SALT") }}
@@ -170,7 +172,9 @@ Rotation works by stacking keys. To rotate:
 
 From that moment on, every new write uses the new key. Reads of older rows fail to decrypt under the new primary, fall through to `previous_keys`, find a match, and succeed. The envelope's `h.i` field records a label of the key used for the write, and decryption walks the configured key list in order — primary first, then each previous key — until GCM authentication succeeds. There's no separate index over key ids, so a row that lands on the last entry of `previous_keys` costs `len(previous_keys)` AES-GCM decryption attempts. In practice this is microseconds and not worth pre-routing on `h.i`, but it's why long `previous_keys` lists are worth pruning after re-encryption.
 
-To actually finish the rotation — that is, to rewrite old rows under the new key — you need to read each row and save it again. A simple background task that pages through the table, calls `encrypt_fields_ctx`, and writes the row back is enough. Once every row has been re-encrypted, you can drop the old key from `previous_keys`.
+Rows also **migrate lazily on save**, matching Rails' previous-encryption-schemes behavior: when `encrypt_fields_ctx` sees a value that is already an envelope, it keeps it untouched if it is fully current, but transparently decrypts and re-encrypts it under the current primary when it was written under a `previous_keys` entry (or an older envelope version). Deterministic fields are exempt — their key does not rotate, so their envelopes are always current. An envelope that none of the configured keys can decrypt fails the save instead of being persisted unreadable; that surfaces a prematurely-pruned `previous_keys` entry (or, for AAD-bound fields, a relocated ciphertext) at write time.
+
+To actively finish a rotation — rewrite every old row rather than waiting for organic saves — page through the table, call `encrypt_fields_ctx` on each row's `ActiveModel` with the stored (encrypted) values `Set`, and save it back. Once every row has been re-encrypted, drop the old key from `previous_keys`.
 
 Deterministic keys cannot be rotated. This matches Rails' behavior and follows from the design: deterministic ciphertexts are a function of `(plaintext, deterministic_key)`, and any equality query you run has to use the same key the data was written with. If you rotate the deterministic key, every existing query helper stops matching existing rows. If you absolutely have to rotate it, you must re-encrypt every deterministic column in lockstep with the configuration change, which usually means downtime or a careful dual-write migration.
 

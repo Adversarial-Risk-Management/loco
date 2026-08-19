@@ -58,3 +58,19 @@ pub async fn ctx_with_encryption(primary: &str, previous: Option<&str>) -> AppCo
     registry::register(&ctx, &cfg).expect("register encryption provider");
     ctx
 }
+
+/// Fetch one string column of a `secret_documents` row exactly as stored.
+pub async fn raw_string_column(db: &DatabaseConnection, id: i32, column: &str) -> String {
+    let backend = db.get_database_backend();
+    let stmt = sea_orm::Statement::from_sql_and_values(
+        backend,
+        format!("SELECT {column} FROM secret_documents WHERE id = ?"),
+        [id.into()],
+    );
+    let row = db
+        .query_one_raw(stmt)
+        .await
+        .expect("raw query")
+        .expect("row exists");
+    row.try_get::<String>("", column).expect("string column")
+}

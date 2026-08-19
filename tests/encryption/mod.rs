@@ -8,4 +8,5 @@ mod entity;
 mod helpers;
 mod nullable_entity;
 mod nullable_tests;
+mod reencrypt_tests;
 mod tests;
