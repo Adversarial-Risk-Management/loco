@@ -274,14 +274,12 @@ pub fn org_provider(scope: &RowScope, ctx: &AppContext) -> EncryptionResult<Opti
         EncryptionError::Scope("org_id missing from scope".into())
     })?;
     let cache = ctx.shared_store.get_ref::<OrgProviders>().expect("installed at boot");
-    cache.get(org_id).map(Some).ok_or_else(|| {
-        EncryptionError::NotConfigured(format!("no key provider loaded for org {org_id}"))
-    })
+    Ok(cache.get(org_id))
 }
 ```
 
 The hook is synchronous. Building a tenant's provider usually needs I/O — reading and unsealing its keypair, calling a KMS — so do that at an async point you already have (a request extractor, the start of a job) and cache the resulting `SharedKeyProvider` in `ctx.shared_store`; `provider_for` only looks it up. The cache owner is responsible for eviction: when a tenant's keys rotate (retire the old key, install the new one), drop that tenant's cached provider in the same step, or its rows keep being written under the retired key until the process restarts.
 
-Return `Err`, not `Ok(None)`, on a cache miss for a scoped table. `Ok(None)` falls back to the global provider, which would write the row under a key the tenant does not own and read it back successfully — the silent-wrong-key case is the one to fail loudly on.
+A hook declared through the macro is fail-closed: `Ok(None)` becomes an error instead of falling back to the global provider, which would write the row under a key the tenant does not own and read it back successfully. Only the trait's default (no `provider_for` declared) means "use the registry".
 
 The per-tenant provider still implements the whole `KeyProvider` trait, so retired tenant keys go in `get_decryption_keys()`, and rows written under them re-encrypt under the active key on their next save, as described under [Key rotation](#key-rotation). `h.i` records whatever `get_key_id()` returns — a tenant key's row id is a reasonable choice. The explicit-provider methods (`encrypt_fields(&p)`, `decrypt_fields::<E, _>(&p)`, `encrypt_query_value_with`) bypass `provider_for` entirely; use them when you already hold the tenant's provider.

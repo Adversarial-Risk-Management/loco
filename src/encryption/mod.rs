@@ -221,9 +221,11 @@ pub use scope::RowScope;
 /// );
 /// ```
 ///
-/// See [`Encryptable::provider_for`](encryptable::Encryptable::provider_for)
-/// for the caching contract. The named arguments are optional and must
-/// appear in this order.
+/// A declared `provider_for` is fail-closed: returning `Ok(None)` is turned
+/// into an error rather than falling back to the registry. See
+/// [`Encryptable::provider_for`](encryptable::Encryptable::provider_for) for
+/// the caching contract. The named arguments are optional and must appear in
+/// this order.
 #[macro_export]
 macro_rules! impl_encryptable_fields {
     (
@@ -301,7 +303,19 @@ macro_rules! __impl_encryptable_fields_inner {
                 ) -> $crate::encryption::EncryptionResult<
                     Option<$crate::encryption::SharedKeyProvider>,
                 > {
-                    $provider_for(scope, ctx)
+                    // A model that declares its own provider never falls back
+                    // to the registry: `None` here would write a row under a
+                    // key the row's scope does not own.
+                    match $provider_for(scope, ctx)? {
+                        Some(provider) => Ok(Some(provider)),
+                        None => Err($crate::encryption::EncryptionError::NotConfigured(
+                            format!(
+                                "{} returned no key provider for scope {:?}",
+                                stringify!($provider_for),
+                                scope.columns()
+                            ),
+                        )),
+                    }
                 }
             )?
 

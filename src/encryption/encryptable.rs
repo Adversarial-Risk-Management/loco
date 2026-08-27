@@ -315,9 +315,10 @@ pub trait Encryptable: ActiveModelTrait {
     /// per-tenant keypair read from the database, a KMS call) earlier on the
     /// request or job path and cache them, for example in
     /// `ctx.shared_store`, then look them up here. The cache owner must evict
-    /// an entry when that tenant's keys rotate. For a scoped table, return
-    /// `Err` rather than `Ok(None)` on a cache miss: falling back to the
-    /// global provider would write a tenant's row under the wrong key.
+    /// an entry when that tenant's keys rotate. When the hook is declared
+    /// through the macro's `provider_for = ...` argument, `Ok(None)` is an
+    /// error: a model with its own provider never falls back to the registry,
+    /// which would write a tenant's row under the wrong key.
     ///
     /// # Errors
     /// Returns an error when no provider can be resolved for the scope.

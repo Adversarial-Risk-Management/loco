@@ -50,16 +50,9 @@ pub fn org_provider(
         .shared_store
         .get_ref::<OrgProviders>()
         .ok_or_else(|| EncryptionError::NotConfigured("OrgProviders not installed".into()))?;
-    // A miss is an error, not `None`: falling back to the global provider
-    // would write this org's row under a key it does not own.
-    cache
-        .0
-        .read()
-        .unwrap()
-        .get(&org)
-        .cloned()
-        .map(Some)
-        .ok_or_else(|| EncryptionError::NotConfigured(format!("no provider loaded for org {org}")))
+    // Returning `None` on a miss is safe: the macro-generated hook turns it
+    // into an error instead of falling back to the global provider.
+    Ok(cache.0.read().unwrap().get(&org).cloned())
 }
 
 async fn make_db() -> DatabaseConnection {
@@ -145,7 +138,8 @@ async fn provider_cache_miss_is_an_error_not_a_registry_fallback() {
     .encrypt_fields_ctx(&ctx)
     .unwrap_err();
     assert!(
-        err.to_string().contains("no provider loaded for org"),
+        matches!(err, EncryptionError::NotConfigured(_))
+            && err.to_string().contains("org_provider"),
         "unexpected error: {err}"
     );
 
@@ -158,7 +152,7 @@ async fn provider_cache_miss_is_an_error_not_a_registry_fallback() {
         .evict(org_a);
     let mut model = Entity::find_by_id(id).one(&ctx.db).await.unwrap().unwrap();
     let err = model.decrypt_fields_ctx::<Entity>(&ctx).unwrap_err();
-    assert!(err.to_string().contains("no provider loaded for org"));
+    assert!(matches!(err, EncryptionError::NotConfigured(_)), "{err}");
 }
 
 #[tokio::test]
