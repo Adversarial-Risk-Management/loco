@@ -36,8 +36,17 @@ default = [
 # alone still builds, even with default-features = false) and needs no C
 # toolchain — matching Loco's zero-friction onboarding.
 auth = ["dep:jsonwebtoken", "jsonwebtoken/rust_crypto"]
-# Model field encryption (AES-256-GCM)
-encryption = ["dep:aes-gcm", "dep:flate2", "dep:hkdf", "dep:hmac", "dep:sha2", "dep:zeroize"]
+# Model field encryption (AES-256-GCM). The `Encryptable` traits are SeaORM
+# extension traits, so the feature needs the database layer.
+encryption = [
+    "with-db",
+    "dep:aes-gcm",
+    "dep:flate2",
+    "dep:hkdf",
+    "dep:hmac",
+    "dep:sha2",
+    "dep:zeroize",
+]
 cli = ["dep:clap"]
 testing = ["dep:axum-test", "dep:scraper", "dep:tree-fs"]
 with-db = [
