@@ -129,7 +129,7 @@ async fn aad_is_namespace_field_and_hyphenated_uuid() {
     let ct = raw(&ctx.db, saved.id, "credentials").await;
 
     let provider = ConfigKeyProvider::new(&config(KEY_A, None)).unwrap();
-    let aad = b"scoped_credentials:credentials\0org_id=6f9619ff-8b86-d011-b42d-00c04fc964ff";
+    let aad = b"scoped_credentials:credentials\0org_id=\"6f9619ff-8b86-d011-b42d-00c04fc964ff\"";
     assert_eq!(
         decrypt_field_with_aad(&ct, "credentials", &provider, aad).unwrap(),
         "pinned"
@@ -138,6 +138,9 @@ async fn aad_is_namespace_field_and_hyphenated_uuid() {
     let mut raw_bytes = b"scoped_credentials:credentials\0org_id=".to_vec();
     raw_bytes.extend_from_slice(org.as_bytes());
     assert!(decrypt_field_with_aad(&ct, "credentials", &provider, &raw_bytes).is_err());
+    // The unquoted string form is not accepted either.
+    let unquoted = format!("scoped_credentials:credentials\0org_id={org}");
+    assert!(decrypt_field_with_aad(&ct, "credentials", &provider, unquoted.as_bytes()).is_err());
 
     // The trait hooks agree with each other and with the pinned bytes.
     let am = ActiveModel {

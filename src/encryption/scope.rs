@@ -112,9 +112,13 @@ impl RowScope {
 
     /// Canonical byte encoding appended to a field's AAD.
     ///
-    /// Each entry renders as `\0<column>=<value>` in declaration order, where
-    /// strings are their raw bytes and numbers/bools their JSON text. Empty
-    /// for an empty scope, so unscoped models keep their existing AAD.
+    /// Each entry renders as `\0<column>=<json>` in entry order, where
+    /// `<json>` is the value's JSON text: strings quoted and escaped
+    /// (`"7"`), numbers and bools bare (`7`, `true`). Quoting keeps the
+    /// encoding injective — a string cannot impersonate a number, and a
+    /// string containing `\0` or `=` cannot fake a second entry, because
+    /// JSON escapes control characters. Empty for an empty scope, so
+    /// unscoped models keep their existing AAD.
     #[must_use]
     pub fn aad_bytes(&self) -> Vec<u8> {
         let mut out = Vec::new();
@@ -122,12 +126,27 @@ impl RowScope {
             out.push(0);
             out.extend_from_slice(column.as_bytes());
             out.push(b'=');
-            match value {
-                Value::String(s) => out.extend_from_slice(s.as_bytes()),
-                other => out.extend_from_slice(other.to_string().as_bytes()),
-            }
+            out.extend_from_slice(value.to_string().as_bytes());
         }
         out
+    }
+
+    /// The same scope reordered to `columns`, for callers that built a scope
+    /// by hand in a different insertion order than the model declares.
+    ///
+    /// # Errors
+    /// Returns [`EncryptionError::Scope`] when a column is missing.
+    pub fn ordered_by(&self, columns: &[String]) -> EncryptionResult<Self> {
+        let mut out = Self::new();
+        for column in columns {
+            let value = self.get(column).ok_or_else(|| {
+                EncryptionError::Scope(format!(
+                    "query scope is missing column '{column}' required by the model's aad_fields"
+                ))
+            })?;
+            out.entries.push((column.clone(), value.clone()));
+        }
+        Ok(out)
     }
 
     /// Full AAD for one field: the model's static `field_aad` followed by the
@@ -167,7 +186,7 @@ mod tests {
         let scope = RowScope::new().with("org_id", &id).unwrap();
         assert_eq!(
             scope.aad_bytes(),
-            b"\0org_id=6f9619ff-8b86-d011-b42d-00c04fc964ff".to_vec()
+            b"\0org_id=\"6f9619ff-8b86-d011-b42d-00c04fc964ff\"".to_vec()
         );
 
         // Decrypt side reads the same bytes out of the serialized row.

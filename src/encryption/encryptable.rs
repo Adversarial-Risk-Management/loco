@@ -861,13 +861,8 @@ where
              `deterministic_fields()` to enable equality queries"
         )));
     }
-    for column in <<E as EntityTrait>::ActiveModel as Encryptable>::scope_columns() {
-        if scope.get(&column).is_none() {
-            return Err(EncryptionError::Scope(format!(
-                "query scope is missing column '{column}' required by the model's aad_fields"
-            )));
-        }
-    }
+    let scope =
+        scope.ordered_by(&<<E as EntityTrait>::ActiveModel as Encryptable>::scope_columns())?;
 
     let det_master = provider.get_deterministic_key()?.ok_or_else(|| {
         EncryptionError::NotConfigured(

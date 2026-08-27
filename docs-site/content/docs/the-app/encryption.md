@@ -211,7 +211,7 @@ impl_encryptable_fields!(
 );
 ```
 
-The AAD for `credentials` becomes `integration_credential:credentials` followed by `\0org_id=<value>` for each listed column, in order. Values are rendered through `serde_json` on both the save path (from the `ActiveModel`) and the read path (from the `Model`), so they agree byte-for-byte: a `Uuid` is its hyphenated lowercase string, integers and booleans their JSON text. Only scalar columns are accepted; `Option` columns must be `Some`.
+The AAD for `credentials` becomes `integration_credential:credentials` followed by `\0org_id=<json>` for each listed column, in declaration order, where `<json>` is the value's JSON text — strings quoted (`"6f96…"`), numbers and booleans bare. Values are rendered through `serde_json` on both the save path (from the `ActiveModel`) and the read path (from the `Model`), so they agree byte-for-byte: a `Uuid` is its quoted hyphenated lowercase string. Quoting makes the encoding injective — the string `"7"` and the number `7` bind differently, and a string cannot spell a second entry. Only scalar columns are accepted; `Option` columns must be `Some`.
 
 The rules are strict on purpose. On save, a scope column that is `NotSet` while an encrypted field is `Set` is an error — a partial update that touches no encrypted column is fine. On read, a missing or `null` scope column is an error. Silently binding to an empty scope would write rows that later fail to decrypt.
 
