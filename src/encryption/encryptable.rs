@@ -44,7 +44,7 @@
 //!
 //! The provider is registered automatically at boot when `config.encryption`
 //! is present. For custom providers (KMS, Vault, HSM), call
-//! [`crate::encryption::registry::set_global`] during your `Hooks::boot`
+//! [`crate::encryption::registry::install`] in your `Hooks::after_context`
 //! implementation.
 //!
 //! **Note**: `SeaORM`'s `ActiveModelBehavior::before_save` hook has no access

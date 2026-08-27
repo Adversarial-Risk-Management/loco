@@ -251,10 +251,13 @@ You shouldn't need to parse this yourself. It's documented because the format is
 The `KeyProvider` trait is public. If you want keys to come from somewhere other than the YAML config — AWS KMS, HashiCorp Vault, an HSM, an internal secrets service — you can implement the trait and register your provider during application boot:
 
 ```rust
-loco_rs::encryption::registry::set_global(my_provider);
+async fn after_context(ctx: AppContext) -> Result<AppContext> {
+    loco_rs::encryption::registry::install(&ctx, Arc::new(MyKmsProvider::new()?));
+    Ok(ctx)
+}
 ```
 
-The registration call belongs in your `Hooks::boot` implementation, before any model code runs. Once installed, a custom provider replaces the YAML-driven one wholesale; the rest of the encryption machinery (envelope format, deterministic mode, key derivation, rotation through `previous_keys`) is unchanged. This is the supported extension point for organizations that want centralized key management without giving up the rest of the feature.
+`Hooks::after_context` runs after the config-driven provider (if any) has been registered, so `install` replaces it for that context. There is no process-wide provider: each `AppContext` carries its own, and a context without one reports `NotConfigured` instead of borrowing another's key. Once installed, a custom provider replaces the YAML-driven one wholesale; the rest of the encryption machinery (envelope format, deterministic mode, key derivation, rotation through `previous_keys`) is unchanged. This is the supported extension point for organizations that want centralized key management without giving up the rest of the feature.
 
 ### Per-row key providers
 

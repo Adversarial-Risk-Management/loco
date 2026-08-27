@@ -113,8 +113,6 @@ async fn rotation_decrypts_records_written_under_a_previous_key() {
     // Snapshot the raw ciphertext from the A-keyed DB.
     let ciphertext_ssn = raw_string_column(&ctx_a.db, original.id, "ssn").await;
 
-    // Drop ctx_a (its OnceLock global may still be set process-wide, but the
-    // per-context shared_store is what `decrypt_fields_ctx` resolves first).
     drop(ctx_a);
 
     // Stand up a fresh ctx with primary=B + previous=A and copy the row in
