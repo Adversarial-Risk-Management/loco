@@ -1,7 +1,7 @@
 //! Helpers for testing models with encrypted fields.
 //!
 //! Available with the `testing` and `encryption` features. They cover the
-//! setup every encryption test repeats: a config with key derivation on, an
+//! setup every encryption test repeats: a config with all three keys, an
 //! `AppContext` with that provider registered, and a raw read of a stored
 //! column so a test can assert on the ciphertext rather than the decrypted
 //! value.
@@ -18,10 +18,7 @@ use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
 
 use crate::{
     app::AppContext,
-    encryption::{
-        config::{EncryptionConfig, KeyDerivationConfig},
-        registry,
-    },
+    encryption::{config::EncryptionConfig, registry},
 };
 
 /// Hex-encoded 32-byte primary key for tests.
@@ -34,17 +31,14 @@ pub const DET_KEY: &str = "aabbccdd00112233445566778899aabbccddeeff0011223344556
 pub const SALT: &str = "112233445566778899aabbccddeeff00112233445566778899aabbccddeeff00";
 
 /// An `EncryptionConfig` with the given primary key, an optional previous
-/// key, the shared [`DET_KEY`], and key derivation enabled with [`SALT`].
+/// key, the shared [`DET_KEY`], and [`SALT`].
 #[must_use]
 pub fn encryption_config(primary: &str, previous: Option<&str>) -> EncryptionConfig {
     EncryptionConfig {
         primary_key: primary.to_string(),
         previous_keys: previous.map(|k| vec![k.to_string()]).unwrap_or_default(),
-        deterministic_key: Some(DET_KEY.to_string()),
-        key_derivation: Some(KeyDerivationConfig {
-            enabled: true,
-            salt: Some(SALT.to_string()),
-        }),
+        deterministic_key: DET_KEY.to_string(),
+        key_derivation_salt: SALT.to_string(),
     }
 }
 

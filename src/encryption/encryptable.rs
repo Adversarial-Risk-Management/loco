@@ -937,28 +937,19 @@ mod tests {
     #[test]
     fn test_decrypt_field_reads_value_written_under_previous_key() {
         // decrypt_field must walk the rotation key list, not just the primary.
-        use crate::encryption::{
-            config::{EncryptionConfig, KeyDerivationConfig},
-            key_provider::ConfigKeyProvider,
-        };
+        use crate::encryption::{config::EncryptionConfig, key_provider::ConfigKeyProvider};
 
         let old = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f".to_string();
         let new = "1f1e1d1c1b1a191817161514131211100f0e0d0c0b0a09080706050403020100".to_string();
-        let salt = "aabbccdd00112233445566778899aabbccddeeff00112233445566778899aabb".to_string();
-
-        let kd = || {
-            Some(KeyDerivationConfig {
-                enabled: true,
-                salt: Some(salt.clone()),
-            })
-        };
 
         // Write under old primary.
         let old_provider = ConfigKeyProvider::new(&EncryptionConfig {
             primary_key: old.clone(),
             previous_keys: vec![],
-            deterministic_key: None,
-            key_derivation: kd(),
+            deterministic_key: "aabbccdd00112233445566778899aabbccddeeff00112233445566778899aabb"
+                .to_string(),
+            key_derivation_salt: "112233445566778899aabbccddeeff00112233445566778899aabbccddeeff00"
+                .to_string(),
         })
         .unwrap();
         let ciphertext = encrypt_field("secret ssn", "ssn", &old_provider).unwrap();
@@ -967,8 +958,10 @@ mod tests {
         let new_provider = ConfigKeyProvider::new(&EncryptionConfig {
             primary_key: new,
             previous_keys: vec![old],
-            deterministic_key: None,
-            key_derivation: kd(),
+            deterministic_key: "aabbccdd00112233445566778899aabbccddeeff00112233445566778899aabb"
+                .to_string(),
+            key_derivation_salt: "112233445566778899aabbccddeeff00112233445566778899aabbccddeeff00"
+                .to_string(),
         })
         .unwrap();
 
@@ -983,23 +976,18 @@ mod tests {
         // with the same config must produce identical ciphertext for the same
         // plaintext — that's what makes equality queries work.
         use crate::encryption::{
-            cipher,
-            config::{EncryptionConfig, KeyDerivationConfig},
-            key_provider::ConfigKeyProvider,
+            cipher, config::EncryptionConfig, key_provider::ConfigKeyProvider,
         };
 
         let primary = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
         let det = "1f1e1d1c1b1a191817161514131211100f0e0d0c0b0a09080706050403020100";
-        let salt = "aabbccdd00112233445566778899aabbccddeeff00112233445566778899aabb";
 
         let cfg = EncryptionConfig {
             primary_key: primary.to_string(),
             previous_keys: vec![],
-            deterministic_key: Some(det.to_string()),
-            key_derivation: Some(KeyDerivationConfig {
-                enabled: true,
-                salt: Some(salt.to_string()),
-            }),
+            deterministic_key: det.to_string(),
+            key_derivation_salt: "112233445566778899aabbccddeeff00112233445566778899aabbccddeeff00"
+                .to_string(),
         };
         let p1 = ConfigKeyProvider::new(&cfg).unwrap();
         let p2 = ConfigKeyProvider::new(&cfg).unwrap();
@@ -1051,26 +1039,21 @@ mod tests {
         // undecryptable — even when the old master was listed as a previous
         // key. The fix derives per-master inside the decryption loop.
 
-        use crate::encryption::{
-            config::{EncryptionConfig, KeyDerivationConfig},
-            key_provider::ConfigKeyProvider,
-        };
+        use crate::encryption::{config::EncryptionConfig, key_provider::ConfigKeyProvider};
 
         let old_master =
             "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f".to_string();
         let new_master =
             "1f1e1d1c1b1a191817161514131211100f0e0d0c0b0a09080706050403020100".to_string();
-        let salt = "aabbccdd00112233445566778899aabbccddeeff00112233445566778899aabb".to_string();
 
         // Encrypt under the OLD config (old master is primary).
         let old_config = EncryptionConfig {
             primary_key: old_master.clone(),
             previous_keys: vec![],
-            deterministic_key: None,
-            key_derivation: Some(KeyDerivationConfig {
-                enabled: true,
-                salt: Some(salt.clone()),
-            }),
+            deterministic_key: "aabbccdd00112233445566778899aabbccddeeff00112233445566778899aabb"
+                .to_string(),
+            key_derivation_salt: "112233445566778899aabbccddeeff00112233445566778899aabbccddeeff00"
+                .to_string(),
         };
         let old_provider = ConfigKeyProvider::new(&old_config).unwrap();
         let ciphertext = encrypt_field("secret ssn", "ssn", &old_provider).unwrap();
@@ -1080,11 +1063,10 @@ mod tests {
         let new_config = EncryptionConfig {
             primary_key: new_master,
             previous_keys: vec![old_master],
-            deterministic_key: None,
-            key_derivation: Some(KeyDerivationConfig {
-                enabled: true,
-                salt: Some(salt),
-            }),
+            deterministic_key: "aabbccdd00112233445566778899aabbccddeeff00112233445566778899aabb"
+                .to_string(),
+            key_derivation_salt: "112233445566778899aabbccddeeff00112233445566778899aabbccddeeff00"
+                .to_string(),
         };
         let new_provider = ConfigKeyProvider::new(&new_config).unwrap();
 
@@ -1112,7 +1094,7 @@ mod tests {
         use super::super::stale_envelope_plaintext;
         use crate::encryption::{
             cipher,
-            config::{EncryptionConfig, KeyDerivationConfig},
+            config::EncryptionConfig,
             encryptable::{encrypt_field, KeyProvider},
             format::EncryptedValue,
             key_provider::ConfigKeyProvider,
@@ -1127,11 +1109,8 @@ mod tests {
             ConfigKeyProvider::new(&EncryptionConfig {
                 primary_key: primary.to_string(),
                 previous_keys: previous.into_iter().map(String::from).collect(),
-                deterministic_key: Some(DET.to_string()),
-                key_derivation: Some(KeyDerivationConfig {
-                    enabled: true,
-                    salt: Some(SALT.to_string()),
-                }),
+                deterministic_key: DET.to_string(),
+                key_derivation_salt: SALT.to_string(),
             })
             .unwrap()
         }

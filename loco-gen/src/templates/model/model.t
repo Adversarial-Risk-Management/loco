@@ -24,8 +24,8 @@ message: |
       {% endfor %}
       ]);
 
-  Set `encryption.primary_key` (and `encryption.deterministic_key` if any
-  field is `(deterministic)`) in your `config/*.yaml`.
+  Set `encryption.primary_key`, `encryption.deterministic_key` and
+  `encryption.key_derivation_salt` in your `config/*.yaml`.
 {% else -%}
 message: "Migration for `{{name}}` added! You can now apply it with `$ cargo loco db migrate && cargo loco db entities`."
 {%- endif %}

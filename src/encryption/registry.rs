@@ -64,7 +64,6 @@ pub fn require(ctx: &AppContext) -> EncryptionResult<SharedKeyProvider> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::encryption::config::KeyDerivationConfig;
     use crate::tests_cfg::app::get_app_context;
 
     fn valid_hex_key() -> String {
@@ -77,8 +76,10 @@ mod tests {
         let cfg = EncryptionConfig {
             primary_key: valid_hex_key(),
             previous_keys: vec![],
-            deterministic_key: None,
-            key_derivation: None,
+            deterministic_key: "aabbccdd00112233445566778899aabbccddeeff00112233445566778899aabb"
+                .to_string(),
+            key_derivation_salt: "112233445566778899aabbccddeeff00112233445566778899aabbccddeeff00"
+                .to_string(),
         };
 
         register(&ctx, &cfg).unwrap();
@@ -107,8 +108,10 @@ mod tests {
         let cfg = EncryptionConfig {
             primary_key: valid_hex_key(),
             previous_keys: vec![],
-            deterministic_key: None,
-            key_derivation: None,
+            deterministic_key: "aabbccdd00112233445566778899aabbccddeeff00112233445566778899aabb"
+                .to_string(),
+            key_derivation_salt: "112233445566778899aabbccddeeff00112233445566778899aabbccddeeff00"
+                .to_string(),
         };
         register(&ctx, &cfg).unwrap();
         let custom: SharedKeyProvider = Arc::new(
@@ -131,11 +134,10 @@ mod tests {
         let cfg = EncryptionConfig {
             primary_key: "not-hex".to_string(),
             previous_keys: vec![],
-            deterministic_key: None,
-            key_derivation: Some(KeyDerivationConfig {
-                enabled: true,
-                salt: None,
-            }),
+            deterministic_key: "aabbccdd00112233445566778899aabbccddeeff00112233445566778899aabb"
+                .to_string(),
+            key_derivation_salt: "112233445566778899aabbccddeeff00112233445566778899aabbccddeeff00"
+                .to_string(),
         };
         assert!(register(&ctx, &cfg).is_err());
     }
@@ -146,8 +148,10 @@ mod tests {
         let cfg = EncryptionConfig {
             primary_key: valid_hex_key(),
             previous_keys: vec![],
-            deterministic_key: None,
-            key_derivation: None,
+            deterministic_key: "aabbccdd00112233445566778899aabbccddeeff00112233445566778899aabb"
+                .to_string(),
+            key_derivation_salt: "112233445566778899aabbccddeeff00112233445566778899aabbccddeeff00"
+                .to_string(),
         };
         register(&ctx, &cfg).unwrap();
 

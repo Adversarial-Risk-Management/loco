@@ -100,11 +100,10 @@ pub struct Config {
     /// ```yaml
     /// encryption:
     ///   primary_key: {{ get_env(name="LOCO_ENCRYPTION_PRIMARY_KEY") }}
+    ///   deterministic_key: {{ get_env(name="LOCO_ENCRYPTION_DETERMINISTIC_KEY") }}
+    ///   key_derivation_salt: {{ get_env(name="LOCO_ENCRYPTION_SALT") }}
     ///   previous_keys:
-    ///     - {{ get_env(name="LOCO_ENCRYPTION_KEY_2024_01", default="") }}
-    ///   key_derivation:
-    ///     enabled: true
-    ///     salt: {{ get_env(name="LOCO_ENCRYPTION_SALT") }}
+    ///     - "{{ get_env(name="LOCO_ENCRYPTION_KEY_2024_01", default="") }}"
     /// ```
     #[cfg(feature = "encryption")]
     pub encryption: Option<EncryptionConfig>,

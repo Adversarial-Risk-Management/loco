@@ -1,102 +1,68 @@
-//! Encryption configuration structures
+//! Encryption configuration
 //!
-//! Configuration for field encryption, loaded from the application's YAML config.
-//!
-//! # Example Configuration
+//! Loaded from the application's YAML config. All three keys are required,
+//! as in Rails Active Record Encryption:
 //!
 //! ```yaml
 //! encryption:
 //!   primary_key: {{ get_env(name="LOCO_ENCRYPTION_PRIMARY_KEY") }}
+//!   deterministic_key: {{ get_env(name="LOCO_ENCRYPTION_DETERMINISTIC_KEY") }}
+//!   key_derivation_salt: {{ get_env(name="LOCO_ENCRYPTION_SALT") }}
 //!   previous_keys:
-//!     - {{ get_env(name="LOCO_ENCRYPTION_KEY_2024_01", default="") }}
-//!   key_derivation:
-//!     enabled: true
-//!     salt: {{ get_env(name="LOCO_ENCRYPTION_SALT") }}
+//!     - "{{ get_env(name="LOCO_ENCRYPTION_KEY_2024_01", default="") }}"
 //! ```
+//!
+//! Generate each value with `openssl rand -hex 32`. Validation happens at
+//! boot (see [`crate::encryption::key_provider::ConfigKeyProvider::new`]):
+//! every key must be 64 hex characters, `deterministic_key` must differ from
+//! `primary_key` and from every `previous_keys` entry, and a non-empty
+//! `previous_keys` entry that is not a valid key is an error. Empty entries
+//! (an unset templated env var) are skipped.
 
 use serde::{Deserialize, Serialize};
 
 /// Encryption configuration
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct EncryptionConfig {
-    /// Primary encryption key (32 bytes hex-encoded = 64 chars for AES-256)
-    /// Generate with: `openssl rand -hex 32`
+    /// Master key for non-deterministic fields (32 bytes, hex-encoded).
     pub primary_key: String,
 
-    /// Previous keys for rotation support (decryption only)
-    /// The system will try decrypting with primary first, then fall back to these
+    /// Retired primary keys, used for decryption only. Decryption tries the
+    /// primary first, then these in order; rows written under one of these
+    /// are re-encrypted under the primary on their next save.
     #[serde(default)]
     pub previous_keys: Vec<String>,
 
-    /// Separate key used for fields marked `deterministic`.
+    /// Master key for fields marked `deterministic` (32 bytes, hex-encoded).
     ///
-    /// Deterministic encryption derives its IV from
-    /// `HMAC-SHA256(deterministic_key, plaintext)`, so a distinct key is used
-    /// to avoid any interaction between deterministic and non-deterministic
-    /// ciphertexts. Required when any `Encryptable` declares deterministic
-    /// fields; otherwise optional.
+    /// Deterministic encryption derives its IV from the plaintext under this
+    /// key, so it must be distinct from every key used for random-IV
+    /// encryption: a shared HKDF-derived field key across the two modes would
+    /// risk AES-GCM nonce reuse.
     ///
-    /// **Rotation is not supported for this key.** As in Rails Active Record
-    /// Encryption ("Rotating keys is not supported for deterministic
-    /// encryption"), changing `deterministic_key` would change the ciphertext
-    /// for the same plaintext and break equality queries and uniqueness — and
-    /// unlike `previous_keys`, there is no fallback list, so existing
-    /// deterministic values would no longer decrypt. Pick this key once and
-    /// keep it stable. Rotating `primary_key`/`previous_keys` does not affect
-    /// deterministic fields, which live on this separate key.
+    /// **Rotation is not supported for this key.** As in Rails ("Rotating
+    /// keys is not supported for deterministic encryption"), changing it
+    /// changes the ciphertext for the same plaintext and breaks equality
+    /// queries, and there is no fallback list. Pick it once and keep it.
+    pub deterministic_key: String,
+
+    /// HKDF-SHA256 salt for per-field key derivation (32 bytes, hex-encoded).
     ///
-    /// Generate with: `openssl rand -hex 32`
-    #[serde(default)]
-    pub deterministic_key: Option<String>,
-
-    /// Key derivation settings
-    #[serde(default)]
-    pub key_derivation: Option<KeyDerivationConfig>,
-}
-
-/// Key derivation configuration for deriving field-specific keys
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
-pub struct KeyDerivationConfig {
-    /// Enable key derivation (derive per-field keys from master key)
-    #[serde(default)]
-    pub enabled: bool,
-
-    /// Salt for HKDF (32 bytes hex-encoded)
-    /// Generate with: `openssl rand -hex 32`
-    pub salt: Option<String>,
+    /// No field is ever encrypted with a master key directly: each field uses
+    /// `HKDF(master, salt, info = column name)`. Changing the salt invalidates
+    /// every existing ciphertext.
+    pub key_derivation_salt: String,
 }
 
 impl EncryptionConfig {
-    /// Check if the configuration has a valid primary key
+    /// `previous_keys` without empty entries (an unset templated env var).
     #[must_use]
-    pub fn has_primary_key(&self) -> bool {
-        !self.primary_key.trim().is_empty()
-    }
-
-    /// Get non-empty previous keys for rotation
-    #[must_use]
-    pub fn valid_previous_keys(&self) -> Vec<&str> {
+    pub fn previous_keys_present(&self) -> Vec<&str> {
         self.previous_keys
             .iter()
             .map(String::as_str)
             .filter(|k| !k.trim().is_empty())
             .collect()
-    }
-
-    /// Check if key derivation is enabled
-    #[must_use]
-    pub fn is_key_derivation_enabled(&self) -> bool {
-        self.key_derivation
-            .as_ref()
-            .is_some_and(|kd| kd.enabled && kd.salt.is_some())
-    }
-
-    /// Whether a deterministic key is configured
-    #[must_use]
-    pub fn has_deterministic_key(&self) -> bool {
-        self.deterministic_key
-            .as_ref()
-            .is_some_and(|k| !k.trim().is_empty())
     }
 }
 
@@ -105,102 +71,53 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_has_primary_key() {
-        let config = EncryptionConfig {
-            primary_key: "abc123".to_string(),
-            previous_keys: vec![],
-            deterministic_key: None,
-            key_derivation: None,
-        };
-        assert!(config.has_primary_key());
-
-        let empty_config = EncryptionConfig {
-            primary_key: "  ".to_string(),
-            previous_keys: vec![],
-            deterministic_key: None,
-            key_derivation: None,
-        };
-        assert!(!empty_config.has_primary_key());
-    }
-
-    #[test]
-    fn test_valid_previous_keys() {
+    fn test_previous_keys_present_skips_empty_entries() {
         let config = EncryptionConfig {
             primary_key: "primary".to_string(),
             previous_keys: vec![
                 "key1".to_string(),
-                "".to_string(),   // empty, should be filtered
-                "  ".to_string(), // whitespace, should be filtered
+                String::new(),
+                "  ".to_string(),
                 "key2".to_string(),
             ],
-            deterministic_key: None,
-            key_derivation: None,
+            deterministic_key: "det".to_string(),
+            key_derivation_salt: "salt".to_string(),
         };
-
-        let valid = config.valid_previous_keys();
-        assert_eq!(valid, vec!["key1", "key2"]);
-    }
-
-    #[test]
-    fn test_key_derivation_enabled() {
-        let config_disabled = EncryptionConfig {
-            primary_key: "key".to_string(),
-            previous_keys: vec![],
-            deterministic_key: None,
-            key_derivation: None,
-        };
-        assert!(!config_disabled.is_key_derivation_enabled());
-
-        let config_no_salt = EncryptionConfig {
-            primary_key: "key".to_string(),
-            previous_keys: vec![],
-            deterministic_key: None,
-            key_derivation: Some(KeyDerivationConfig {
-                enabled: true,
-                salt: None,
-            }),
-        };
-        assert!(!config_no_salt.is_key_derivation_enabled());
-
-        let config_enabled = EncryptionConfig {
-            primary_key: "key".to_string(),
-            previous_keys: vec![],
-            deterministic_key: None,
-            key_derivation: Some(KeyDerivationConfig {
-                enabled: true,
-                salt: Some("salt".to_string()),
-            }),
-        };
-        assert!(config_enabled.is_key_derivation_enabled());
+        assert_eq!(config.previous_keys_present(), vec!["key1", "key2"]);
     }
 
     #[test]
     fn test_deserialize_from_yaml() {
         let yaml = r#"
 primary_key: "abc123def456"
+deterministic_key: "det"
+key_derivation_salt: "my_salt"
 previous_keys:
   - "old_key_1"
-  - "old_key_2"
-key_derivation:
-  enabled: true
-  salt: "my_salt"
+  - ""
 "#;
         let config: EncryptionConfig = serde_yaml::from_str(yaml).unwrap();
-
         assert_eq!(config.primary_key, "abc123def456");
+        assert_eq!(config.deterministic_key, "det");
+        assert_eq!(config.key_derivation_salt, "my_salt");
         assert_eq!(config.previous_keys.len(), 2);
-        assert!(config.is_key_derivation_enabled());
+        assert_eq!(config.previous_keys_present(), vec!["old_key_1"]);
     }
 
     #[test]
-    fn test_deserialize_minimal() {
-        let yaml = r#"
-primary_key: "abc123def456"
-"#;
-        let config: EncryptionConfig = serde_yaml::from_str(yaml).unwrap();
-
-        assert_eq!(config.primary_key, "abc123def456");
+    fn test_all_three_keys_are_required() {
+        for yaml in [
+            "primary_key: a\ndeterministic_key: b\n",
+            "primary_key: a\nkey_derivation_salt: c\n",
+            "deterministic_key: b\nkey_derivation_salt: c\n",
+        ] {
+            assert!(
+                serde_yaml::from_str::<EncryptionConfig>(yaml).is_err(),
+                "{yaml}"
+            );
+        }
+        let minimal = "primary_key: a\ndeterministic_key: b\nkey_derivation_salt: c\n";
+        let config: EncryptionConfig = serde_yaml::from_str(minimal).unwrap();
         assert!(config.previous_keys.is_empty());
-        assert!(!config.is_key_derivation_enabled());
     }
 }

@@ -47,6 +47,8 @@
 //! ```yaml
 //! encryption:
 //!   primary_key: {{ get_env(name="LOCO_ENCRYPTION_PRIMARY_KEY") }}
+//!   deterministic_key: {{ get_env(name="LOCO_ENCRYPTION_DETERMINISTIC_KEY") }}
+//!   key_derivation_salt: {{ get_env(name="LOCO_ENCRYPTION_SALT") }}
 //! ```
 //!
 //!    When present, the key provider is registered automatically during
@@ -103,7 +105,6 @@
 //! - **Never commit keys to version control**
 //! - Use Loco's config system with env var templating
 //! - Generate keys with: `openssl rand -hex 32`
-//! - Enable key derivation for field-specific keys
 //! - Configure `previous_keys` for zero-downtime key rotation
 
 pub mod cipher;
@@ -119,7 +120,7 @@ pub mod scope;
 pub use cipher::{
     decrypt, encrypt, encrypt_deterministic, parse_hex_key, KEY_SIZE, NONCE_SIZE, TAG_SIZE,
 };
-pub use config::{EncryptionConfig, KeyDerivationConfig};
+pub use config::EncryptionConfig;
 pub use encryptable::{
     decrypt_field, decrypt_field_with_aad, encrypt_field, encrypt_field_with_aad,
     encrypt_query_value, encrypt_query_value_scoped, encrypt_query_value_with, Encryptable,
@@ -428,178 +429,40 @@ macro_rules! __impl_encryptable_field_meta {
     };
 }
 
-/// Validate encryption configuration at startup
+/// Validate an encryption configuration without keeping the provider.
 ///
-/// Call this during application boot to fail fast on misconfiguration.
-/// Returns Ok(()) if encryption is not configured (optional feature).
+/// `boot::create_context` performs the same check when it registers the
+/// provider, so most applications never call this directly.
 ///
 /// # Errors
-/// Returns an error if the configuration is invalid:
-/// - Primary key is present but invalid format/length
-/// - Key derivation is enabled but salt is missing or invalid
-///
-/// # Example
-/// ```rust,ignore
-/// // In your app's boot sequence
-/// if let Some(config) = &app_config.encryption {
-///     loco_rs::encryption::validate_config(config)?;
-/// }
-/// ```
+/// See [`key_provider::ConfigKeyProvider::new`].
 pub fn validate_config(config: &config::EncryptionConfig) -> EncryptionResult<()> {
-    // Validate primary key format and length
-    if config.has_primary_key() {
-        let _ = cipher::parse_hex_key(&config.primary_key)
-            .map_err(|e| EncryptionError::InvalidKey(format!("primary_key: {e}")))?;
-    }
-
-    // Validate key derivation salt if enabled
-    if let Some(ref kd) = config.key_derivation
-        && kd.enabled
-    {
-        let salt = kd.salt.as_ref().ok_or_else(|| {
-            EncryptionError::NotConfigured(
-                "key_derivation.salt is required when derivation is enabled".to_string(),
-            )
-        })?;
-        let _ = cipher::parse_hex_key(salt)
-            .map_err(|e| EncryptionError::InvalidKey(format!("key_derivation.salt: {e}")))?;
-    }
-
-    // Validate deterministic key when present
-    if let Some(ref det) = config.deterministic_key
-        && !det.trim().is_empty()
-    {
-        cipher::parse_hex_key(det)
-            .map_err(|e| EncryptionError::InvalidKey(format!("deterministic_key: {e}")))?;
-        if det.trim() == config.primary_key.trim() {
-            return Err(EncryptionError::InvalidKey(
-                "deterministic_key must differ from primary_key".into(),
-            ));
-        }
-    }
-
-    // Warn about empty previous_keys entries (don't fail, just log)
-    for (i, key) in config.previous_keys.iter().enumerate() {
-        if key.trim().is_empty() {
-            tracing::warn!(
-                "encryption.previous_keys[{}] is empty and will be skipped",
-                i
-            );
-        } else if cipher::parse_hex_key(key).is_err() {
-            tracing::warn!(
-                "encryption.previous_keys[{}] has invalid format and will be skipped",
-                i
-            );
-        }
-    }
-
-    Ok(())
+    key_provider::ConfigKeyProvider::new(config).map(drop)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn valid_hex_key() -> String {
-        "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f".to_string()
+    const PRIMARY: &str = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+    const DET: &str = "1f1e1d1c1b1a191817161514131211100f0e0d0c0b0a09080706050403020100";
+
+    fn cfg(primary: &str, det: &str, salt: &str) -> config::EncryptionConfig {
+        config::EncryptionConfig {
+            primary_key: primary.to_string(),
+            previous_keys: vec![],
+            deterministic_key: det.to_string(),
+            key_derivation_salt: salt.to_string(),
+        }
     }
 
     #[test]
-    fn test_validate_config_valid() {
-        let config = config::EncryptionConfig {
-            primary_key: valid_hex_key(),
-            previous_keys: vec![],
-            deterministic_key: None,
-            key_derivation: None,
-        };
-        assert!(validate_config(&config).is_ok());
-    }
-
-    #[test]
-    fn test_validate_config_invalid_primary_key() {
-        let config = config::EncryptionConfig {
-            primary_key: "too_short".to_string(),
-            previous_keys: vec![],
-            deterministic_key: None,
-            key_derivation: None,
-        };
-        assert!(validate_config(&config).is_err());
-    }
-
-    #[test]
-    fn test_validate_config_key_derivation_missing_salt() {
-        let config = config::EncryptionConfig {
-            primary_key: valid_hex_key(),
-            previous_keys: vec![],
-            deterministic_key: None,
-            key_derivation: Some(config::KeyDerivationConfig {
-                enabled: true,
-                salt: None,
-            }),
-        };
-        assert!(validate_config(&config).is_err());
-    }
-
-    #[test]
-    fn test_validate_config_key_derivation_invalid_salt() {
-        let config = config::EncryptionConfig {
-            primary_key: valid_hex_key(),
-            previous_keys: vec![],
-            deterministic_key: None,
-            key_derivation: Some(config::KeyDerivationConfig {
-                enabled: true,
-                salt: Some("invalid".to_string()),
-            }),
-        };
-        assert!(validate_config(&config).is_err());
-    }
-
-    #[test]
-    fn test_validate_config_key_derivation_valid() {
-        let config = config::EncryptionConfig {
-            primary_key: valid_hex_key(),
-            previous_keys: vec![],
-            deterministic_key: None,
-            key_derivation: Some(config::KeyDerivationConfig {
-                enabled: true,
-                salt: Some(valid_hex_key()),
-            }),
-        };
-        assert!(validate_config(&config).is_ok());
-    }
-
-    #[test]
-    fn test_validate_config_deterministic_key_valid() {
-        let other_hex = "1f1e1d1c1b1a191817161514131211100f0e0d0c0b0a09080706050403020100";
-        let config = config::EncryptionConfig {
-            primary_key: valid_hex_key(),
-            previous_keys: vec![],
-            deterministic_key: Some(other_hex.to_string()),
-            key_derivation: None,
-        };
-        assert!(validate_config(&config).is_ok());
-    }
-
-    #[test]
-    fn test_validate_config_deterministic_key_equal_to_primary() {
-        let config = config::EncryptionConfig {
-            primary_key: valid_hex_key(),
-            previous_keys: vec![],
-            deterministic_key: Some(valid_hex_key()),
-            key_derivation: None,
-        };
-        assert!(validate_config(&config).is_err());
-    }
-
-    #[test]
-    fn test_validate_config_deterministic_key_invalid_hex() {
-        let config = config::EncryptionConfig {
-            primary_key: valid_hex_key(),
-            previous_keys: vec![],
-            deterministic_key: Some("not-a-valid-hex-key".to_string()),
-            key_derivation: None,
-        };
-        assert!(validate_config(&config).is_err());
+    fn test_validate_config() {
+        assert!(validate_config(&cfg(PRIMARY, DET, DET)).is_ok());
+        assert!(validate_config(&cfg("too_short", DET, DET)).is_err());
+        assert!(validate_config(&cfg(PRIMARY, "not-a-valid-hex-key", DET)).is_err());
+        assert!(validate_config(&cfg(PRIMARY, DET, "invalid")).is_err());
+        assert!(validate_config(&cfg(PRIMARY, PRIMARY, DET)).is_err());
     }
 
     /// Direct unit test of the macro's modifier classifier. The full

@@ -35,6 +35,4 @@ database:
 encryption:
   primary_key: {{ get_env(name="LOCO_ENCRYPTION_PRIMARY_KEY") }}
   deterministic_key: {{ get_env(name="LOCO_ENCRYPTION_DETERMINISTIC_KEY") }}
-  key_derivation:
-    enabled: true
-    salt: {{ get_env(name="LOCO_ENCRYPTION_SALT") }}
+  key_derivation_salt: {{ get_env(name="LOCO_ENCRYPTION_SALT") }}

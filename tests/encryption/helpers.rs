@@ -9,7 +9,7 @@ use super::entity;
 pub use testing::encryption::{DET_KEY, KEY_A, KEY_B, SALT};
 
 /// Build an `EncryptionConfig` with the given primary, optional previous key,
-/// and key-derivation enabled.
+/// and the shared deterministic key and salt.
 pub fn config(primary: &str, previous: Option<&str>) -> EncryptionConfig {
     testing::encryption::encryption_config(primary, previous)
 }

@@ -136,83 +136,65 @@ pub trait KeyProvider: Send + Sync {
 
 /// Default key provider that reads from Loco configuration
 ///
-/// This provider parses encryption keys from the application's YAML configuration,
-/// which supports environment variable templating via `{{ get_env(...) }}`.
+/// Parses the keys from [`EncryptionConfig`] (which supports environment
+/// variable templating via `{{ get_env(...) }}`) and derives a distinct
+/// AES-256 key per field with HKDF-SHA256.
 ///
 /// # Security
 ///
 /// All keys stored in this provider are wrapped in [`SecureKey`], which ensures
-/// they are zeroed from memory when the provider is dropped.
+/// they are zeroed from memory when the provider is dropped. The provider
+/// does not retain the raw hex strings from the config.
 #[derive(Debug, Clone)]
 pub struct ConfigKeyProvider {
-    /// Whether per-field HKDF derivation is enabled. We store only this flag
-    /// rather than the full `EncryptionConfig` so the provider does not retain
-    /// a second, un-zeroized copy of the raw hex key strings for its lifetime.
-    key_derivation_enabled: bool,
     primary_key: SecureKey,
     previous_keys: Vec<SecureKey>,
-    deterministic_key: Option<SecureKey>,
-    salt: Option<SecureKey>,
+    deterministic_key: SecureKey,
+    salt: SecureKey,
 }
 
 impl ConfigKeyProvider {
-    /// Create a new config key provider
+    /// Parse and validate a configuration.
     ///
     /// # Errors
-    /// Returns an error if the primary key is missing or invalid
+    /// Returns an error when any key or the salt is not 64 hex characters,
+    /// when a non-empty `previous_keys` entry is invalid, or when
+    /// `deterministic_key` equals `primary_key` or a previous key.
     pub fn new(config: &EncryptionConfig) -> EncryptionResult<Self> {
-        if !config.has_primary_key() {
-            return Err(EncryptionError::NotConfigured(
-                "primary_key is required".to_string(),
+        let parse = |label: &str, hex: &str| {
+            parse_hex_key(hex)
+                .map(SecureKey::new)
+                .map_err(|e| EncryptionError::InvalidKey(format!("{label}: {e}")))
+        };
+        let primary_key = parse("primary_key", &config.primary_key)?;
+        let previous_keys = config
+            .previous_keys_present()
+            .iter()
+            .enumerate()
+            .map(|(i, k)| parse(&format!("previous_keys[{i}]"), k))
+            .collect::<EncryptionResult<Vec<_>>>()?;
+        let salt = parse("key_derivation_salt", &config.key_derivation_salt)?;
+
+        // The deterministic key must be distinct from every master used for
+        // random-IV encryption: if it collided with one, the same HKDF-derived
+        // field key would be shared between a deterministic ciphertext and a
+        // random-IV one, risking AES-GCM nonce reuse across the two modes.
+        let deterministic_key = parse("deterministic_key", &config.deterministic_key)?;
+        if deterministic_key.as_bytes() == primary_key.as_bytes() {
+            return Err(EncryptionError::InvalidKey(
+                "deterministic_key must differ from primary_key".into(),
+            ));
+        }
+        if previous_keys
+            .iter()
+            .any(|p| p.as_bytes() == deterministic_key.as_bytes())
+        {
+            return Err(EncryptionError::InvalidKey(
+                "deterministic_key must differ from every previous_keys entry".into(),
             ));
         }
 
-        let primary_key = SecureKey::new(parse_hex_key(&config.primary_key)?);
-
-        // Parse previous keys, skipping invalid ones with a warning
-        let previous_keys: Vec<SecureKey> = config
-            .valid_previous_keys()
-            .iter()
-            .filter_map(|k| parse_hex_key(k).ok().map(SecureKey::new))
-            .collect();
-
-        // Parse salt if key derivation is enabled
-        let salt = if config.is_key_derivation_enabled() {
-            config
-                .key_derivation
-                .as_ref()
-                .and_then(|kd| kd.salt.as_ref())
-                .map(|s| parse_hex_key(s).map(SecureKey::new))
-                .transpose()?
-        } else {
-            None
-        };
-
-        // Parse deterministic key if configured. It must be distinct from the
-        // primary AND from every previous (rotation) key: if it collided with
-        // any master used for random-IV encryption, the same HKDF-derived
-        // field key could be shared between a deterministic ciphertext and a
-        // random-IV one, risking AES-GCM nonce reuse across the two modes.
-        let deterministic_key = match config.deterministic_key.as_ref() {
-            Some(k) if !k.trim().is_empty() => {
-                let det = parse_hex_key(k)?;
-                if det.as_slice() == primary_key.as_bytes() {
-                    return Err(EncryptionError::InvalidKey(
-                        "deterministic_key must differ from primary_key".into(),
-                    ));
-                }
-                if previous_keys.iter().any(|p| p.as_bytes() == det.as_slice()) {
-                    return Err(EncryptionError::InvalidKey(
-                        "deterministic_key must differ from every previous_keys entry".into(),
-                    ));
-                }
-                Some(SecureKey::new(det))
-            }
-            _ => None,
-        };
-
         Ok(Self {
-            key_derivation_enabled: config.is_key_derivation_enabled(),
             primary_key,
             previous_keys,
             deterministic_key,
@@ -235,19 +217,10 @@ impl KeyProvider for ConfigKeyProvider {
         master: &SecureKey,
         field_name: &str,
     ) -> EncryptionResult<SecureKey> {
-        if !self.key_derivation_enabled {
-            return Ok(master.clone());
-        }
-
-        let salt = self.salt.as_ref().ok_or_else(|| {
-            EncryptionError::KeyDerivation("salt is required for key derivation".to_string())
-        })?;
-
-        let hk = Hkdf::<Sha256>::new(Some(salt.as_bytes()), master.as_bytes());
+        let hk = Hkdf::<Sha256>::new(Some(self.salt.as_bytes()), master.as_bytes());
         let mut derived = vec![0u8; KEY_SIZE];
         hk.expand(field_name.as_bytes(), &mut derived)
             .map_err(|e| EncryptionError::KeyDerivation(e.to_string()))?;
-
         Ok(SecureKey::new(derived))
     }
 
@@ -261,7 +234,7 @@ impl KeyProvider for ConfigKeyProvider {
     }
 
     fn get_deterministic_key(&self) -> EncryptionResult<Option<SecureKey>> {
-        Ok(self.deterministic_key.clone())
+        Ok(Some(self.deterministic_key.clone()))
     }
 }
 
@@ -319,55 +292,62 @@ impl KeyProvider for StaticKeyProvider {
 mod tests {
     use super::*;
 
-    fn test_config() -> EncryptionConfig {
+    const PRIMARY: &str = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+    const PREVIOUS: &str = "1f1e1d1c1b1a191817161514131211100f0e0d0c0b0a09080706050403020100";
+    const DET: &str = "aabbccdd00112233445566778899aabbccddeeff00112233445566778899aabb";
+    const SALT: &str = "112233445566778899aabbccddeeff00112233445566778899aabbccddeeff00";
+
+    fn cfg(primary: &str, previous: &[&str], det: &str) -> EncryptionConfig {
         EncryptionConfig {
-            // 64 hex chars = 32 bytes
-            primary_key: "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
-                .to_string(),
-            previous_keys: vec![],
-            deterministic_key: None,
-            key_derivation: None,
+            primary_key: primary.to_string(),
+            previous_keys: previous.iter().map(ToString::to_string).collect(),
+            deterministic_key: det.to_string(),
+            key_derivation_salt: SALT.to_string(),
         }
     }
 
     #[test]
     fn test_config_key_provider_basic() {
-        let config = test_config();
-        let provider = ConfigKeyProvider::new(&config).unwrap();
-
+        let provider = ConfigKeyProvider::new(&cfg(PRIMARY, &[], DET)).unwrap();
         let key = provider.get_encryption_key().unwrap();
         assert_eq!(key.len(), KEY_SIZE);
         assert_eq!(key.as_bytes()[0], 0x00);
         assert_eq!(key.as_bytes()[31], 0x1f);
+        assert_eq!(
+            provider.get_deterministic_key().unwrap().unwrap().len(),
+            KEY_SIZE
+        );
     }
 
     #[test]
-    fn test_config_key_provider_missing_key() {
-        let config = EncryptionConfig {
-            primary_key: "".to_string(),
-            previous_keys: vec![],
-            deterministic_key: None,
-            key_derivation: None,
-        };
-
-        assert!(ConfigKeyProvider::new(&config).is_err());
+    fn test_config_key_provider_rejects_bad_keys() {
+        for (label, config) in [
+            ("primary", cfg("", &[], DET)),
+            ("primary", cfg("too_short", &[], DET)),
+            ("deterministic", cfg(PRIMARY, &[], "")),
+            ("deterministic", cfg(PRIMARY, &[], "not-hex")),
+            ("previous", cfg(PRIMARY, &["bad"], DET)),
+            (
+                "salt",
+                EncryptionConfig {
+                    key_derivation_salt: "short".to_string(),
+                    ..cfg(PRIMARY, &[], DET)
+                },
+            ),
+        ] {
+            let err = ConfigKeyProvider::new(&config).unwrap_err();
+            assert!(
+                matches!(err, EncryptionError::InvalidKey(_)),
+                "{label}: {err}"
+            );
+        }
     }
 
     #[test]
-    fn test_config_key_provider_with_previous_keys() {
-        let config = EncryptionConfig {
-            primary_key: "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
-                .to_string(),
-            previous_keys: vec![
-                "1f1e1d1c1b1a191817161514131211100f0e0d0c0b0a09080706050403020100".to_string(),
-            ],
-            deterministic_key: None,
-            key_derivation: None,
-        };
-
-        let provider = ConfigKeyProvider::new(&config).unwrap();
+    fn test_config_key_provider_skips_empty_previous_entries() {
+        // An unset templated env var renders as "", which is not an error.
+        let provider = ConfigKeyProvider::new(&cfg(PRIMARY, &["", PREVIOUS, "  "], DET)).unwrap();
         let decryption_keys = provider.get_decryption_keys().unwrap();
-
         assert_eq!(decryption_keys.len(), 2);
         assert_eq!(decryption_keys[0].1, Some("primary".to_string()));
         assert_eq!(decryption_keys[1].1, Some("previous_0".to_string()));
@@ -375,133 +355,60 @@ mod tests {
 
     #[test]
     fn test_config_key_provider_key_derivation() {
-        let config = EncryptionConfig {
-            primary_key: "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
-                .to_string(),
-            previous_keys: vec![],
-            deterministic_key: None,
-            key_derivation: Some(super::super::config::KeyDerivationConfig {
-                enabled: true,
-                salt: Some(
-                    "aabbccdd00112233445566778899aabbccddeeff00112233445566778899aabb".to_string(),
-                ),
-            }),
-        };
+        let provider = ConfigKeyProvider::new(&cfg(PRIMARY, &[], DET)).unwrap();
 
-        let provider = ConfigKeyProvider::new(&config).unwrap();
-
-        // Field-specific keys should be different from primary key
+        // Field keys are never the master.
         let primary = provider.get_encryption_key().unwrap();
         let field_key = provider.get_field_key("ssn").unwrap();
-
         assert_ne!(primary.as_bytes(), field_key.as_bytes());
         assert_eq!(field_key.len(), KEY_SIZE);
 
-        // Same field should get same derived key
-        let field_key2 = provider.get_field_key("ssn").unwrap();
-        assert_eq!(field_key.as_bytes(), field_key2.as_bytes());
-
-        // Different fields should get different keys
-        let other_field_key = provider.get_field_key("credit_card").unwrap();
-        assert_ne!(field_key.as_bytes(), other_field_key.as_bytes());
-    }
-
-    #[test]
-    fn test_config_key_provider_deterministic_key() {
-        let config = EncryptionConfig {
-            primary_key: "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
-                .to_string(),
-            previous_keys: vec![],
-            deterministic_key: Some(
-                "1f1e1d1c1b1a191817161514131211100f0e0d0c0b0a09080706050403020100".to_string(),
-            ),
-            key_derivation: None,
-        };
-        let provider = ConfigKeyProvider::new(&config).unwrap();
-
-        let det = provider
-            .get_deterministic_key()
-            .unwrap()
-            .expect("deterministic key should be present");
-        assert_eq!(det.len(), KEY_SIZE);
+        // Stable per field, distinct across fields.
+        assert_eq!(
+            field_key.as_bytes(),
+            provider.get_field_key("ssn").unwrap().as_bytes()
+        );
         assert_ne!(
-            det.as_bytes(),
-            provider.get_encryption_key().unwrap().as_bytes()
+            field_key.as_bytes(),
+            provider.get_field_key("credit_card").unwrap().as_bytes()
+        );
+
+        // Distinct across salts.
+        let other_salt = EncryptionConfig {
+            key_derivation_salt: DET.to_string(),
+            ..cfg(PRIMARY, &[], DET)
+        };
+        let other = ConfigKeyProvider::new(&other_salt).unwrap();
+        assert_ne!(
+            field_key.as_bytes(),
+            other.get_field_key("ssn").unwrap().as_bytes()
         );
     }
 
     #[test]
     fn test_config_key_provider_rejects_det_equal_to_primary() {
-        let hex = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
-        let config = EncryptionConfig {
-            primary_key: hex.to_string(),
-            previous_keys: vec![],
-            deterministic_key: Some(hex.to_string()),
-            key_derivation: None,
-        };
-        let err = ConfigKeyProvider::new(&config).unwrap_err();
-        assert!(
-            matches!(err, EncryptionError::InvalidKey(_)),
-            "expected InvalidKey, got {err:?}"
-        );
+        let err = ConfigKeyProvider::new(&cfg(PRIMARY, &[], PRIMARY)).unwrap_err();
+        assert!(matches!(err, EncryptionError::InvalidKey(_)), "{err:?}");
     }
 
     #[test]
     fn test_config_key_provider_rejects_det_equal_to_previous_key() {
-        let primary = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
-        let previous = "1f1e1d1c1b1a191817161514131211100f0e0d0c0b0a09080706050403020100";
-        let config = EncryptionConfig {
-            primary_key: primary.to_string(),
-            previous_keys: vec![previous.to_string()],
-            // Equal to a previous master: would risk a shared HKDF-derived
-            // field key across deterministic and random-IV ciphertexts.
-            deterministic_key: Some(previous.to_string()),
-            key_derivation: None,
-        };
-        let err = ConfigKeyProvider::new(&config).unwrap_err();
-        assert!(
-            matches!(err, EncryptionError::InvalidKey(_)),
-            "expected InvalidKey, got {err:?}"
-        );
-    }
-
-    #[test]
-    fn test_config_key_provider_no_deterministic_key() {
-        let provider = ConfigKeyProvider::new(&test_config()).unwrap();
-        assert!(provider.get_deterministic_key().unwrap().is_none());
+        // Equal to a previous master: would risk a shared HKDF-derived field
+        // key across deterministic and random-IV ciphertexts.
+        let err = ConfigKeyProvider::new(&cfg(PRIMARY, &[PREVIOUS], PREVIOUS)).unwrap_err();
+        assert!(matches!(err, EncryptionError::InvalidKey(_)), "{err:?}");
     }
 
     #[test]
     fn test_derive_field_key_per_master_for_rotation() {
-        // Regression for the rotation+derivation bug: derive_field_key must
-        // derive from the supplied master, not always from the primary.
-        let config = EncryptionConfig {
-            primary_key: "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
-                .to_string(),
-            previous_keys: vec![
-                "1f1e1d1c1b1a191817161514131211100f0e0d0c0b0a09080706050403020100".to_string(),
-            ],
-            deterministic_key: None,
-            key_derivation: Some(super::super::config::KeyDerivationConfig {
-                enabled: true,
-                salt: Some(
-                    "aabbccdd00112233445566778899aabbccddeeff00112233445566778899aabb".to_string(),
-                ),
-            }),
-        };
-        let provider = ConfigKeyProvider::new(&config).unwrap();
-
+        // Rotation with derivation: the field key must come from the supplied
+        // master, not always from the primary.
+        let provider = ConfigKeyProvider::new(&cfg(PRIMARY, &[PREVIOUS], DET)).unwrap();
         let masters = provider.get_decryption_keys().unwrap();
         assert_eq!(masters.len(), 2);
 
-        let (primary_master, _) = &masters[0];
-        let (previous_master, _) = &masters[1];
-
-        let primary_field = provider.derive_field_key(primary_master, "ssn").unwrap();
-        let previous_field = provider.derive_field_key(previous_master, "ssn").unwrap();
-
-        // Deriving from different masters MUST yield different field keys;
-        // before the fix `get_field_key` always derived from primary.
+        let primary_field = provider.derive_field_key(&masters[0].0, "ssn").unwrap();
+        let previous_field = provider.derive_field_key(&masters[1].0, "ssn").unwrap();
         assert_ne!(primary_field.as_bytes(), previous_field.as_bytes());
         assert_eq!(primary_field.len(), KEY_SIZE);
         assert_eq!(previous_field.len(), KEY_SIZE);

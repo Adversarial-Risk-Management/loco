@@ -4,10 +4,7 @@
 //! configured key can decrypt it.
 
 use loco_rs::encryption::{
-    config::{EncryptionConfig, KeyDerivationConfig},
-    decrypt_field,
-    key_provider::ConfigKeyProvider,
-    Encryptable,
+    config::EncryptionConfig, decrypt_field, key_provider::ConfigKeyProvider, Encryptable,
 };
 use sea_orm::{ActiveModelTrait, Set};
 
@@ -60,11 +57,8 @@ async fn stale_envelope_is_reencrypted_with_the_current_key_on_save() {
     let key_b_only = ConfigKeyProvider::new(&EncryptionConfig {
         primary_key: KEY_B.to_string(),
         previous_keys: vec![],
-        deterministic_key: Some(DET_KEY.to_string()),
-        key_derivation: Some(KeyDerivationConfig {
-            enabled: true,
-            salt: Some(SALT.to_string()),
-        }),
+        deterministic_key: DET_KEY.to_string(),
+        key_derivation_salt: SALT.to_string(),
     })
     .unwrap();
     assert_eq!(
