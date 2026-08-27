@@ -11,4 +11,6 @@ mod nullable_tests;
 mod reencrypt_tests;
 mod scoped_entity;
 mod scoped_tests;
+mod tenant_entity;
+mod tenant_tests;
 mod tests;

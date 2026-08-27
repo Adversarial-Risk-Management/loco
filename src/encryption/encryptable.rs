@@ -59,7 +59,7 @@ use super::{
     errors::{EncryptionError, EncryptionResult},
     format::{is_encrypted_format, EncryptedValue, CURRENT_ENVELOPE_VERSION},
     key_provider::{KeyProvider, SecureKey},
-    registry,
+    registry::{self, SharedKeyProvider},
     scope::RowScope,
 };
 use crate::app::AppContext;
@@ -303,6 +303,33 @@ pub trait Encryptable: ActiveModelTrait {
         Ok(RowScope::new())
     }
 
+    /// Select the key provider for a row, given its scope.
+    ///
+    /// The `*_ctx` helpers ([`encrypt_fields_ctx`](Self::encrypt_fields_ctx),
+    /// [`ModelDecryption::decrypt_fields_ctx`], [`encrypt_query_value_scoped`])
+    /// call this first and fall back to the registry when it returns
+    /// `Ok(None)`. Override it — or pass `provider_for = path::to::fn` to
+    /// [`impl_encryptable_fields!`](crate::impl_encryptable_fields) — to
+    /// encrypt each tenant's rows under that tenant's own keys.
+    ///
+    /// The hook is synchronous: resolve providers that need I/O (a sealed
+    /// per-tenant keypair read from the database, a KMS call) earlier on the
+    /// request or job path and cache them, for example in
+    /// `ctx.shared_store`, then look them up here. The cache owner must evict
+    /// an entry when that tenant's keys rotate. For a scoped table, return
+    /// `Err` rather than `Ok(None)` on a cache miss: falling back to the
+    /// global provider would write a tenant's row under the wrong key.
+    ///
+    /// # Errors
+    /// Returns an error when no provider can be resolved for the scope.
+    fn provider_for(
+        scope: &RowScope,
+        ctx: &AppContext,
+    ) -> EncryptionResult<Option<SharedKeyProvider>> {
+        let _ = (scope, ctx);
+        Ok(None)
+    }
+
     /// Get the current value of a string field if it is Set
     ///
     /// This method must be implemented for each field that can be encrypted.
@@ -331,7 +358,15 @@ pub trait Encryptable: ActiveModelTrait {
     where
         Self: Sized,
     {
-        let provider = registry::require(ctx)?;
+        // Nothing to encrypt: do not demand the scope columns or a provider.
+        if !Self::encrypted_fields()
+            .iter()
+            .any(|f| self.get_set_string_value(f).is_some())
+        {
+            return Ok(self);
+        }
+        let scope = self.row_scope()?;
+        let provider = resolve_provider::<Self>(&scope, ctx)?;
         self.encrypt_fields(&*provider)
     }
 
@@ -454,8 +489,12 @@ pub trait ModelDecryption: Sized + Serialize + DeserializeOwned {
         <E as EntityTrait>::Model: Serialize + DeserializeOwned,
         <E as EntityTrait>::ActiveModel: Encryptable,
     {
-        let provider = registry::require(ctx)?;
-        self.decrypt_fields::<E, _>(&*provider)
+        let mut value = serde_json::to_value(&self)?;
+        let scope = <<E as EntityTrait>::ActiveModel as Encryptable>::row_scope_from_json(&value)?;
+        let provider = resolve_provider::<<E as EntityTrait>::ActiveModel>(&scope, ctx)?;
+        decrypt_row_fields::<E, _>(&mut value, &scope, &*provider)?;
+        *self = serde_json::from_value(value)?;
+        Ok(())
     }
 
     /// Decrypt all encrypted fields in-place using an explicit provider.
@@ -470,11 +509,38 @@ pub trait ModelDecryption: Sized + Serialize + DeserializeOwned {
         <E as EntityTrait>::ActiveModel: Encryptable,
         P: KeyProvider + ?Sized,
     {
-        let encrypted_fields = <<E as EntityTrait>::ActiveModel as Encryptable>::encrypted_fields();
-
-        // Convert model to JSON for dynamic field access
         let mut value = serde_json::to_value(&self)?;
         let scope = <<E as EntityTrait>::ActiveModel as Encryptable>::row_scope_from_json(&value)?;
+        decrypt_row_fields::<E, P>(&mut value, &scope, provider)?;
+        *self = serde_json::from_value(value)?;
+        Ok(())
+    }
+}
+
+/// Resolve the provider for a row: the model's [`Encryptable::provider_for`]
+/// first, then the registry.
+fn resolve_provider<A: Encryptable>(
+    scope: &RowScope,
+    ctx: &AppContext,
+) -> EncryptionResult<SharedKeyProvider> {
+    A::provider_for(scope, ctx)?.map_or_else(|| registry::require(ctx), Ok)
+}
+
+/// Decrypt every encrypted field of a model serialized as a JSON object,
+/// in place. Shared by the ctx-aware and explicit-provider entry points.
+fn decrypt_row_fields<E, P>(
+    value: &mut serde_json::Value,
+    scope: &RowScope,
+    provider: &P,
+) -> EncryptionResult<()>
+where
+    E: EntityTrait,
+    <E as EntityTrait>::ActiveModel: Encryptable,
+    P: KeyProvider + ?Sized,
+{
+    {
+        let encrypted_fields = <<E as EntityTrait>::ActiveModel as Encryptable>::encrypted_fields();
+
         let obj = value.as_object_mut().ok_or_else(|| {
             EncryptionError::DecryptionFailed("failed to convert model to JSON object".into())
         })?;
@@ -578,11 +644,8 @@ pub trait ModelDecryption: Sized + Serialize + DeserializeOwned {
                 ));
             }
         }
-
-        // Convert back to Model
-        *self = serde_json::from_value(value)?;
-        Ok(())
     }
+    Ok(())
 }
 
 // Blanket implementation for all types that implement Serialize + DeserializeOwned
@@ -743,8 +806,9 @@ where
              use `encrypt_query_value_scoped` with the row's scope values"
         )));
     }
-    let provider = registry::require(ctx)?;
-    encrypt_query_value_with::<E, _>(field_name, plaintext, &RowScope::new(), &*provider)
+    let scope = RowScope::new();
+    let provider = resolve_provider::<<E as EntityTrait>::ActiveModel>(&scope, ctx)?;
+    encrypt_query_value_with::<E, _>(field_name, plaintext, &scope, &*provider)
 }
 
 /// [`encrypt_query_value`] for a row-scoped model (`aad_fields`).
@@ -766,7 +830,7 @@ where
     E: EntityTrait,
     <E as EntityTrait>::ActiveModel: Encryptable,
 {
-    let provider = registry::require(ctx)?;
+    let provider = resolve_provider::<<E as EntityTrait>::ActiveModel>(scope, ctx)?;
     encrypt_query_value_with::<E, _>(field_name, plaintext, scope, &*provider)
 }
 

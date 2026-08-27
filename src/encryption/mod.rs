@@ -203,51 +203,43 @@ pub use scope::RowScope;
 /// receives to select a per-row key provider. Deterministic fields on a
 /// scoped model must be queried with
 /// [`encrypt_query_value_scoped`](encryptable::encrypt_query_value_scoped).
+///
+/// # Per-row key providers (`provider_for`)
+///
+/// Pass `provider_for = path::to::fn` to name a
+/// `fn(&RowScope, &AppContext) -> EncryptionResult<Option<SharedKeyProvider>>`
+/// that the `*_ctx` helpers consult before the registry, so each tenant's
+/// rows are encrypted under that tenant's keys:
+///
+/// ```rust,ignore
+/// impl_encryptable_fields!(
+///     integration_credentials::ActiveModel,
+///     [credentials(no_compress)],
+///     aad_namespace = "integration_credential",
+///     aad_fields = [org_id],
+///     provider_for = crate::encryption::org_provider,
+/// );
+/// ```
+///
+/// See [`Encryptable::provider_for`](encryptable::Encryptable::provider_for)
+/// for the caching contract. The named arguments are optional and must
+/// appear in this order.
 #[macro_export]
 macro_rules! impl_encryptable_fields {
-    ($model:ty, [$($field:ident $(($modifier:ident))?),* $(,)?]) => {
-        $crate::__impl_encryptable_fields_inner!(
-            $model,
-            [$($field $(($modifier))?),*],
-            aad_namespace = "",
-            aad_fields = []
-        );
-    };
     (
         $model:ty,
-        [$($field:ident $(($modifier:ident))?),* $(,)?],
-        aad_namespace = $ns:literal $(,)?
+        [$($field:ident $(($modifier:ident))?),* $(,)?]
+        $(, aad_namespace = $ns:literal)?
+        $(, aad_fields = [$($scope:ident),* $(,)?])?
+        $(, provider_for = $provider_for:path)?
+        $(,)?
     ) => {
         $crate::__impl_encryptable_fields_inner!(
             $model,
             [$($field $(($modifier))?),*],
-            aad_namespace = $ns,
-            aad_fields = []
-        );
-    };
-    (
-        $model:ty,
-        [$($field:ident $(($modifier:ident))?),* $(,)?],
-        aad_fields = [$($scope:ident),* $(,)?] $(,)?
-    ) => {
-        $crate::__impl_encryptable_fields_inner!(
-            $model,
-            [$($field $(($modifier))?),*],
-            aad_namespace = "",
-            aad_fields = [$($scope),*]
-        );
-    };
-    (
-        $model:ty,
-        [$($field:ident $(($modifier:ident))?),* $(,)?],
-        aad_namespace = $ns:literal,
-        aad_fields = [$($scope:ident),* $(,)?] $(,)?
-    ) => {
-        $crate::__impl_encryptable_fields_inner!(
-            $model,
-            [$($field $(($modifier))?),*],
-            aad_namespace = $ns,
-            aad_fields = [$($scope),*]
+            aad_namespace = [$($ns)?],
+            aad_fields = [$($($scope),*)?],
+            provider_for = [$($provider_for)?]
         );
     };
 }
@@ -260,8 +252,9 @@ macro_rules! __impl_encryptable_fields_inner {
     (
         $model:ty,
         [$($field:ident $(($modifier:ident))?),* $(,)?],
-        aad_namespace = $ns:literal,
-        aad_fields = [$($scope:ident),*]
+        aad_namespace = [$($ns:literal)?],
+        aad_fields = [$($scope:ident),*],
+        provider_for = [$($provider_for:path)?]
     ) => {
         impl $crate::encryption::Encryptable for $model {
             fn encrypted_fields() -> Vec<String> {
@@ -293,12 +286,24 @@ macro_rules! __impl_encryptable_fields_inner {
             }
 
             fn field_aad(field_name: &str) -> Vec<u8> {
-                if $ns.is_empty() {
+                let ns: &str = $crate::__encryption_first_literal!($($ns)?);
+                if ns.is_empty() {
                     Vec::new()
                 } else {
-                    format!("{}:{}", $ns, field_name).into_bytes()
+                    format!("{}:{}", ns, field_name).into_bytes()
                 }
             }
+
+            $(
+                fn provider_for(
+                    scope: &$crate::encryption::RowScope,
+                    ctx: &$crate::app::AppContext,
+                ) -> $crate::encryption::EncryptionResult<
+                    Option<$crate::encryption::SharedKeyProvider>,
+                > {
+                    $provider_for(scope, ctx)
+                }
+            )?
 
             fn scope_columns() -> Vec<String> {
                 vec![$(stringify!($scope).to_string()),*]
@@ -362,6 +367,19 @@ macro_rules! __impl_encryptable_fields_inner {
                 self
             }
         }
+    };
+}
+
+/// Internal helper for [`impl_encryptable_fields!`] — an optional string
+/// literal, or `""` when absent.
+#[macro_export]
+#[doc(hidden)]
+macro_rules! __encryption_first_literal {
+    () => {
+        ""
+    };
+    ($lit:literal) => {
+        $lit
     };
 }
 

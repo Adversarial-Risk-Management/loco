@@ -255,3 +255,33 @@ loco_rs::encryption::registry::set_global(my_provider);
 ```
 
 The registration call belongs in your `Hooks::boot` implementation, before any model code runs. Once installed, a custom provider replaces the YAML-driven one wholesale; the rest of the encryption machinery (envelope format, deterministic mode, key derivation, rotation through `previous_keys`) is unchanged. This is the supported extension point for organizations that want centralized key management without giving up the rest of the feature.
+
+### Per-row key providers
+
+One process-wide provider is the wrong shape for a multi-tenant table where each organization has its own keys. `Encryptable::provider_for(scope, ctx)` selects a provider per row from its [`RowScope`](#binding-to-row-values-aad_fields); the `*_ctx` helpers and `encrypt_query_value_scoped` call it first and fall back to the registry only when it returns `Ok(None)`. Name the function through the macro:
+
+```rust
+impl_encryptable_fields!(
+    integration_credentials::ActiveModel,
+    [credentials(no_compress)],
+    aad_namespace = "integration_credential",
+    aad_fields = [org_id],
+    provider_for = crate::encryption::org_provider,
+);
+
+pub fn org_provider(scope: &RowScope, ctx: &AppContext) -> EncryptionResult<Option<SharedKeyProvider>> {
+    let org_id = scope.get("org_id").and_then(|v| v.as_str()).ok_or_else(|| {
+        EncryptionError::Scope("org_id missing from scope".into())
+    })?;
+    let cache = ctx.shared_store.get_ref::<OrgProviders>().expect("installed at boot");
+    cache.get(org_id).map(Some).ok_or_else(|| {
+        EncryptionError::NotConfigured(format!("no key provider loaded for org {org_id}"))
+    })
+}
+```
+
+The hook is synchronous. Building a tenant's provider usually needs I/O — reading and unsealing its keypair, calling a KMS — so do that at an async point you already have (a request extractor, the start of a job) and cache the resulting `SharedKeyProvider` in `ctx.shared_store`; `provider_for` only looks it up. The cache owner is responsible for eviction: when a tenant's keys rotate (retire the old key, install the new one), drop that tenant's cached provider in the same step, or its rows keep being written under the retired key until the process restarts.
+
+Return `Err`, not `Ok(None)`, on a cache miss for a scoped table. `Ok(None)` falls back to the global provider, which would write the row under a key the tenant does not own and read it back successfully — the silent-wrong-key case is the one to fail loudly on.
+
+The per-tenant provider still implements the whole `KeyProvider` trait, so retired tenant keys go in `get_decryption_keys()`, and rows written under them re-encrypt under the active key on their next save, as described under [Key rotation](#key-rotation). `h.i` records whatever `get_key_id()` returns — a tenant key's row id is a reasonable choice. The explicit-provider methods (`encrypt_fields(&p)`, `decrypt_fields::<E, _>(&p)`, `encrypt_query_value_with`) bypass `provider_for` entirely; use them when you already hold the tenant's provider.
