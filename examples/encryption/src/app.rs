@@ -1,5 +1,6 @@
 //! `Hooks` impl for the example app.
 
+use crate::{controllers, migration::Migrator};
 use async_trait::async_trait;
 use loco_rs::{
     app::{AppContext, Hooks, Initializer},
@@ -11,7 +12,6 @@ use loco_rs::{
     task::Tasks,
     Result,
 };
-use crate::{controllers, migration::Migrator};
 
 pub struct App;
 

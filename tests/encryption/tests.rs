@@ -6,7 +6,7 @@ use loco_rs::encryption::{
 };
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder, Set,
-    Statement,
+    Statement, Unchanged,
 };
 
 use super::{
@@ -259,4 +259,36 @@ async fn plaintext_in_an_encrypted_column_is_an_error_on_read() {
         matches!(err, loco_rs::encryption::EncryptionError::InvalidFormat(_)),
         "{err}"
     );
+}
+
+#[tokio::test]
+async fn unchanged_plaintext_is_encrypted_on_save() {
+    // SeaORM's `insert` writes `Unchanged` columns, so a decrypted `Model`
+    // turned back into an `ActiveModel` must not leak its plaintext to disk.
+    let ctx = ctx_with_encryption(KEY_A, None).await;
+    let saved = ActiveModel {
+        ssn: Unchanged("123-45-6789".to_string()),
+        email: Unchanged("alice@example.com".to_string()),
+        name: Set("Alice".to_string()),
+        ..Default::default()
+    }
+    .encrypt_fields_ctx(&ctx)
+    .unwrap()
+    .insert(&ctx.db)
+    .await
+    .unwrap();
+
+    let raw_ssn = raw_string_column(&ctx.db, saved.id, "ssn").await;
+    assert!(is_encrypted_format(&raw_ssn), "stored: {raw_ssn}");
+    assert!(is_encrypted_format(
+        &raw_string_column(&ctx.db, saved.id, "email").await
+    ));
+
+    let mut model = Entity::find_by_id(saved.id)
+        .one(&ctx.db)
+        .await
+        .unwrap()
+        .unwrap();
+    model.decrypt_fields_ctx::<Entity>(&ctx).unwrap();
+    assert_eq!(model.ssn, "123-45-6789");
 }

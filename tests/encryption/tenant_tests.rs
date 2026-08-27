@@ -13,7 +13,7 @@ use loco_rs::{
 };
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, Database, DatabaseConnection, EntityTrait,
-    QueryFilter, Schema, Set,
+    QueryFilter, Schema, Set, Unchanged,
 };
 use uuid::Uuid;
 
@@ -172,7 +172,7 @@ async fn org_key_rotation_reencrypts_on_save_under_the_orgs_new_key() {
     assert_eq!(model.secret, "rotate");
     ActiveModel {
         id: Set(id),
-        org_id: Set(org_a),
+        org_id: Unchanged(org_a),
         secret: Set(before.secret.clone()),
         ..Default::default()
     }

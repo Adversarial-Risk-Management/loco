@@ -1,8 +1,8 @@
 //! AAD binding integration tests.
 //!
-//! Uses `aad_entity` which overrides `Encryptable::field_aad` to bind every
-//! ciphertext to `(table, column)`. These tests demonstrate that the binding
-//! defeats the ciphertext-relocation attack class.
+//! `aad_entity` binds every ciphertext to `(table, column)`. These tests
+//! demonstrate that the binding defeats the ciphertext-relocation attack
+//! class.
 
 use loco_rs::encryption::{Encryptable, ModelDecryption};
 use sea_orm::{
@@ -104,8 +104,8 @@ async fn aad_defeats_cross_column_relocation() {
 
 #[tokio::test]
 async fn changing_aad_invalidates_existing_ciphertexts() {
-    // Sanity check that the trait override actually feeds through to the
-    // cipher: the bound ciphertext won't decrypt under the no-AAD primitive.
+    // The macro's AAD feeds through to the cipher: the bound ciphertext does
+    // not decrypt under the no-AAD primitive.
     let ctx = ctx().await;
     let saved = insert(&ctx, "111-22-3333", "alice@example.com").await;
     let ssn_ct = raw(&ctx.db, saved.id, "ssn").await;

@@ -7,7 +7,7 @@ use loco_rs::encryption::{
 };
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, Database, DatabaseConnection, EntityTrait,
-    QueryFilter, Schema, Set, Statement,
+    QueryFilter, Schema, Set, Statement, Unchanged,
 };
 use uuid::Uuid;
 
@@ -214,7 +214,7 @@ async fn explicit_provider_path_honours_the_scope_and_rotation() {
     let old_ct = raw(&db, saved.id, "credentials").await;
     ActiveModel {
         id: Set(saved.id),
-        org_id: Set(org),
+        org_id: Unchanged(org),
         credentials: Set(old_ct.clone()),
         ..Default::default()
     }
@@ -259,5 +259,56 @@ async fn deterministic_scoped_field_queries_within_the_org() {
     // needle that never matches.
     let err = encrypt_query_value::<Entity>("external_id", "shared-ext", &ctx, &RowScope::new())
         .unwrap_err();
+    assert!(matches!(err, EncryptionError::Scope(_)), "{err}");
+}
+
+#[tokio::test]
+async fn changing_a_scope_column_requires_every_encrypted_field() {
+    let ctx = ctx().await;
+    let org_a = Uuid::new_v4();
+    let org_b = Uuid::new_v4();
+    let a = insert(&ctx, org_a, "creds", "ext").await;
+
+    // Moving the row to org B without re-supplying the encrypted fields would
+    // leave ciphertexts bound to org A behind: rejected.
+    let err = ActiveModel {
+        id: Set(a.id),
+        org_id: Set(org_b),
+        ..Default::default()
+    }
+    .encrypt_fields_ctx(&ctx)
+    .unwrap_err();
+    assert!(matches!(err, EncryptionError::Scope(_)), "{err}");
+
+    // Supplying every encrypted field re-binds them to org B.
+    let moved = ActiveModel {
+        id: Set(a.id),
+        org_id: Set(org_b),
+        credentials: Set("creds".to_string()),
+        external_id: Set("ext".to_string()),
+    }
+    .encrypt_fields_ctx(&ctx)
+    .unwrap()
+    .update(&ctx.db)
+    .await
+    .unwrap();
+    let mut model = Entity::find_by_id(moved.id)
+        .one(&ctx.db)
+        .await
+        .unwrap()
+        .unwrap();
+    model.decrypt_fields_ctx::<Entity>(&ctx).unwrap();
+    assert_eq!(model.org_id, org_b);
+    assert_eq!(model.credentials, "creds");
+
+    // A partial update of an encrypted field with the scope NotSet still
+    // needs the scope (the AAD depends on it).
+    let err = ActiveModel {
+        id: Set(a.id),
+        external_id: Set("ext-2".to_string()),
+        ..Default::default()
+    }
+    .encrypt_fields_ctx(&ctx)
+    .unwrap_err();
     assert!(matches!(err, EncryptionError::Scope(_)), "{err}");
 }

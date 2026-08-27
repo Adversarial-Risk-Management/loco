@@ -4,7 +4,8 @@
 //! configured key can decrypt it.
 
 use loco_rs::encryption::{
-    config::EncryptionConfig, decrypt_field, key_provider::ConfigKeyProvider, Encryptable,
+    config::EncryptionConfig, decrypt_field, key_provider::ConfigKeyProvider, ColumnValue,
+    Encryptable,
 };
 use sea_orm::{ActiveModelTrait, Set};
 
@@ -82,7 +83,7 @@ async fn current_envelope_is_not_rewritten_on_save() {
     }
     .encrypt_fields_ctx(&ctx)
     .unwrap();
-    assert_eq!(am.get_set_string_value("ssn").unwrap(), envelope);
+    assert_eq!(am.column_value("ssn"), ColumnValue::Text(envelope));
 }
 
 #[tokio::test]
@@ -138,5 +139,5 @@ async fn deterministic_envelope_survives_primary_rotation_unchanged() {
     }
     .encrypt_fields_ctx(&ctx_b)
     .unwrap();
-    assert_eq!(am.get_set_string_value("email").unwrap(), email_envelope);
+    assert_eq!(am.column_value("email"), ColumnValue::Text(email_envelope));
 }

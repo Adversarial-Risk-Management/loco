@@ -122,7 +122,7 @@ pub use cipher::{
 };
 pub use config::EncryptionConfig;
 pub use encryptable::{
-    decrypt_field, encrypt_field, encrypt_query_value, Encryptable, EncryptableValue,
+    decrypt_field, encrypt_field, encrypt_query_value, ColumnValue, Encryptable, EncryptableValue,
     ModelDecryption,
 };
 pub use errors::{EncryptionError, EncryptionResult};
@@ -185,8 +185,10 @@ pub use scope::RowScope;
 ///
 /// The referenced columns must implement `serde::Serialize` and serialize to
 /// a JSON scalar (a `Uuid` renders as its hyphenated lowercase string). On
-/// save, a scope column that is `NotSet` while an encrypted field is `Set`
-/// is an error; on read, a missing or null scope column is an error. The
+/// save, a scope column that is `NotSet` while an encrypted field holds a
+/// value is an error, and so is a scope column that is `Set` while an
+/// encrypted field is `NotSet`; on read, a missing or null scope column is an
+/// error. The
 /// scope is also what [`Encryptable::provider_for`](encryptable::Encryptable::provider_for)
 /// receives to select a per-row key provider. Deterministic fields on a
 /// scoped model are queried with
@@ -338,20 +340,26 @@ macro_rules! __impl_encryptable_fields_inner {
                 $crate::encryption::RowScope::from_json_row(row, &[$(stringify!($scope)),*])
             }
 
-            fn get_set_string_value(&self, field_name: &str) -> Option<String> {
+            fn scope_changed(&self) -> bool {
+                false $(|| matches!(self.$scope, sea_orm::ActiveValue::Set(_)))*
+            }
+
+            fn column_value(&self, field_name: &str) -> $crate::encryption::ColumnValue {
                 match field_name {
                     $(
-                        stringify!($field) => {
-                            match &self.$field {
-                                sea_orm::ActiveValue::Set(v) => {
-                                    $crate::encryption::EncryptableValue::plaintext(v)
-                                        .map(str::to_string)
+                        stringify!($field) => match &self.$field {
+                            sea_orm::ActiveValue::Set(v) | sea_orm::ActiveValue::Unchanged(v) => {
+                                match $crate::encryption::EncryptableValue::plaintext(v) {
+                                    Some(text) => $crate::encryption::ColumnValue::Text(
+                                        text.to_string(),
+                                    ),
+                                    None => $crate::encryption::ColumnValue::Null,
                                 }
-                                _ => None,
                             }
-                        }
+                            sea_orm::ActiveValue::NotSet => $crate::encryption::ColumnValue::NotSet,
+                        },
                     )*
-                    _ => None,
+                    _ => $crate::encryption::ColumnValue::NotSet,
                 }
             }
 
