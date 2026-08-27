@@ -1,8 +1,8 @@
 //! End-to-end encryption tests against a real SeaORM entity backed by sqlite.
 
 use loco_rs::encryption::{
-    cipher, encrypt_query_value, format::is_encrypted_format, registry, EncryptedValue,
-    ModelDecryption, RowScope,
+    cipher, encrypt_query_value, format::is_encrypted_format, registry, Encryptable,
+    EncryptedValue, ModelDecryption, RowScope,
 };
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder, Set,
@@ -22,8 +22,6 @@ async fn insert_with_encryption(
     email: &str,
     name: &str,
 ) -> Model {
-    use loco_rs::encryption::Encryptable;
-
     let am = ActiveModel {
         ssn: Set(ssn.to_string()),
         email: Set(email.to_string()),
@@ -221,7 +219,7 @@ async fn deterministic_envelope_carries_d_flag() {
         "alice@example.com",
         field_key.as_bytes(),
         Some("deterministic".to_string()),
-        b"",
+        &ActiveModel::field_aad("email"),
     )
     .unwrap();
     let stored = raw_email.clone();

@@ -137,6 +137,16 @@ pub use scope::RowScope;
 /// Convenience macro to implement [`Encryptable`](encryptable::Encryptable)
 /// for an `ActiveModel`.
 ///
+/// ```rust,ignore
+/// use loco_rs::impl_encryptable_fields;
+///
+/// impl_encryptable_fields!(
+///     users::ActiveModel,
+///     [ssn, email(deterministic), bio(no_compress)],
+///     aad_namespace = "users",
+/// );
+/// ```
+///
 /// Each field is one of:
 /// - a bare ident — non-deterministic (random IV) and **compressed by
 ///   default** (subject to the size threshold);
@@ -146,39 +156,17 @@ pub use scope::RowScope;
 ///   the CRIME/BREACH note on
 ///   [`Encryptable::uncompressed_fields`](encryptable::Encryptable::uncompressed_fields)).
 ///
-/// # Example
-///
-/// ```rust,ignore
-/// use loco_rs::impl_encryptable_fields;
-///
-/// // ssn: compressed by default. email: deterministic (and not compressed) so
-/// // `WHERE email = encrypt_query_value::<users::Entity>("email", &input, &ctx, &RowScope::new())?`
-/// // works. bio: opted out of compression.
-/// impl_encryptable_fields!(users::ActiveModel, [ssn, email(deterministic), bio(no_compress)]);
-/// ```
-///
-/// The generated impl produces `encrypted_fields()` containing every name,
-/// `deterministic_fields()` containing only those marked `(deterministic)`,
-/// and `uncompressed_fields()` containing only those marked `(no_compress)`.
 /// Unknown modifiers are rejected at compile time.
 ///
-/// # Binding ciphertexts to a `(table, column)` location (AAD)
+/// # `aad_namespace` (required)
 ///
-/// Pass an `aad_namespace = "<label>"` argument to bind every ciphertext to
-/// `<label>:<field_name>` via Additional Authenticated Data. With this
-/// enabled, a ciphertext written for one field will not decrypt as another:
-///
-/// ```rust,ignore
-/// impl_encryptable_fields!(
-///     users::ActiveModel,
-///     [ssn, email(deterministic)],
-///     aad_namespace = "users",
-/// );
-/// ```
-///
-/// Once enabled, all reads and writes must agree on the namespace; turning it
-/// on for a field that already has data invalidates existing ciphertexts the
-/// same way a key rotation does.
+/// Every ciphertext is bound to `<aad_namespace>:<field_name>` via Additional
+/// Authenticated Data, so a ciphertext written for one column will not
+/// decrypt as another. The namespace is a literal you choose (the table name
+/// is the convention) rather than a value derived from the entity, so a
+/// table rename does not invalidate stored rows. All reads and writes must
+/// agree on it; changing it invalidates existing ciphertexts the same way a
+/// key rotation does.
 ///
 /// # Binding ciphertexts to row values (`aad_fields`)
 ///
@@ -190,7 +178,7 @@ pub use scope::RowScope;
 /// impl_encryptable_fields!(
 ///     integration_credentials::ActiveModel,
 ///     [credentials(no_compress)],
-///     aad_namespace = "integration_credential",
+///     aad_namespace = "integration_credentials",
 ///     aad_fields = [org_id],
 /// );
 /// ```
@@ -216,7 +204,7 @@ pub use scope::RowScope;
 /// impl_encryptable_fields!(
 ///     integration_credentials::ActiveModel,
 ///     [credentials(no_compress)],
-///     aad_namespace = "integration_credential",
+///     aad_namespace = "integration_credentials",
 ///     aad_fields = [org_id],
 ///     provider_for = crate::encryption::org_provider,
 /// );
@@ -225,14 +213,14 @@ pub use scope::RowScope;
 /// A declared `provider_for` is fail-closed: returning `Ok(None)` is turned
 /// into an error rather than falling back to the registry. See
 /// [`Encryptable::provider_for`](encryptable::Encryptable::provider_for) for
-/// the caching contract. The named arguments are optional and must appear in
-/// this order.
+/// the caching contract. `aad_fields` and `provider_for` are optional and the
+/// named arguments must appear in this order.
 #[macro_export]
 macro_rules! impl_encryptable_fields {
     (
         $model:ty,
-        [$($field:ident $(($modifier:ident))?),* $(,)?]
-        $(, aad_namespace = $ns:literal)?
+        [$($field:ident $(($modifier:ident))?),* $(,)?],
+        aad_namespace = $ns:literal
         $(, aad_fields = [$($scope:ident),* $(,)?])?
         $(, provider_for = $provider_for:path)?
         $(,)?
@@ -240,9 +228,14 @@ macro_rules! impl_encryptable_fields {
         $crate::__impl_encryptable_fields_inner!(
             $model,
             [$($field $(($modifier))?),*],
-            aad_namespace = [$($ns)?],
+            aad_namespace = $ns,
             aad_fields = [$($($scope),*)?],
             provider_for = [$($provider_for)?]
+        );
+    };
+    ($model:ty, [$($field:ident $(($modifier:ident))?),* $(,)?] $(,)?) => {
+        compile_error!(
+            "impl_encryptable_fields! requires `aad_namespace = \"<table name>\"` after the field list"
         );
     };
 }
@@ -255,7 +248,7 @@ macro_rules! __impl_encryptable_fields_inner {
     (
         $model:ty,
         [$($field:ident $(($modifier:ident))?),* $(,)?],
-        aad_namespace = [$($ns:literal)?],
+        aad_namespace = $ns:literal,
         aad_fields = [$($scope:ident),*],
         provider_for = [$($provider_for:path)?]
     ) => {
@@ -289,14 +282,8 @@ macro_rules! __impl_encryptable_fields_inner {
             }
 
             fn field_aad(field_name: &str) -> Vec<u8> {
-                let ns: &str = $crate::__encryption_first_literal!($($ns)?);
-                if ns.is_empty() {
-                    Vec::new()
-                } else {
-                    format!("{}:{}", ns, field_name).into_bytes()
-                }
+                format!("{}:{}", $ns, field_name).into_bytes()
             }
-
             $(
                 fn provider_for(
                     scope: &$crate::encryption::RowScope,
@@ -382,19 +369,6 @@ macro_rules! __impl_encryptable_fields_inner {
                 self
             }
         }
-    };
-}
-
-/// Internal helper for [`impl_encryptable_fields!`] — an optional string
-/// literal, or `""` when absent.
-#[macro_export]
-#[doc(hidden)]
-macro_rules! __encryption_first_literal {
-    () => {
-        ""
-    };
-    ($lit:literal) => {
-        $lit
     };
 }
 

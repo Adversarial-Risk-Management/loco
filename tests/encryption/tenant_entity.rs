@@ -24,6 +24,7 @@ impl ActiveModelBehavior for ActiveModel {}
 impl_encryptable_fields!(
     ActiveModel,
     [secret, lookup(deterministic)],
+    aad_namespace = "tenant_secrets",
     aad_fields = [org_id],
     provider_for = super::tenant_tests::org_provider,
 );

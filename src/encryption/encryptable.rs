@@ -12,7 +12,7 @@
 //! use loco_rs::impl_encryptable_fields;
 //!
 //! // Instead of manually implementing all methods:
-//! impl_encryptable_fields!(users::ActiveModel, [ssn, credit_card]);
+//! impl_encryptable_fields!(users::ActiveModel, [ssn, credit_card], aad_namespace = "users");
 //! ```
 //!
 //! # Usage
@@ -23,7 +23,7 @@
 //! ```rust,ignore
 //! use loco_rs::impl_encryptable_fields;
 //!
-//! impl_encryptable_fields!(users::ActiveModel, [ssn, credit_card]);
+//! impl_encryptable_fields!(users::ActiveModel, [ssn, credit_card], aad_namespace = "users");
 //! ```
 //!
 //! 2. Encrypt on save and decrypt on read using the context-aware helpers:
@@ -247,15 +247,11 @@ pub trait Encryptable: ActiveModelTrait {
     /// Deterministic encryption is inherently less private than the random-IV
     /// default: equal plaintexts yield equal ciphertexts, which is what makes
     /// equality queries possible but also reveals which rows share a value.
-    /// This matches Rails Active Record Encryption. Note the leak is not
-    /// confined to a single column: with key derivation disabled (or no
-    /// `aad_namespace`), two deterministic fields holding the same plaintext
-    /// produce the *same* ciphertext, revealing the cross-field equality.
-    /// Enabling key derivation derives a distinct per-field key, so identical
-    /// plaintexts in different fields no longer collide — prefer it whenever
-    /// you have more than one deterministic field. Reserve deterministic mode
-    /// for fields you must query by exact value (e.g. an email used for
-    /// lookup); leave everything else non-deterministic.
+    /// This matches Rails Active Record Encryption. The leak is confined to a
+    /// single column: the per-field HKDF key and the `aad_namespace` binding
+    /// mean identical plaintexts in different fields do not collide. Reserve
+    /// deterministic mode for fields you must query by exact value (e.g. an
+    /// email used for lookup); leave everything else non-deterministic.
     #[must_use]
     fn deterministic_fields() -> Vec<String> {
         Vec::new()
@@ -292,24 +288,20 @@ pub trait Encryptable: ActiveModelTrait {
         Vec::new()
     }
 
-    /// Returns the Additional Authenticated Data to bind to ciphertexts of
-    /// the named field.
+    /// The Additional Authenticated Data that binds ciphertexts of the named
+    /// field to their column.
     ///
     /// AES-GCM authenticates this byte string alongside the ciphertext: the
     /// same AAD must be supplied at decryption time, otherwise authentication
-    /// fails. Override this to defeat ciphertext-relocation attacks where a
+    /// fails. This is what defeats ciphertext-relocation attacks where a
     /// row-level attacker copies a ciphertext from one column to another.
     ///
-    /// A common choice is `format!("{table}:{field}").into_bytes()`. Once
-    /// non-empty AAD is in use, all reads and writes of the field must
-    /// agree, so changing the value invalidates existing ciphertexts.
-    ///
-    /// The default is empty (no AAD binding).
+    /// The macro emits `format!("{aad_namespace}:{field_name}")`. Hand
+    /// implementations should follow the same shape. All reads and writes of
+    /// the field must agree, so changing the value invalidates existing
+    /// ciphertexts.
     #[must_use]
-    fn field_aad(field_name: &str) -> Vec<u8> {
-        let _ = field_name;
-        Vec::new()
-    }
+    fn field_aad(field_name: &str) -> Vec<u8>;
 
     /// Columns whose values scope this row's ciphertexts (`aad_fields`).
     ///

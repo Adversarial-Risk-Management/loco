@@ -30,4 +30,8 @@ pub enum Relation {}
 
 impl ActiveModelBehavior for ActiveModel {}
 
-impl_encryptable_fields!(ActiveModel, [ssn, email(deterministic)]);
+impl_encryptable_fields!(
+    ActiveModel,
+    [ssn, email(deterministic)],
+    aad_namespace = "secret_documents",
+);

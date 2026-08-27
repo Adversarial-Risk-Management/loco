@@ -62,7 +62,7 @@ async fn stale_envelope_is_reencrypted_with_the_current_key_on_save() {
     })
     .unwrap();
     assert_eq!(
-        decrypt_field(&stored, "ssn", &key_b_only, b"").unwrap(),
+        decrypt_field(&stored, "ssn", &key_b_only, &ActiveModel::field_aad("ssn")).unwrap(),
         "111-22-3333"
     );
 }

@@ -22,7 +22,7 @@ message: |
       {%- for f in encrypted_fields %}
           {{f.name}}{% if f.deterministic %}(deterministic){% endif %}{% if not loop.last %},{% endif -%}
       {% endfor %}
-      ]);
+      ], aad_namespace = "{{plural_snake}}");
 
   Set `encryption.primary_key`, `encryption.deterministic_key` and
   `encryption.key_derivation_salt` in your `config/*.yaml`.

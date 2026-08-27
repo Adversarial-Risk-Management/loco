@@ -21,4 +21,8 @@ impl ActiveModelBehavior for ActiveModel {}
 
 // `bio` is compressed by default; `note` opts out of compression with
 // `(no_compress)`, so it is stored at plaintext size even when large.
-impl_encryptable_fields!(ActiveModel, [bio, note(no_compress)]);
+impl_encryptable_fields!(
+    ActiveModel,
+    [bio, note(no_compress)],
+    aad_namespace = "long_documents",
+);
