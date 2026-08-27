@@ -14,7 +14,7 @@
 //! let stored = raw_string_column(&ctx.db, "users", saved.id, "ssn").await;
 //! ```
 
-use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
+use sea_orm::{ConnectionTrait, DatabaseConnection, DbBackend, Statement};
 
 use crate::{
     app::AppContext,
@@ -91,9 +91,13 @@ pub async fn raw_nullable_column(
     column: &str,
 ) -> Option<String> {
     let backend = db.get_database_backend();
+    let placeholder = match backend {
+        DbBackend::Postgres => "$1",
+        _ => "?",
+    };
     let stmt = Statement::from_sql_and_values(
         backend,
-        format!("SELECT {column} FROM {table} WHERE id = ?"),
+        format!("SELECT {column} FROM {table} WHERE id = {placeholder}"),
         [id.into()],
     );
     let row = db

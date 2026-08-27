@@ -6,27 +6,19 @@ use loco_rs::encryption::{
     EncryptionError, ModelDecryption, RowScope,
 };
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, ConnectionTrait, Database, DatabaseConnection, EntityTrait,
-    QueryFilter, Schema, Set, Statement, Unchanged,
+    ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait, QueryFilter,
+    Set, Statement, Unchanged,
 };
 use uuid::Uuid;
 
 use super::{
-    helpers::{config, ctx_with_encryption, KEY_A, KEY_B},
+    helpers::{config, ctx_with_encryption, make_db_for, KEY_A, KEY_B},
     scoped_entity::{ActiveModel, Column, Entity, Model},
 };
 
-async fn make_db() -> DatabaseConnection {
-    let db = Database::connect("sqlite::memory:").await.unwrap();
-    let backend = db.get_database_backend();
-    let stmt = Schema::new(backend).create_table_from_entity(Entity);
-    db.execute_raw(backend.build(&stmt)).await.unwrap();
-    db
-}
-
 async fn ctx() -> loco_rs::app::AppContext {
     let mut c = ctx_with_encryption(KEY_A, None).await;
-    c.db = make_db().await;
+    c.db = make_db_for(Entity).await;
     c
 }
 
@@ -183,7 +175,7 @@ async fn not_set_scope_column_is_an_error_only_when_an_encrypted_field_is_set() 
 async fn explicit_provider_path_honours_the_scope_and_rotation() {
     // Rotation tests drive `encrypt_fields(&provider)` / `decrypt_fields`
     // directly with a ConfigKeyProvider; the scope must apply there too.
-    let db = make_db().await;
+    let db = make_db_for(Entity).await;
     let org = Uuid::new_v4();
     let key_a = ConfigKeyProvider::new(&config(KEY_A, None)).unwrap();
     let saved = ActiveModel {

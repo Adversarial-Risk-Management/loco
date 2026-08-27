@@ -2,7 +2,7 @@
 //! `loco_rs::testing::encryption` helpers.
 
 use loco_rs::{app::AppContext, encryption::config::EncryptionConfig, testing};
-use sea_orm::{ConnectionTrait, Database, DatabaseConnection, Schema};
+use sea_orm::{ConnectionTrait, Database, DatabaseConnection, EntityTrait, Schema};
 
 use super::entity;
 
@@ -14,19 +14,23 @@ pub fn config(primary: &str, previous: Option<&str>) -> EncryptionConfig {
     testing::encryption::encryption_config(primary, previous)
 }
 
-/// Open an in-memory sqlite connection and create the `secret_documents`
-/// table from the entity definition.
-pub async fn make_db() -> DatabaseConnection {
+/// Open an in-memory sqlite connection and create `entity`'s table from its
+/// definition.
+pub async fn make_db_for<E: EntityTrait>(entity: E) -> DatabaseConnection {
     let db = Database::connect("sqlite::memory:")
         .await
         .expect("connect sqlite in-memory");
     let backend = db.get_database_backend();
-    let schema = Schema::new(backend);
-    let stmt = schema.create_table_from_entity(entity::Entity);
+    let stmt = Schema::new(backend).create_table_from_entity(entity);
     db.execute_raw(backend.build(&stmt))
         .await
-        .expect("create secret_documents table");
+        .expect("create table");
     db
+}
+
+/// [`make_db_for`] the `secret_documents` entity.
+pub async fn make_db() -> DatabaseConnection {
+    make_db_for(entity::Entity).await
 }
 
 /// Build a fresh `AppContext` whose `shared_store` already has the encryption

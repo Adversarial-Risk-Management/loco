@@ -236,123 +236,8 @@ pub fn is_encrypted_format(value: &str) -> bool {
     matches!(EncryptedValue::parse_column(value), Ok(Some(_)))
 }
 
-/// Metadata about an encrypted value (for debugging)
-#[derive(Debug, Clone)]
-pub struct EncryptionMetadata {
-    /// Whether a key ID is present
-    pub has_key_id: bool,
-    /// The key ID if present
-    pub key_id: Option<String>,
-    /// Length of the base64-encoded payload
-    pub payload_len: usize,
-    /// Length of the base64-encoded IV
-    pub iv_len: usize,
-    /// Length of the base64-encoded auth tag
-    pub auth_tag_len: usize,
-}
-
-/// Debug utilities for encrypted values
-///
-/// These functions are useful for debugging encryption issues without
-/// exposing sensitive data.
-pub mod debug {
-    use super::{EncryptedValue, EncryptionMetadata};
-
-    /// Inspect an encrypted value's metadata without decrypting
-    ///
-    /// Returns `None` if the value is not in encrypted format.
-    ///
-    /// # Example
-    /// ```rust,ignore
-    /// if let Some(meta) = loco_rs::encryption::format::debug::inspect_encrypted(&encrypted_value) {
-    ///     println!("Key ID: {:?}", meta.key_id);
-    ///     println!("Payload length: {} bytes (base64)", meta.payload_len);
-    /// }
-    /// ```
-    #[must_use]
-    pub fn inspect_encrypted(value: &str) -> Option<EncryptionMetadata> {
-        EncryptedValue::from_json(value)
-            .ok()
-            .map(|v| EncryptionMetadata {
-                has_key_id: v.h.i.is_some(),
-                key_id: v.h.i,
-                payload_len: v.p.len(),
-                iv_len: v.h.iv.len(),
-                auth_tag_len: v.h.at.len(),
-            })
-    }
-
-    /// Get a safe preview of an encrypted value for logging
-    ///
-    /// Returns a string like `"[ENCRYPTED: key_id=primary, payload=64 chars]"`
-    /// that can be safely logged without exposing sensitive data.
-    #[must_use]
-    pub fn safe_preview(value: &str) -> String {
-        match inspect_encrypted(value) {
-            Some(meta) => {
-                let key_info = meta
-                    .key_id
-                    .map_or_else(|| "no key_id".to_string(), |id| format!("key_id={id}"));
-                format!(
-                    "[ENCRYPTED: {}, payload={} chars]",
-                    key_info, meta.payload_len
-                )
-            }
-            None => "[NOT ENCRYPTED]".to_string(),
-        }
-    }
-
-    /// Estimate the decrypted size of an encrypted value
-    ///
-    /// Returns an approximate size in bytes. The actual decrypted size
-    /// may vary slightly due to base64 padding.
-    #[must_use]
-    pub fn estimate_decrypted_size(value: &str) -> Option<usize> {
-        inspect_encrypted(value).map(|meta| {
-            // Base64 encoding increases size by ~33%, so decoded size is ~75% of encoded.
-            // Saturating: payload_len comes off the wire and could be large.
-            meta.payload_len.saturating_mul(3) / 4
-        })
-    }
-}
-
-/// Estimate the encrypted size for a given plaintext length
-///
-/// This is useful for planning database column sizes.
-/// Encrypted values include JSON overhead, base64 encoding, IV, and auth tag.
-///
-/// # Example
-/// ```rust
-/// use loco_rs::encryption::format::estimate_encrypted_size;
-///
-/// // A 100-byte plaintext will need approximately this many bytes when encrypted
-/// let estimated = estimate_encrypted_size(100);
-/// assert!(estimated > 100); // Encrypted is always larger
-/// ```
-#[must_use]
-pub fn estimate_encrypted_size(plaintext_len: usize) -> usize {
-    // AES-GCM ciphertext is the same size as plaintext (stream cipher, no
-    // padding). The 16-byte auth tag is stored separately in the envelope
-    // under `h.at`, and the 12-byte IV under `h.iv`. Saturating arithmetic
-    // so an absurdly large `plaintext_len` returns usize::MAX rather than
-    // overflow-panicking (debug) or wrapping to a tiny value (release).
-    let ciphertext_base64 = (plaintext_len.saturating_add(2) / 3).saturating_mul(4);
-    let iv_base64 = 16; // 12 bytes -> 16 base64 chars
-    let tag_base64 = 24; // 16 bytes -> 24 base64 chars
-
-    // JSON structure overhead: {"p":"...","h":{"iv":"...","at":"..."}}
-    // ~50 bytes for the JSON structure itself
-    let json_overhead: usize = 50;
-
-    json_overhead
-        .saturating_add(ciphertext_base64)
-        .saturating_add(iv_base64)
-        .saturating_add(tag_base64)
-}
-
 #[cfg(test)]
 mod tests {
-    use super::debug::*;
     use super::*;
 
     #[test]
@@ -431,16 +316,6 @@ mod tests {
     }
 
     #[test]
-    fn test_inspect_encrypted() {
-        let json = r#"{"p":"dGVzdCBkYXRh","h":{"v":1,"iv":"MTIzNDU2Nzg5MDEy","at":"MDEyMzQ1Njc4OWFiY2RlZg==","i":"primary"}}"#;
-        let meta = inspect_encrypted(json).unwrap();
-
-        assert!(meta.has_key_id);
-        assert_eq!(meta.key_id, Some("primary".to_string()));
-        assert_eq!(meta.payload_len, "dGVzdCBkYXRh".len());
-    }
-
-    #[test]
     fn test_from_json_rejects_other_versions_and_missing_version() {
         for bad in [
             r#"{"p":"dGVzdA==","h":{"v":99,"iv":"MTIzNDU2Nzg5MDEy","at":"MDEyMzQ1Njc4OWFiY2RlZg=="}}"#,
@@ -484,59 +359,5 @@ mod tests {
     fn test_new_envelope_carries_current_version() {
         let v = EncryptedValue::new(b"ct", b"123456789012", b"0123456789abcdef", None);
         assert_eq!(v.h.v, ENVELOPE_VERSION);
-    }
-
-    #[test]
-    fn test_inspect_encrypted_no_key_id() {
-        let json = r#"{"p":"dGVzdA==","h":{"v":1,"iv":"MTIzNDU2Nzg5MDEy","at":"MDEyMzQ1Njc4OWFiY2RlZg=="}}"#;
-        let meta = inspect_encrypted(json).unwrap();
-
-        assert!(!meta.has_key_id);
-        assert!(meta.key_id.is_none());
-    }
-
-    #[test]
-    fn test_inspect_encrypted_not_encrypted() {
-        assert!(inspect_encrypted("plain text").is_none());
-        assert!(inspect_encrypted("").is_none());
-    }
-
-    #[test]
-    fn test_safe_preview() {
-        let json = r#"{"p":"dGVzdCBkYXRh","h":{"v":1,"iv":"MTIzNDU2Nzg5MDEy","at":"MDEyMzQ1Njc4OWFiY2RlZg==","i":"primary"}}"#;
-        let preview = safe_preview(json);
-
-        assert!(preview.contains("[ENCRYPTED:"));
-        assert!(preview.contains("key_id=primary"));
-        assert!(preview.contains("payload="));
-    }
-
-    #[test]
-    fn test_safe_preview_not_encrypted() {
-        let preview = safe_preview("plain text");
-        assert_eq!(preview, "[NOT ENCRYPTED]");
-    }
-
-    #[test]
-    fn test_estimate_encrypted_size() {
-        // A 100-byte plaintext should produce an encrypted value larger than 100 bytes
-        let estimated = estimate_encrypted_size(100);
-        assert!(estimated > 100);
-
-        // Empty plaintext should still have overhead for JSON structure, IV, tag
-        let empty_estimated = estimate_encrypted_size(0);
-        assert!(empty_estimated > 0);
-    }
-
-    #[test]
-    fn test_estimate_decrypted_size() {
-        let json = r#"{"p":"dGVzdCBkYXRh","h":{"v":1,"iv":"MTIzNDU2Nzg5MDEy","at":"MDEyMzQ1Njc4OWFiY2RlZg=="}}"#;
-        let estimated = estimate_decrypted_size(json);
-
-        // "dGVzdCBkYXRh" is base64 for "test data" (9 bytes)
-        // Base64 length is 12, so estimated decrypted should be around 9
-        assert!(estimated.is_some());
-        let size = estimated.unwrap();
-        assert!(size >= 8 && size <= 12); // Allow some margin for base64 calculation
     }
 }

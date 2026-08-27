@@ -5,27 +5,16 @@
 //! class.
 
 use loco_rs::encryption::{Encryptable, ModelDecryption};
-use sea_orm::{
-    ActiveModelTrait, ConnectionTrait, Database, DatabaseConnection, EntityTrait, Schema, Set,
-    Statement,
-};
+use sea_orm::{ActiveModelTrait, ConnectionTrait, DatabaseConnection, EntityTrait, Set, Statement};
 
 use super::{
     aad_entity::{ActiveModel, Entity, Model},
-    helpers::{ctx_with_encryption, KEY_A},
+    helpers::{ctx_with_encryption, make_db_for, KEY_A},
 };
-
-async fn make_db() -> DatabaseConnection {
-    let db = Database::connect("sqlite::memory:").await.unwrap();
-    let backend = db.get_database_backend();
-    let stmt = Schema::new(backend).create_table_from_entity(Entity);
-    db.execute_raw(backend.build(&stmt)).await.unwrap();
-    db
-}
 
 async fn ctx() -> loco_rs::app::AppContext {
     let mut c = ctx_with_encryption(KEY_A, None).await;
-    c.db = make_db().await;
+    c.db = make_db_for(Entity).await;
     c
 }
 

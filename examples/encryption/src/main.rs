@@ -14,5 +14,5 @@ mod models;
 
 #[tokio::main]
 async fn main() -> loco_rs::Result<()> {
-    cli::main::<app::App, Migrator>().await
+    Box::pin(cli::main::<app::App, Migrator>()).await
 }

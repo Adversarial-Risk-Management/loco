@@ -57,19 +57,51 @@ pub const NONCE_SIZE: usize = 12;
 /// AES-GCM authentication tag size in bytes
 pub const TAG_SIZE: usize = 16;
 
-/// Encrypt plaintext using AES-256-GCM
+/// Upper bound on the inflated size of a compressed value. The compressed
+/// bytes are AES-GCM-authenticated, so only a key holder can reach the
+/// inflater, but a bound keeps a corrupt or hostile payload from allocating
+/// without limit.
+pub const MAX_INFLATED_BYTES: usize = 64 * 1024 * 1024;
+
+/// AES-256-GCM seal shared by the three encryption modes: authenticate the
+/// header flags alongside `aad`, split off the tag, and build the envelope.
+fn seal(
+    key: &[u8],
+    nonce: Nonce<<Aes256Gcm as AeadCore>::NonceSize>,
+    msg: &[u8],
+    key_id: Option<String>,
+    deterministic: bool,
+    compressed: bool,
+    aad: &[u8],
+) -> EncryptionResult<String> {
+    validate_key(key)?;
+    let cipher =
+        Aes256Gcm::new_from_slice(key).map_err(|e| EncryptionError::InvalidKey(e.to_string()))?;
+
+    // Bind the envelope's version and flags into the auth data so the headers
+    // cannot be changed independently of the ciphertext.
+    let aad = header_aad(ENVELOPE_VERSION, deterministic, compressed, aad);
+    let ciphertext_with_tag = cipher
+        .encrypt(&nonce, aes_gcm::aead::Payload { msg, aad: &aad })
+        .map_err(|e| EncryptionError::EncryptionFailed(e.to_string()))?;
+    let (ciphertext, auth_tag) = ciphertext_with_tag.split_at(ciphertext_with_tag.len() - TAG_SIZE);
+
+    let mut envelope = EncryptedValue::new(ciphertext, &nonce, auth_tag, key_id);
+    envelope.h.d = deterministic.then_some(true);
+    envelope.h.c = compressed.then_some(true);
+    envelope.to_json()
+}
+
+/// Encrypt plaintext using AES-256-GCM with a random nonce.
 ///
 /// # Arguments
 /// * `plaintext` - The data to encrypt
 /// * `key` - The 32-byte encryption key
 /// * `key_id` - Optional key identifier for key rotation support
 /// * `aad` - Additional Authenticated Data bound to the ciphertext. Pass `&[]`
-///   for no binding (the default at the model layer). When non-empty, the
-///   same AAD must be supplied to [`decrypt`] or authentication will fail —
-///   this is what defeats ciphertext-relocation attacks.
-///
-/// # Returns
-/// The encrypted value as a JSON string in Rails-compatible format
+///   for no binding. When non-empty, the same AAD must be supplied to
+///   [`decrypt`] or authentication will fail — this is what defeats
+///   ciphertext-relocation attacks.
 ///
 /// # Errors
 /// Returns an error if encryption fails or key is invalid
@@ -79,31 +111,10 @@ pub fn encrypt(
     key_id: Option<String>,
     aad: &[u8],
 ) -> EncryptionResult<String> {
-    validate_key(key)?;
-
-    let cipher =
-        Aes256Gcm::new_from_slice(key).map_err(|e| EncryptionError::InvalidKey(e.to_string()))?;
-
     // 96-bit nonce from OS CSPRNG. Random nonces are safe for up to ~2^32
     // encryptions per key (NIST SP 800-38D); rotate keys before that bound.
     let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
-
-    // Bind the envelope's version and (here unset) flags into the auth data so
-    // the headers can't be tampered with independently of the ciphertext.
-    let aad = header_aad(ENVELOPE_VERSION, false, false, aad);
-    let payload = aes_gcm::aead::Payload {
-        msg: plaintext.as_bytes(),
-        aad: &aad,
-    };
-    let ciphertext_with_tag = cipher
-        .encrypt(&nonce, payload)
-        .map_err(|e| EncryptionError::EncryptionFailed(e.to_string()))?;
-
-    // Split ciphertext and auth tag (AES-GCM appends the tag at the end)
-    let (ciphertext, auth_tag) = ciphertext_with_tag.split_at(ciphertext_with_tag.len() - TAG_SIZE);
-
-    let encrypted = EncryptedValue::new(ciphertext, &nonce, auth_tag, key_id);
-    encrypted.to_json()
+    seal(key, nonce, plaintext.as_bytes(), key_id, false, false, aad)
 }
 
 /// Decrypt an encrypted value using AES-256-GCM
@@ -114,12 +125,10 @@ pub fn encrypt(
 /// * `aad` - Additional Authenticated Data that must match the value used at
 ///   encryption time. Pass `&[]` if no AAD was bound.
 ///
-/// # Returns
-/// The decrypted plaintext
-///
 /// # Errors
-/// Returns an error if decryption fails, format is invalid, key is wrong, or
-/// the supplied AAD does not match what was bound at encryption.
+/// Returns an error if decryption fails, format is invalid, key is wrong, the
+/// supplied AAD does not match what was bound at encryption, or a compressed
+/// value inflates past [`MAX_INFLATED_BYTES`].
 pub fn decrypt(encrypted_json: &str, key: &[u8], aad: &[u8]) -> EncryptionResult<String> {
     validate_key(key)?;
 
@@ -128,20 +137,17 @@ pub fn decrypt(encrypted_json: &str, key: &[u8], aad: &[u8]) -> EncryptionResult
     let cipher =
         Aes256Gcm::new_from_slice(key).map_err(|e| EncryptionError::InvalidKey(e.to_string()))?;
 
-    let ciphertext = encrypted.ciphertext()?;
-    let iv = encrypted.iv()?;
-    let auth_tag = encrypted.auth_tag()?;
-
     // Infallible: `from_json` validated the IV as `NONCE_SIZE` bytes.
-    let iv_bytes: [u8; NONCE_SIZE] = iv
+    let iv_bytes: [u8; NONCE_SIZE] = encrypted
+        .iv()?
         .as_slice()
         .try_into()
         .map_err(|_| EncryptionError::InvalidFormat("invalid IV size".to_string()))?;
     let nonce = Nonce::from(iv_bytes);
 
-    // Reconstruct ciphertext with tag appended (as aes-gcm expects)
-    let mut ciphertext_with_tag = ciphertext;
-    ciphertext_with_tag.extend_from_slice(&auth_tag);
+    // aes-gcm expects the tag appended to the ciphertext.
+    let mut ciphertext_with_tag = encrypted.ciphertext()?;
+    ciphertext_with_tag.extend_from_slice(&encrypted.auth_tag()?);
 
     // Rebuild the associated data the same way the writer did, from the
     // stored version and flags: if an attacker flipped `d`/`c`/`v`, the
@@ -152,25 +158,27 @@ pub fn decrypt(encrypted_json: &str, key: &[u8], aad: &[u8]) -> EncryptionResult
         encrypted.is_compressed(),
         aad,
     );
-
-    let payload = aes_gcm::aead::Payload {
-        msg: ciphertext_with_tag.as_ref(),
-        aad: &auth_data,
-    };
     let plaintext_bytes = cipher
-        .decrypt(&nonce, payload)
+        .decrypt(
+            &nonce,
+            aes_gcm::aead::Payload {
+                msg: ciphertext_with_tag.as_ref(),
+                aad: &auth_data,
+            },
+        )
         .map_err(|e| EncryptionError::DecryptionFailed(e.to_string()))?;
 
     let bytes = if encrypted.is_compressed() {
-        // No pre-sized capacity: `len * 2` could overflow usize on a large
-        // payload, and the decompressed size is unknown anyway. The
-        // compressed bytes are AES-GCM-authenticated, so only a key holder
-        // could craft a value that reaches this point.
-        let mut decoder = ZlibDecoder::new(plaintext_bytes.as_slice());
         let mut out = Vec::new();
-        decoder
+        ZlibDecoder::new(plaintext_bytes.as_slice())
+            .take(MAX_INFLATED_BYTES as u64 + 1)
             .read_to_end(&mut out)
             .map_err(|e| EncryptionError::DecryptionFailed(format!("decompression: {e}")))?;
+        if out.len() > MAX_INFLATED_BYTES {
+            return Err(EncryptionError::DecryptionFailed(format!(
+                "decompression: inflated value exceeds {MAX_INFLATED_BYTES} bytes"
+            )));
+        }
         out
     } else {
         plaintext_bytes
@@ -181,11 +189,12 @@ pub fn decrypt(encrypted_json: &str, key: &[u8], aad: &[u8]) -> EncryptionResult
 }
 
 /// Encrypt plaintext using AES-256-GCM, applying zlib `deflate` compression
-/// when the plaintext is large enough to benefit.
+/// when it pays off.
 ///
 /// Compression is skipped when the plaintext is shorter than
-/// [`COMPRESS_THRESHOLD`] (140 bytes). When applied, the envelope header
-/// `h.c` is set to `true` so [`decrypt`] can reverse it.
+/// [`COMPRESS_THRESHOLD`] (140 bytes) or when the deflated bytes are not
+/// smaller than the plaintext (already-compressed or random data). When
+/// applied, the envelope header `h.c` is set so [`decrypt`] can reverse it.
 ///
 /// # Errors
 /// Returns an error if compression, key setup, or AES-GCM encryption fails.
@@ -199,37 +208,19 @@ pub fn encrypt_compressed(
         return encrypt(plaintext, key, key_id, aad);
     }
 
-    validate_key(key)?;
-
-    // Deflate the plaintext bytes. Default compression level is a reasonable
-    // tradeoff between size and CPU; matches Rails' `Zlib::Deflate.deflate`
-    // default.
+    // Default compression level matches Rails' `Zlib::Deflate.deflate`.
     let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
     std::io::Write::write_all(&mut encoder, plaintext.as_bytes())
         .map_err(|e| EncryptionError::EncryptionFailed(format!("compression: {e}")))?;
     let compressed = encoder
         .finish()
         .map_err(|e| EncryptionError::EncryptionFailed(format!("compression finish: {e}")))?;
+    if compressed.len() >= plaintext.len() {
+        return encrypt(plaintext, key, key_id, aad);
+    }
 
-    let cipher =
-        Aes256Gcm::new_from_slice(key).map_err(|e| EncryptionError::InvalidKey(e.to_string()))?;
     let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
-
-    // Authenticate the compressed flag we are about to set, so it can't be
-    // cleared in storage to make `decrypt` skip inflation and return garbage.
-    let aad = header_aad(ENVELOPE_VERSION, false, true, aad);
-    let payload = aes_gcm::aead::Payload {
-        msg: compressed.as_slice(),
-        aad: &aad,
-    };
-    let ciphertext_with_tag = cipher
-        .encrypt(&nonce, payload)
-        .map_err(|e| EncryptionError::EncryptionFailed(e.to_string()))?;
-    let (ciphertext, auth_tag) = ciphertext_with_tag.split_at(ciphertext_with_tag.len() - TAG_SIZE);
-
-    let mut envelope = EncryptedValue::new(ciphertext, &nonce, auth_tag, key_id);
-    envelope.h.c = Some(true);
-    envelope.to_json()
+    seal(key, nonce, &compressed, key_id, false, true, aad)
 }
 
 /// Encrypt plaintext deterministically using AES-256-GCM with an
@@ -241,12 +232,11 @@ pub fn encrypt_compressed(
 ///
 /// # Arguments
 /// * `plaintext` - The data to encrypt
-/// * `key` - The 32-byte encryption key (typically derived from the
-///   deterministic master)
-/// * `key_id` - Optional key identifier for key rotation support
-///
-/// # Returns
-/// The encrypted value as a JSON string with `h.d = true`.
+/// * `key` - The 32-byte encryption key (derived from the deterministic
+///   master)
+/// * `key_id` - Optional key identifier recorded in the envelope
+/// * `aad` - Additional Authenticated Data; also absorbed into the IV so the
+///   same plaintext under a different binding is a different ciphertext
 ///
 /// # Errors
 /// Returns an error if encryption fails or the key is invalid.
@@ -258,21 +248,14 @@ pub fn encrypt_deterministic(
 ) -> EncryptionResult<String> {
     validate_key(key)?;
 
-    let cipher =
-        Aes256Gcm::new_from_slice(key).map_err(|e| EncryptionError::InvalidKey(e.to_string()))?;
-
-    // Derive a stable IV from the plaintext (and any AAD, so AAD-bound
-    // ciphertexts produce different IVs from non-bound ones for the same
-    // plaintext). Using the encryption key as the HMAC key binds the IV to
-    // this specific key — rotating the key produces a different IV even for
-    // identical plaintexts.
+    // Derive a stable IV from the plaintext and AAD. Using the encryption key
+    // as the HMAC key binds the IV to this specific key — a different key
+    // produces a different IV even for identical plaintexts.
     let mut mac = <HmacSha256 as Mac>::new_from_slice(key)
         .map_err(|e| EncryptionError::EncryptionFailed(e.to_string()))?;
     // Length-prefix the AAD before the plaintext so that (aad, plaintext)
     // pairs whose concatenations would otherwise be equal — e.g.
-    // ("users", ":x") vs ("users:", "x") — cannot derive the same IV. Without
-    // the prefix the boundary is ambiguous; with it the HMAC input is an
-    // unambiguous encoding of the pair.
+    // ("users", ":x") vs ("users:", "x") — cannot derive the same IV.
     mac.update(&(aad.len() as u64).to_be_bytes());
     mac.update(aad);
     mac.update(plaintext.as_bytes());
@@ -281,26 +264,18 @@ pub fn encrypt_deterministic(
     let iv_bytes: [u8; NONCE_SIZE] = tag[..NONCE_SIZE]
         .try_into()
         .map_err(|_| EncryptionError::EncryptionFailed("invalid derived IV size".to_string()))?;
-    let nonce = Nonce::from(iv_bytes);
 
-    // The IV derivation above intentionally uses the raw caller AAD so the
-    // ciphertext stays stable and queryable. The GCM auth data additionally
-    // binds the version and the deterministic flag; this does not affect the
-    // IV, so determinism (and cross-process query matching) is preserved.
-    let aad = header_aad(ENVELOPE_VERSION, true, false, aad);
-    let payload = aes_gcm::aead::Payload {
-        msg: plaintext.as_bytes(),
-        aad: &aad,
-    };
-    let ciphertext_with_tag = cipher
-        .encrypt(&nonce, payload)
-        .map_err(|e| EncryptionError::EncryptionFailed(e.to_string()))?;
-
-    let (ciphertext, auth_tag) = ciphertext_with_tag.split_at(ciphertext_with_tag.len() - TAG_SIZE);
-
-    let mut encrypted = EncryptedValue::new(ciphertext, &nonce, auth_tag, key_id);
-    encrypted.h.d = Some(true);
-    encrypted.to_json()
+    // The GCM auth data additionally binds the version and the deterministic
+    // flag; that does not affect the IV, so determinism is preserved.
+    seal(
+        key,
+        Nonce::from(iv_bytes),
+        plaintext.as_bytes(),
+        key_id,
+        true,
+        false,
+        aad,
+    )
 }
 
 /// Validate that a key is the correct size for AES-256
@@ -567,6 +542,37 @@ mod tests {
             "expected compressed payload << plaintext (got {payload_len} vs {})",
             plaintext.len()
         );
+    }
+
+    #[test]
+    fn test_encrypt_compressed_skips_incompressible_payloads() {
+        let key = test_key();
+        // Base64 of random bytes above the threshold does not deflate smaller;
+        // the value is stored uncompressed rather than grown.
+        let plaintext: String = (0..400u32)
+            .map(|i| char::from(b'A' + ((i * 7 + i / 3) % 26) as u8))
+            .collect::<String>()
+            .chars()
+            .rev()
+            .collect();
+        let random_like = format!("{plaintext}{}", plaintext.chars().rev().collect::<String>());
+        let env = encrypt_compressed(&random_like, &key, None, b"").unwrap();
+        let parsed = EncryptedValue::from_json(&env).unwrap();
+        if parsed.is_compressed() {
+            assert!(parsed.ciphertext().unwrap().len() < random_like.len());
+        }
+        assert_eq!(decrypt(&env, &key, b"").unwrap(), random_like);
+    }
+
+    #[test]
+    fn test_inflate_is_capped() {
+        // A key holder writes a compressed value that inflates past the cap;
+        // decrypt refuses it instead of allocating without bound.
+        let key = test_key();
+        let huge = "a".repeat(MAX_INFLATED_BYTES + 1);
+        let env = encrypt_compressed(&huge, &key, None, b"").unwrap();
+        let err = decrypt(&env, &key, b"").unwrap_err();
+        assert!(err.to_string().contains("exceeds"), "{err}");
     }
 
     #[test]

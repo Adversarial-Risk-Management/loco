@@ -11,14 +11,11 @@ use loco_rs::{
         EncryptionResult, ModelDecryption, RowScope, SharedKeyProvider,
     },
 };
-use sea_orm::{
-    ActiveModelTrait, ColumnTrait, ConnectionTrait, Database, DatabaseConnection, EntityTrait,
-    QueryFilter, Schema, Set, Unchanged,
-};
+use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set, Unchanged};
 use uuid::Uuid;
 
 use super::{
-    helpers::{config, ctx_with_encryption, KEY_A, KEY_B},
+    helpers::{config, ctx_with_encryption, make_db_for, KEY_A, KEY_B},
     tenant_entity::{ActiveModel, Column, Entity},
 };
 
@@ -55,18 +52,10 @@ pub fn org_provider(
     Ok(cache.0.read().unwrap().get(&org).cloned())
 }
 
-async fn make_db() -> DatabaseConnection {
-    let db = Database::connect("sqlite::memory:").await.unwrap();
-    let backend = db.get_database_backend();
-    let stmt = Schema::new(backend).create_table_from_entity(Entity);
-    db.execute_raw(backend.build(&stmt)).await.unwrap();
-    db
-}
-
 /// Global registry holds KEY_B; orgs get their own providers.
 async fn ctx() -> (AppContext, Uuid, Uuid) {
     let mut c = ctx_with_encryption(KEY_B, None).await;
-    c.db = make_db().await;
+    c.db = make_db_for(Entity).await;
     let org_a = Uuid::new_v4();
     let org_b = Uuid::new_v4();
     let cache = OrgProviders::default();

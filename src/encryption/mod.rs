@@ -126,10 +126,7 @@ pub use encryptable::{
     ModelDecryption,
 };
 pub use errors::{EncryptionError, EncryptionResult};
-pub use format::{
-    debug, estimate_encrypted_size, is_encrypted_format, EncryptedHeaders, EncryptedValue,
-    EncryptionMetadata,
-};
+pub use format::{is_encrypted_format, EncryptedHeaders, EncryptedValue};
 pub use key_provider::{ConfigKeyProvider, KeyProvider, SecureKey, StaticKeyProvider};
 pub use registry::SharedKeyProvider;
 pub use scope::RowScope;

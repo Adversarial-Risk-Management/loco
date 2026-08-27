@@ -107,10 +107,12 @@ pub trait KeyProvider: Send + Sync {
 
     /// Get all keys for decryption (primary + previous keys for rotation)
     ///
-    /// Returns a list of `(master_key, key_id)` tuples. Each master is a
-    /// distinct master key that may have encrypted existing ciphertexts. For
-    /// decryption with key derivation, callers must call
-    /// [`derive_field_key`](Self::derive_field_key) for each master.
+    /// Returns a list of `(master_key, key_id)` tuples. **The first entry must
+    /// be the current primary**: a value that only a later entry decrypts is
+    /// treated as stale and re-encrypted on its next save. Each master is a
+    /// distinct master key that may have encrypted existing ciphertexts; the
+    /// caller derives the field key per master with
+    /// [`derive_field_key`](Self::derive_field_key).
     ///
     /// # Errors
     /// Returns an error if keys cannot be retrieved

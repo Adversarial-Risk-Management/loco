@@ -18,6 +18,8 @@ impl MigratorTrait for Migrator {
 #[derive(DeriveMigrationName)]
 pub struct CreateUsers;
 
+// `SchemaManager` carries a lifetime that `async_trait` needs elided here.
+#[allow(elided_lifetimes_in_paths)]
 #[async_trait::async_trait]
 impl MigrationTrait for CreateUsers {
     async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
