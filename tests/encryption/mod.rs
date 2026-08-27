@@ -9,4 +9,6 @@ mod helpers;
 mod nullable_entity;
 mod nullable_tests;
 mod reencrypt_tests;
+mod scoped_entity;
+mod scoped_tests;
 mod tests;

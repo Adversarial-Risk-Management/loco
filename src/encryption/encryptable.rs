@@ -60,6 +60,7 @@ use super::{
     format::{is_encrypted_format, EncryptedValue, CURRENT_ENVELOPE_VERSION},
     key_provider::{KeyProvider, SecureKey},
     registry,
+    scope::RowScope,
 };
 use crate::app::AppContext;
 
@@ -260,6 +261,48 @@ pub trait Encryptable: ActiveModelTrait {
         Vec::new()
     }
 
+    /// Columns whose values scope this row's ciphertexts (`aad_fields`).
+    ///
+    /// The macro's `aad_fields = [org_id]` argument fills this list and
+    /// generates [`row_scope`](Self::row_scope) /
+    /// [`row_scope_from_json`](Self::row_scope_from_json). The values are
+    /// appended to every field's AAD (see [`RowScope::aad_bytes`]), so a
+    /// ciphertext copied onto a row with a different tenant id fails
+    /// authentication. Deterministic fields on a scoped model need
+    /// [`encrypt_query_value_scoped`] for equality queries.
+    ///
+    /// The default is empty (no row binding).
+    #[must_use]
+    fn scope_columns() -> Vec<String> {
+        Vec::new()
+    }
+
+    /// Row scope from this `ActiveModel`'s current values.
+    ///
+    /// Only consulted when at least one encrypted field is `Set`, so partial
+    /// updates that leave the scope columns `NotSet` are fine as long as
+    /// they do not touch an encrypted column.
+    ///
+    /// # Errors
+    /// Returns [`EncryptionError::Scope`] when a scope column is `NotSet`
+    /// or its value is not a JSON scalar.
+    fn row_scope(&self) -> EncryptionResult<RowScope> {
+        Ok(RowScope::new())
+    }
+
+    /// Row scope from a `Model` serialized to JSON (the decrypt side).
+    ///
+    /// Must produce byte-identical [`RowScope::aad_bytes`] to
+    /// [`row_scope`](Self::row_scope) for the same row.
+    ///
+    /// # Errors
+    /// Returns [`EncryptionError::Scope`] when a scope column is missing,
+    /// null, or not a JSON scalar.
+    fn row_scope_from_json(row: &serde_json::Value) -> EncryptionResult<RowScope> {
+        let _ = row;
+        Ok(RowScope::new())
+    }
+
     /// Get the current value of a string field if it is Set
     ///
     /// This method must be implemented for each field that can be encrypted.
@@ -321,11 +364,17 @@ pub trait Encryptable: ActiveModelTrait {
         // The key id is constant across all fields of a model; fetch it once
         // rather than re-allocating it on every loop iteration.
         let key_id = provider.get_key_id();
+        // The row scope is resolved on first use so a partial update that
+        // touches no encrypted column never demands the scope columns.
+        let mut scope: Option<RowScope> = None;
 
         for field_name in &fields {
             let Some(value) = self.get_set_string_value(field_name) else {
                 continue;
             };
+            if scope.is_none() {
+                scope = Some(self.row_scope()?);
+            }
 
             let is_deterministic = det_fields.iter().any(|f| f == field_name);
             // Compression is on by default; deterministic fields are never
@@ -333,7 +382,9 @@ pub trait Encryptable: ActiveModelTrait {
             // and any field can opt out via `uncompressed_fields`.
             let is_compressed =
                 !is_deterministic && !uncompressed_fields.iter().any(|f| f == field_name);
-            let aad = Self::field_aad(field_name);
+            let aad = scope
+                .as_ref()
+                .map_or_else(Vec::new, |s| s.field_aad(Self::field_aad(field_name)));
 
             let plaintext = if is_encrypted_format(&value) {
                 // Already an envelope: keep it when current, or recover the
@@ -423,6 +474,7 @@ pub trait ModelDecryption: Sized + Serialize + DeserializeOwned {
 
         // Convert model to JSON for dynamic field access
         let mut value = serde_json::to_value(&self)?;
+        let scope = <<E as EntityTrait>::ActiveModel as Encryptable>::row_scope_from_json(&value)?;
         let obj = value.as_object_mut().ok_or_else(|| {
             EncryptionError::DecryptionFailed("failed to convert model to JSON object".into())
         })?;
@@ -464,7 +516,9 @@ pub trait ModelDecryption: Sized + Serialize + DeserializeOwned {
             let mut decrypted = None;
             let mut last_error = None;
 
-            let aad = <<E as EntityTrait>::ActiveModel as Encryptable>::field_aad(&field_name);
+            let aad = scope.field_aad(<<E as EntityTrait>::ActiveModel as Encryptable>::field_aad(
+                &field_name,
+            ));
 
             if is_deterministic {
                 for master in masters {
@@ -663,9 +717,16 @@ pub fn encrypt_field_with_aad<P: KeyProvider + ?Sized>(
 /// otherwise this returns an error (rather than silently producing a
 /// non-deterministic ciphertext that cannot match any row).
 ///
+/// Models with `aad_fields` (a non-empty
+/// [`Encryptable::scope_columns`]) bind the ciphertext to row values, so the
+/// needle must be built with [`encrypt_query_value_scoped`]; calling this
+/// unscoped form on such a model is an error rather than a query that can
+/// never match.
+///
 /// # Errors
 /// Returns an error when no provider is registered, the field is not
-/// deterministic, no `deterministic_key` is configured, or encryption fails.
+/// deterministic, the model is row-scoped, no `deterministic_key` is
+/// configured, or encryption fails.
 pub fn encrypt_query_value<E>(
     field_name: &str,
     plaintext: &str,
@@ -675,6 +736,60 @@ where
     E: EntityTrait,
     <E as EntityTrait>::ActiveModel: Encryptable,
 {
+    let scope_columns = <<E as EntityTrait>::ActiveModel as Encryptable>::scope_columns();
+    if !scope_columns.is_empty() {
+        return Err(EncryptionError::Scope(format!(
+            "field '{field_name}' belongs to a row-scoped model (aad_fields = {scope_columns:?}); \
+             use `encrypt_query_value_scoped` with the row's scope values"
+        )));
+    }
+    let provider = registry::require(ctx)?;
+    encrypt_query_value_with::<E, _>(field_name, plaintext, &RowScope::new(), &*provider)
+}
+
+/// [`encrypt_query_value`] for a row-scoped model (`aad_fields`).
+///
+/// `scope` must carry every column in [`Encryptable::scope_columns`] with the
+/// values of the rows being matched — for a tenant-scoped table, the tenant
+/// id the query is confined to.
+///
+/// # Errors
+/// As [`encrypt_query_value`], plus [`EncryptionError::Scope`] when `scope`
+/// lacks one of the model's scope columns.
+pub fn encrypt_query_value_scoped<E>(
+    field_name: &str,
+    plaintext: &str,
+    scope: &RowScope,
+    ctx: &AppContext,
+) -> EncryptionResult<String>
+where
+    E: EntityTrait,
+    <E as EntityTrait>::ActiveModel: Encryptable,
+{
+    let provider = registry::require(ctx)?;
+    encrypt_query_value_with::<E, _>(field_name, plaintext, scope, &*provider)
+}
+
+/// [`encrypt_query_value_scoped`] with an explicit provider and no
+/// `AppContext`.
+///
+/// Pass an empty [`RowScope`] for models without `aad_fields`.
+///
+/// # Errors
+/// Returns an error when the field is not deterministic, `scope` lacks one
+/// of the model's scope columns, no deterministic key is available, or
+/// encryption fails.
+pub fn encrypt_query_value_with<E, P>(
+    field_name: &str,
+    plaintext: &str,
+    scope: &RowScope,
+    provider: &P,
+) -> EncryptionResult<String>
+where
+    E: EntityTrait,
+    <E as EntityTrait>::ActiveModel: Encryptable,
+    P: KeyProvider + ?Sized,
+{
     let det_fields = <<E as EntityTrait>::ActiveModel as Encryptable>::deterministic_fields();
     if !det_fields.iter().any(|f| f == field_name) {
         return Err(EncryptionError::NotConfigured(format!(
@@ -682,15 +797,23 @@ where
              `deterministic_fields()` to enable equality queries"
         )));
     }
+    for column in <<E as EntityTrait>::ActiveModel as Encryptable>::scope_columns() {
+        if scope.get(&column).is_none() {
+            return Err(EncryptionError::Scope(format!(
+                "query scope is missing column '{column}' required by the model's aad_fields"
+            )));
+        }
+    }
 
-    let provider = registry::require(ctx)?;
     let det_master = provider.get_deterministic_key()?.ok_or_else(|| {
         EncryptionError::NotConfigured(
             "deterministic_key is required for query-value encryption".into(),
         )
     })?;
     let field_key = provider.derive_field_key(&det_master, field_name)?;
-    let aad = <<E as EntityTrait>::ActiveModel as Encryptable>::field_aad(field_name);
+    let aad = scope.field_aad(<<E as EntityTrait>::ActiveModel as Encryptable>::field_aad(
+        field_name,
+    ));
     encrypt_deterministic(plaintext, field_key.as_bytes(), provider.get_key_id(), &aad)
 }
 

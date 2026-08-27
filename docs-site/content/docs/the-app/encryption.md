@@ -198,6 +198,32 @@ impl_encryptable_fields!(
 
 This makes `Encryptable::field_aad("ssn")` return `b"users:ssn"`, which AES-GCM authenticates alongside the ciphertext. A relocated ciphertext authenticates against a different AAD and fails. You can also implement `field_aad` by hand for non-`(table, column)` schemes — anything goes as long as encrypt and decrypt agree. Turning AAD on for an existing field invalidates ciphertexts written without it; plan the rollout the same way you would a key rotation.
 
+### Binding to row values (`aad_fields`)
+
+`aad_namespace` stops a ciphertext moving between columns. It does not stop one moving between *rows* of the same column — in a multi-tenant table, from one organization's row to another's. Add `aad_fields` to authenticate sibling column values too:
+
+```rust
+impl_encryptable_fields!(
+    integration_credentials::ActiveModel,
+    [credentials(no_compress)],
+    aad_namespace = "integration_credential",
+    aad_fields = [org_id],
+);
+```
+
+The AAD for `credentials` becomes `integration_credential:credentials` followed by `\0org_id=<value>` for each listed column, in order. Values are rendered through `serde_json` on both the save path (from the `ActiveModel`) and the read path (from the `Model`), so they agree byte-for-byte: a `Uuid` is its hyphenated lowercase string, integers and booleans their JSON text. Only scalar columns are accepted; `Option` columns must be `Some`.
+
+The rules are strict on purpose. On save, a scope column that is `NotSet` while an encrypted field is `Set` is an error — a partial update that touches no encrypted column is fine. On read, a missing or `null` scope column is an error. Silently binding to an empty scope would write rows that later fail to decrypt.
+
+Deterministic fields on a scoped model are bound to the scope as well, so the same plaintext under two tenants is two different ciphertexts. Build the query needle with the scoped helper; the unscoped `encrypt_query_value` returns an error for such models rather than a query that never matches:
+
+```rust
+let scope = RowScope::new().with("org_id", &org_id)?;
+let needle = encrypt_query_value_scoped::<credentials::Entity>("external_id", &input, &scope, &ctx)?;
+```
+
+`encrypt_query_value_with` is the same without an `AppContext`, for an explicit provider. `Encryptable::row_scope` / `row_scope_from_json` are the generated hooks; implement them by hand if your scope is not a plain list of columns.
+
 Finally, AES-GCM with random IVs has a birthday-bound limit. Roughly: after about 2^32 encryptions under a single key, the probability of an IV collision becomes non-negligible. If you are encrypting at that scale, rotate keys before you get there. For most applications this is far beyond anything you'll hit, but it is the reason to take key rotation seriously even when nothing has gone wrong.
 
 ## Ciphertext format

@@ -113,6 +113,7 @@ pub mod errors;
 pub mod format;
 pub mod key_provider;
 pub mod registry;
+pub mod scope;
 
 // Re-export main types for convenience
 pub use cipher::{
@@ -120,8 +121,9 @@ pub use cipher::{
 };
 pub use config::{EncryptionConfig, KeyDerivationConfig};
 pub use encryptable::{
-    decrypt_field, encrypt_field, encrypt_query_value, Encryptable, EncryptableValue,
-    ModelDecryption,
+    decrypt_field, decrypt_field_with_aad, encrypt_field, encrypt_field_with_aad,
+    encrypt_query_value, encrypt_query_value_scoped, encrypt_query_value_with, Encryptable,
+    EncryptableValue, ModelDecryption,
 };
 pub use errors::{EncryptionError, EncryptionResult};
 pub use format::{
@@ -130,6 +132,7 @@ pub use format::{
 };
 pub use key_provider::{ConfigKeyProvider, KeyProvider, SecureKey, StaticKeyProvider};
 pub use registry::SharedKeyProvider;
+pub use scope::RowScope;
 
 /// Convenience macro to implement [`Encryptable`](encryptable::Encryptable)
 /// for an `ActiveModel`.
@@ -176,13 +179,38 @@ pub use registry::SharedKeyProvider;
 /// Once enabled, all reads and writes must agree on the namespace; turning it
 /// on for a field that already has data invalidates existing ciphertexts the
 /// same way a key rotation does.
+///
+/// # Binding ciphertexts to row values (`aad_fields`)
+///
+/// Pass `aad_fields = [col, ...]` to also authenticate the values of sibling
+/// columns — typically a tenant id — so a ciphertext copied onto another
+/// tenant's row fails to decrypt:
+///
+/// ```rust,ignore
+/// impl_encryptable_fields!(
+///     integration_credentials::ActiveModel,
+///     [credentials(no_compress)],
+///     aad_namespace = "integration_credential",
+///     aad_fields = [org_id],
+/// );
+/// ```
+///
+/// The referenced columns must implement `serde::Serialize` and serialize to
+/// a JSON scalar (a `Uuid` renders as its hyphenated lowercase string). On
+/// save, a scope column that is `NotSet` while an encrypted field is `Set`
+/// is an error; on read, a missing or null scope column is an error. The
+/// scope is also what [`Encryptable::provider_for`](encryptable::Encryptable::provider_for)
+/// receives to select a per-row key provider. Deterministic fields on a
+/// scoped model must be queried with
+/// [`encrypt_query_value_scoped`](encryptable::encrypt_query_value_scoped).
 #[macro_export]
 macro_rules! impl_encryptable_fields {
     ($model:ty, [$($field:ident $(($modifier:ident))?),* $(,)?]) => {
         $crate::__impl_encryptable_fields_inner!(
             $model,
             [$($field $(($modifier))?),*],
-            aad_namespace = ""
+            aad_namespace = "",
+            aad_fields = []
         );
     };
     (
@@ -193,20 +221,47 @@ macro_rules! impl_encryptable_fields {
         $crate::__impl_encryptable_fields_inner!(
             $model,
             [$($field $(($modifier))?),*],
-            aad_namespace = $ns
+            aad_namespace = $ns,
+            aad_fields = []
+        );
+    };
+    (
+        $model:ty,
+        [$($field:ident $(($modifier:ident))?),* $(,)?],
+        aad_fields = [$($scope:ident),* $(,)?] $(,)?
+    ) => {
+        $crate::__impl_encryptable_fields_inner!(
+            $model,
+            [$($field $(($modifier))?),*],
+            aad_namespace = "",
+            aad_fields = [$($scope),*]
+        );
+    };
+    (
+        $model:ty,
+        [$($field:ident $(($modifier:ident))?),* $(,)?],
+        aad_namespace = $ns:literal,
+        aad_fields = [$($scope:ident),* $(,)?] $(,)?
+    ) => {
+        $crate::__impl_encryptable_fields_inner!(
+            $model,
+            [$($field $(($modifier))?),*],
+            aad_namespace = $ns,
+            aad_fields = [$($scope),*]
         );
     };
 }
 
 /// Shared expansion for [`impl_encryptable_fields!`] — public-but-hidden so
-/// the public macro's two arms can both delegate here.
+/// the public macro's arms can all delegate here.
 #[macro_export]
 #[doc(hidden)]
 macro_rules! __impl_encryptable_fields_inner {
     (
         $model:ty,
         [$($field:ident $(($modifier:ident))?),* $(,)?],
-        aad_namespace = $ns:literal
+        aad_namespace = $ns:literal,
+        aad_fields = [$($scope:ident),*]
     ) => {
         impl $crate::encryption::Encryptable for $model {
             fn encrypted_fields() -> Vec<String> {
@@ -243,6 +298,37 @@ macro_rules! __impl_encryptable_fields_inner {
                 } else {
                     format!("{}:{}", $ns, field_name).into_bytes()
                 }
+            }
+
+            fn scope_columns() -> Vec<String> {
+                vec![$(stringify!($scope).to_string()),*]
+            }
+
+            fn row_scope(
+                &self,
+            ) -> $crate::encryption::EncryptionResult<$crate::encryption::RowScope> {
+                #[allow(unused_mut)]
+                let mut scope = $crate::encryption::RowScope::new();
+                $(
+                    match &self.$scope {
+                        sea_orm::ActiveValue::Set(v) | sea_orm::ActiveValue::Unchanged(v) => {
+                            scope.insert(stringify!($scope), v)?;
+                        }
+                        sea_orm::ActiveValue::NotSet => {
+                            return Err($crate::encryption::EncryptionError::Scope(format!(
+                                "scope column '{}' is NotSet while an encrypted field is Set",
+                                stringify!($scope)
+                            )));
+                        }
+                    }
+                )*
+                Ok(scope)
+            }
+
+            fn row_scope_from_json(
+                row: &$crate::encryption::scope::Value,
+            ) -> $crate::encryption::EncryptionResult<$crate::encryption::RowScope> {
+                $crate::encryption::RowScope::from_json_row(row, &[$(stringify!($scope)),*])
             }
 
             fn get_set_string_value(&self, field_name: &str) -> Option<String> {

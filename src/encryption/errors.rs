@@ -65,6 +65,10 @@ pub enum EncryptionError {
     #[error("key derivation failed: {0}")]
     KeyDerivation(String),
 
+    /// A row-scope (`aad_fields`) value is missing, null, or not a scalar
+    #[error("encryption row scope error: {0}")]
+    Scope(String),
+
     /// No keys available for decryption after trying all configured keys
     #[error("no keys could decrypt the value (tried {keys_tried} keys)")]
     AllKeysFailed {
