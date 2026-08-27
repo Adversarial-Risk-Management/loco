@@ -367,11 +367,11 @@ pub fn parse_hex_key(hex: &str) -> EncryptionResult<Vec<u8>> {
     }
 
     bytes
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| {
-            // `pair` is two ASCII-or-not bytes; from_str_radix on the &str view
-            // is safe because chunks_exact never splits — but we must confirm
-            // the pair is valid UTF-8/ASCII first.
+            // Each pair must be valid UTF-8/ASCII before it is parsed as hex.
             let s = std::str::from_utf8(pair)
                 .map_err(|_| EncryptionError::InvalidKey("invalid hex: non-ASCII".to_string()))?;
             u8::from_str_radix(s, 16)
