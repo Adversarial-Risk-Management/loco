@@ -67,7 +67,7 @@ cargo loco generate model user \
   name:string
 ```
 
-This produces a migration that stores the encrypted columns as text (the ciphertext envelope is JSON-encoded). After running migrations and regenerating entities:
+This produces a migration that stores the encrypted columns as `text`, whatever inner type you wrote (`string:encrypted` becomes `text`, not `varchar`). The stored value is a JSON envelope, not the plaintext, and it is longer than the plaintext: roughly 90 bytes of fixed overhead plus 4/3 of the ciphertext length. A `varchar(255)` column overflows on plaintexts of about 120 characters. Use `text` for any hand-written migration too, and call `loco_rs::encryption::estimate_encrypted_size(plaintext_len)` if you need a bound for a length-limited store. After running migrations and regenerating entities:
 
 ```sh
 cargo loco db migrate

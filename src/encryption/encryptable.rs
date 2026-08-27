@@ -292,9 +292,13 @@ pub trait Encryptable: ActiveModelTrait {
         self.encrypt_fields(&*provider)
     }
 
-    /// Encrypt all specified fields before saving
+    /// Encrypt all specified fields before saving, using an explicit provider.
     ///
-    /// This method should be called in `ActiveModelBehavior::before_save`.
+    /// Call this on the `ActiveModel` right before `insert`/`update`. It
+    /// cannot run from `ActiveModelBehavior::before_save`: that hook has no
+    /// access to the `AppContext` or a key provider. Prefer
+    /// [`encrypt_fields_ctx`](Self::encrypt_fields_ctx) when a context is
+    /// available.
     ///
     /// A `Set` value that is already an encryption envelope is kept as-is
     /// when it is fully current, and transparently **re-encrypted with the

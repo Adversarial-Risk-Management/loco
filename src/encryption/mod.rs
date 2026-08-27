@@ -6,8 +6,8 @@
 //!
 //! # Features
 //!
-//! - **Automatic encryption on save**: Fields are automatically encrypted using
-//!   `ActiveModelBehavior::before_save`
+//! - **Explicit encryption on save**: call `encrypt_fields_ctx` on the
+//!   `ActiveModel` before `insert`/`update`
 //! - **Explicit decryption on read**: Manual decryption call required (Rust idiom)
 //! - **Rails-style envelope**: Uses the same JSON envelope *shape* as Rails
 //!   `ActiveRecord` Encryption (`{"p":…,"h":{"iv":…,"at":…}}`). See the
