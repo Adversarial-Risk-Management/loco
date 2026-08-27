@@ -74,6 +74,16 @@ pub fn get_columns_and_references(
     Ok((columns, references, encrypted_fields))
 }
 
+/// Template context for the `encrypted_fields` guidance block shared by the
+/// model and migration templates.
+#[must_use]
+pub fn encrypted_fields_json(fields: &[EncryptedField]) -> Vec<serde_json::Value> {
+    fields
+        .iter()
+        .map(|f| json!({"name": f.name, "deterministic": f.deterministic}))
+        .collect()
+}
+
 pub fn generate(
     rrgen: &RRgen,
     name: &str,
@@ -86,10 +96,6 @@ pub fn generate(
 
     let (columns, references, encrypted_fields) = get_columns_and_references(fields)?;
 
-    let encrypted_fields_json: Vec<serde_json::Value> = encrypted_fields
-        .iter()
-        .map(|f| json!({"name": f.name, "deterministic": f.deterministic}))
-        .collect();
     let vars = json!({
         "name": name,
         "ts": ts,
@@ -97,7 +103,7 @@ pub fn generate(
         "pkg_name": pkg_name,
         "columns": columns,
         "references": references,
-        "encrypted_fields": encrypted_fields_json,
+        "encrypted_fields": encrypted_fields_json(&encrypted_fields),
     });
     let gen_result = render_template(rrgen, Path::new("model"), &vars)?;
 

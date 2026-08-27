@@ -218,15 +218,17 @@ pub fn parse_column(name: &str, spec: &str) -> Result<Column> {
             nullable = false;
         }
     }
-    // Peel a trailing `:encrypted` / `:encrypted:deterministic` qualifier so
-    // it composes with the string-like base types.
+    // Peel a trailing `:encrypted` / `:encrypted:deterministic` qualifier.
+    // Only `string` and `text` take it: the model field must be `String` to
+    // hold the JSON envelope. Other bases keep their parameters intact, so an
+    // `enum` value literally named `encrypted` still parses as an enum value.
     let encrypted = match parts.as_slice() {
-        [_, .., "encrypted", "deterministic"] => {
-            parts.truncate(parts.len() - 2);
+        ["string" | "text", "encrypted", "deterministic"] => {
+            parts.truncate(1);
             Some(EncryptionMode::Deterministic)
         }
-        [_, .., "encrypted"] => {
-            parts.truncate(parts.len() - 1);
+        ["string" | "text", "encrypted"] => {
+            parts.truncate(1);
             Some(EncryptionMode::NonDeterministic)
         }
         ["encrypted"] | ["encrypted", "deterministic"] => {
@@ -235,16 +237,27 @@ pub fn parse_column(name: &str, spec: &str) -> Result<Column> {
                  `{spec}`"
             )));
         }
+        [base, .., "encrypted"] | [base, .., "encrypted", "deterministic"]
+            if !matches!(*base, "enum") =>
+        {
+            return Err(Error::Message(format!(
+                "`:encrypted` requires a `string` or `text` inner type (the model field must be \
+                 `String` to hold the JSON envelope), got `{spec}`"
+            )));
+        }
         _ => None,
     };
-
-    let base = parts.join(":");
-    if encrypted.is_some() && !matches!(base.as_str(), "string" | "text") {
+    // A unique index on a random-IV ciphertext is meaningless: the same
+    // plaintext encrypts to a different value every time, so the constraint
+    // never fires. Only deterministic ciphertexts are stable enough to index.
+    if unique && encrypted == Some(EncryptionMode::NonDeterministic) {
         return Err(Error::Message(format!(
-            "`:encrypted` requires a `string` or `text` inner type (the model field must be \
-             `String` to hold the JSON envelope), got `{spec}`"
+            "`{spec}`: a non-deterministic encrypted column cannot be unique (`^`); use \
+             `:encrypted:deterministic^` for an equality-queryable, unique column"
         )));
     }
+
+    let base = parts.join(":");
     let kind = match parts.as_slice() {
         ["array", rest @ ..] => {
             let [inner_name] = rest else {
@@ -1591,16 +1604,28 @@ mod tests {
         let err = parse_column("ssn", "encrypted:deterministic").unwrap_err();
         assert!(err.to_string().contains("requires an inner column type"));
 
+        // unique (`^`) on a random-IV ciphertext can never fire
+        for spec in ["string:encrypted^", "text:encrypted^", "string^:encrypted"] {
+            let err = parse_column("ssn", spec).unwrap_err();
+            assert!(
+                err.to_string().contains("cannot be unique"),
+                "{spec}: {err}"
+            );
+        }
+        // an enum value literally named `encrypted` is an enum value, not the
+        // qualifier
+        let c = col("state", "enum:draft,encrypted");
+        assert_eq!(c.encrypted, None);
+        assert!(matches!(
+            c.kind,
+            ColumnKind::Scalar(ScalarType::Enum { .. })
+        ));
+
         // `deterministic` without `encrypted` is not a valid parameter
         assert!(parse_column("ssn", "string:deterministic").is_err());
 
         // only string-like inner types can hold the JSON envelope
-        for spec in [
-            "int:encrypted",
-            "uuid:encrypted",
-            "enum:a,b:encrypted",
-            "json:encrypted",
-        ] {
+        for spec in ["int:encrypted", "uuid:encrypted", "json:encrypted"] {
             let err = parse_column("x", spec).unwrap_err();
             assert!(
                 err.to_string()
@@ -1608,6 +1633,9 @@ mod tests {
                 "{spec}: unexpected error: {err}"
             );
         }
+        // an enum keeps its parameter list intact, so the qualifier is an
+        // extra parameter, not a value
+        assert!(parse_column("x", "enum:a,b:encrypted").is_err());
     }
 
     #[test]
