@@ -14,7 +14,7 @@
 //!   compatibility note below — the shape matches but values are not
 //!   wire-compatible across the two stacks.
 //! - **AEAD security**: Uses AES-256-GCM for authenticated encryption, with the
-//!   envelope headers folded into the authenticated data (envelope `v >= 2`)
+//!   envelope headers folded into the authenticated data
 //! - **Flexible key management**: Trait-based key provider system
 //! - **Key rotation support**: Configure previous keys for seamless rotation
 //!   (non-deterministic fields only; see the deterministic-key caveat in
@@ -92,7 +92,7 @@
 //!   "h": {
 //!     "iv": "base64-encoded-iv",
 //!     "at": "base64-encoded-auth-tag",
-//!     "v": 2,
+//!     "v": 1,
 //!     "i": "optional-key-id"
 //!   }
 //! }

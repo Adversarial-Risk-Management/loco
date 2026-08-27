@@ -15,7 +15,7 @@ use sha2::Sha256;
 
 use super::{
     errors::{EncryptionError, EncryptionResult},
-    format::{EncryptedValue, CURRENT_ENVELOPE_VERSION},
+    format::{EncryptedValue, ENVELOPE_VERSION},
 };
 
 type HmacSha256 = Hmac<Sha256>;
@@ -24,12 +24,6 @@ type HmacSha256 = Hmac<Sha256>;
 /// data. Keeps the header bytes from ever being confused with caller AAD or
 /// with a future associated-data scheme.
 const AAD_HEADER_DOMAIN: &[u8] = b"loco-enc-hdr\x00";
-
-/// Lowest envelope version that folds its headers into the AEAD data.
-///
-/// Values written below this (legacy `v=1` and the pre-versioned format)
-/// authenticate only the caller-supplied AAD and are read back the same way.
-pub const HEADER_AUTH_MIN_VERSION: u8 = 2;
 
 /// Build the associated data that authenticates the envelope's interpretation
 /// flags alongside any caller-supplied AAD.
@@ -96,7 +90,7 @@ pub fn encrypt(
 
     // Bind the envelope's version and (here unset) flags into the auth data so
     // the headers can't be tampered with independently of the ciphertext.
-    let aad = header_aad(CURRENT_ENVELOPE_VERSION, false, false, aad);
+    let aad = header_aad(ENVELOPE_VERSION, false, false, aad);
     let payload = aes_gcm::aead::Payload {
         msg: plaintext.as_bytes(),
         aad: &aad,
@@ -138,23 +132,7 @@ pub fn decrypt(encrypted_json: &str, key: &[u8], aad: &[u8]) -> EncryptionResult
     let iv = encrypted.iv()?;
     let auth_tag = encrypted.auth_tag()?;
 
-    // Validate IV size
-    if iv.len() != NONCE_SIZE {
-        return Err(EncryptionError::InvalidFormat(format!(
-            "invalid IV size: expected {NONCE_SIZE}, got {}",
-            iv.len()
-        )));
-    }
-
-    // Validate auth tag size
-    if auth_tag.len() != TAG_SIZE {
-        return Err(EncryptionError::InvalidFormat(format!(
-            "invalid auth tag size: expected {TAG_SIZE}, got {}",
-            auth_tag.len()
-        )));
-    }
-
-    // Infallible: `iv.len()` was validated as `NONCE_SIZE` above.
+    // Infallible: `from_json` validated the IV as `NONCE_SIZE` bytes.
     let iv_bytes: [u8; NONCE_SIZE] = iv
         .as_slice()
         .try_into()
@@ -165,22 +143,15 @@ pub fn decrypt(encrypted_json: &str, key: &[u8], aad: &[u8]) -> EncryptionResult
     let mut ciphertext_with_tag = ciphertext;
     ciphertext_with_tag.extend_from_slice(&auth_tag);
 
-    // Rebuild the associated data the same way the writer did. For v2+ that
-    // means re-deriving it from the stored version and flags; if an attacker
-    // flipped `d`/`c`/`v`, the reconstructed AAD no longer matches the tag and
-    // authentication fails here. Legacy values (v1 / pre-versioned) bound only
-    // the caller AAD, so we use it unchanged.
-    let version = encrypted.h.v.unwrap_or(0);
-    let auth_data = if version >= HEADER_AUTH_MIN_VERSION {
-        header_aad(
-            version,
-            encrypted.is_deterministic(),
-            encrypted.is_compressed(),
-            aad,
-        )
-    } else {
-        aad.to_vec()
-    };
+    // Rebuild the associated data the same way the writer did, from the
+    // stored version and flags: if an attacker flipped `d`/`c`/`v`, the
+    // reconstructed AAD no longer matches the tag and authentication fails.
+    let auth_data = header_aad(
+        encrypted.h.v,
+        encrypted.is_deterministic(),
+        encrypted.is_compressed(),
+        aad,
+    );
 
     let payload = aes_gcm::aead::Payload {
         msg: ciphertext_with_tag.as_ref(),
@@ -246,7 +217,7 @@ pub fn encrypt_compressed(
 
     // Authenticate the compressed flag we are about to set, so it can't be
     // cleared in storage to make `decrypt` skip inflation and return garbage.
-    let aad = header_aad(CURRENT_ENVELOPE_VERSION, false, true, aad);
+    let aad = header_aad(ENVELOPE_VERSION, false, true, aad);
     let payload = aes_gcm::aead::Payload {
         msg: compressed.as_slice(),
         aad: &aad,
@@ -316,7 +287,7 @@ pub fn encrypt_deterministic(
     // ciphertext stays stable and queryable. The GCM auth data additionally
     // binds the version and the deterministic flag; this does not affect the
     // IV, so determinism (and cross-process query matching) is preserved.
-    let aad = header_aad(CURRENT_ENVELOPE_VERSION, true, false, aad);
+    let aad = header_aad(ENVELOPE_VERSION, true, false, aad);
     let payload = aes_gcm::aead::Payload {
         msg: plaintext.as_bytes(),
         aad: &aad,
@@ -660,12 +631,11 @@ mod tests {
     }
 
     #[test]
-    fn test_v2_envelope_is_current_version() {
+    fn test_envelope_carries_the_version() {
         let key = test_key();
         let env = encrypt("hello", &key, None, b"").unwrap();
         let parsed = EncryptedValue::from_json(&env).unwrap();
-        assert_eq!(parsed.h.v, Some(CURRENT_ENVELOPE_VERSION));
-        assert!(CURRENT_ENVELOPE_VERSION >= HEADER_AUTH_MIN_VERSION);
+        assert_eq!(parsed.h.v, ENVELOPE_VERSION);
     }
 
     #[test]
@@ -706,43 +676,17 @@ mod tests {
     }
 
     #[test]
-    fn test_tampered_version_fails_authentication() {
+    fn test_other_versions_are_rejected_before_decryption() {
+        // There is exactly one envelope version. A rewritten `v` is rejected
+        // by the parser; even if it were not, it is bound into the tag.
         let key = test_key();
         let env = encrypt("secret", &key, None, b"").unwrap();
         let mut parsed = EncryptedValue::from_json(&env).unwrap();
-        // Downgrade v2 -> v1: the reader would switch to the legacy
-        // user-AAD-only path, which no longer matches the v2 tag.
-        parsed.h.v = Some(1);
-        assert!(
-            decrypt(&parsed.to_json().unwrap(), &key, b"").is_err(),
-            "downgrading the envelope version must fail authentication"
-        );
-    }
-
-    #[test]
-    fn test_legacy_v1_envelope_decrypts_with_user_aad_only() {
-        // A pre-header-auth (v1) value: the tag was computed over the caller
-        // AAD only. The reader must fall back to that path for v < 2 so
-        // existing data written by older builds keeps decrypting.
-        use aes_gcm::aead::Aead;
-        let key = test_key();
-        let cipher = Aes256Gcm::new_from_slice(&key).unwrap();
-        let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
-        let ct_with_tag = cipher
-            .encrypt(
-                &nonce,
-                aes_gcm::aead::Payload {
-                    msg: b"legacy value",
-                    aad: b"",
-                },
-            )
-            .unwrap();
-        let (ct, tag) = ct_with_tag.split_at(ct_with_tag.len() - TAG_SIZE);
-        let mut env = EncryptedValue::new(ct, nonce.as_slice(), tag, None);
-        env.h.v = Some(1); // mark legacy; v < HEADER_AUTH_MIN_VERSION
-        let json = env.to_json().unwrap();
-
-        assert_eq!(decrypt(&json, &key, b"").unwrap(), "legacy value");
+        parsed.h.v = ENVELOPE_VERSION + 1;
+        let err = decrypt(&parsed.to_json().unwrap(), &key, b"").unwrap_err();
+        assert!(matches!(err, EncryptionError::InvalidFormat(_)), "{err}");
+        parsed.h.v = 0;
+        assert!(decrypt(&parsed.to_json().unwrap(), &key, b"").is_err());
     }
 
     #[test]

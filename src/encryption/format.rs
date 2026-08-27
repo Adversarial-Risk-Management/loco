@@ -20,20 +20,20 @@
 //! ```
 //!
 //! Header keys:
-//! - `v` — envelope version (`2` is current). `v >= 2` binds the
-//!   interpretation flags (`v`, `d`, `c`) into the AES-GCM authenticated data,
-//!   so a storage-layer attacker cannot flip them to force a mis-decryption.
-//!   `v = 1` (and the legacy pre-versioned format with no `v`) authenticates
-//!   only the caller-supplied AAD; such values are still readable. Writing
-//!   always emits the current version.
+//! - `v` — envelope version, always `1`. The version and the `d`/`c` flags
+//!   are bound into the AES-GCM associated data, so a storage-layer attacker
+//!   cannot change them without failing authentication. Envelopes with any
+//!   other version are rejected.
 //! - `iv` — AES-GCM nonce (12 bytes, base64).
 //! - `at` — AES-GCM authentication tag (16 bytes, base64).
 //! - `i` — optional key identifier for rotation. Rails uses this for the
 //!   first 4 hex of `SHA1(key)`; this implementation uses semantic labels
-//!   like `"primary"` / `"previous_0"`. The names match Rails; the values
-//!   differ.
+//!   like `"primary"` / `"previous_0"` / `"deterministic"`. The names match
+//!   Rails; the values differ.
 //! - `d` — set when the ciphertext was produced by deterministic
 //!   encryption. Elided when false.
+//! - `c` — set when the plaintext was zlib-deflated before encryption.
+//!   Elided when false.
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use serde::{Deserialize, Serialize};
@@ -43,21 +43,20 @@ use super::{
     errors::{EncryptionError, EncryptionResult},
 };
 
-/// Current envelope schema version emitted by [`EncryptedValue::new`].
+/// The envelope schema version, emitted by [`EncryptedValue::new`] and
+/// required by [`EncryptedValue::from_json`].
 ///
-/// `2` introduced header authentication: the version and the `d`/`c` flags are
-/// folded into the AES-GCM associated data (see
-/// [`crate::encryption::cipher`]). `1` is the prior format whose headers were
-/// not authenticated; it remains readable.
-pub const CURRENT_ENVELOPE_VERSION: u8 = 2;
+/// The version and the `d`/`c` flags are folded into the AES-GCM associated
+/// data (see [`crate::encryption::cipher`]), so they cannot be altered in
+/// storage. A future format change bumps this constant and adds an explicit
+/// migration; there is no fallback read path for other versions.
+pub const ENVELOPE_VERSION: u8 = 1;
 
 /// Headers for encrypted value metadata
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EncryptedHeaders {
-    /// Envelope schema version. Missing on legacy pre-versioned writes;
-    /// new writes always emit [`CURRENT_ENVELOPE_VERSION`].
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub v: Option<u8>,
+    /// Envelope schema version; always [`ENVELOPE_VERSION`].
+    pub v: u8,
 
     /// Base64-encoded initialization vector (nonce)
     pub iv: String,
@@ -66,7 +65,7 @@ pub struct EncryptedHeaders {
     pub at: String,
 
     /// Optional key identifier for key rotation support
-    #[serde(default, skip_serializing_if = "Option::is_none", alias = "kid")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub i: Option<String>,
 
     /// Set to `true` when the value was encrypted deterministically.
@@ -107,7 +106,7 @@ impl EncryptedValue {
         Self {
             p: BASE64.encode(ciphertext),
             h: EncryptedHeaders {
-                v: Some(CURRENT_ENVELOPE_VERSION),
+                v: ENVELOPE_VERSION,
                 iv: BASE64.encode(iv),
                 at: BASE64.encode(auth_tag),
                 i: key_id,
@@ -134,22 +133,49 @@ impl EncryptedValue {
     /// Parse an encrypted value from a JSON string
     ///
     /// # Errors
-    /// Returns an error if the JSON is invalid, missing required fields, or
-    /// declares an envelope version this build does not understand. Missing
-    /// `h.v` is accepted (legacy pre-versioned format).
+    /// Returns an error if the JSON is invalid, a field is missing, the
+    /// version is not [`ENVELOPE_VERSION`], or `iv`/`at`/`p` are not base64
+    /// of the expected sizes.
     pub fn from_json(json: &str) -> EncryptionResult<Self> {
         let value: Self = serde_json::from_str(json).map_err(|e| {
             EncryptionError::InvalidFormat(format!("failed to parse encrypted value: {e}"))
         })?;
-        if let Some(v) = value.h.v
-            && v > CURRENT_ENVELOPE_VERSION
-        {
+        if value.h.v != ENVELOPE_VERSION {
             return Err(EncryptionError::InvalidFormat(format!(
-                "unsupported envelope version: {v} (this build supports up to \
-                 v{CURRENT_ENVELOPE_VERSION})"
+                "unsupported envelope version {} (this build reads v{ENVELOPE_VERSION} only)",
+                value.h.v
             )));
         }
+        if value.iv()?.len() != NONCE_SIZE {
+            return Err(EncryptionError::InvalidFormat(format!(
+                "invalid IV size: expected {NONCE_SIZE} bytes"
+            )));
+        }
+        if value.auth_tag()?.len() != TAG_SIZE {
+            return Err(EncryptionError::InvalidFormat(format!(
+                "invalid auth tag size: expected {TAG_SIZE} bytes"
+            )));
+        }
+        value.ciphertext()?;
         Ok(value)
+    }
+
+    /// Parse a stored column value that may or may not be an envelope.
+    ///
+    /// Returns `Ok(None)` for values that do not have the envelope's JSON
+    /// shape at all (plaintext), `Ok(Some(..))` for a valid envelope, and
+    /// `Err` for a value that has the shape but fails validation — an
+    /// unsupported version or malformed fields. The error matters: treating
+    /// such a value as plaintext would re-encrypt it on save or hand it to a
+    /// caller as if it were the decrypted value.
+    ///
+    /// # Errors
+    /// Returns [`EncryptionError::InvalidFormat`] for a malformed envelope.
+    pub fn parse_column(value: &str) -> EncryptionResult<Option<Self>> {
+        if !looks_like_envelope(value) {
+            return Ok(None);
+        }
+        Self::from_json(value).map(Some)
     }
 
     /// Serialize to a JSON string
@@ -191,27 +217,23 @@ impl EncryptedValue {
     }
 }
 
-/// Check if a string looks like an encrypted value (JSON with expected fields)
+/// Cheap shape test: a JSON object carrying `p` and `h` keys.
+fn looks_like_envelope(value: &str) -> bool {
+    let value = value.trim_start();
+    value.starts_with('{') && value.contains("\"p\"") && value.contains("\"h\"")
+}
+
+/// Whether a string is a valid encryption envelope.
 ///
-/// Matching the envelope *shape* is not enough: organic user data (or a value
-/// crafted by an attacker who controls a field's input) could be JSON with `p`
-/// and `h` keys and would then either be stored unencrypted by the
-/// encrypt-on-save guard or trip a doomed decryption attempt on read. So this
-/// additionally requires `iv` and `at` to base64-decode to the exact AEAD
-/// sizes and `p` to be valid base64 — constraints organic data effectively
-/// never satisfies by accident.
+/// Matching the JSON *shape* is not enough: organic user data could be JSON
+/// with `p` and `h` keys. This requires the value to fully parse — current
+/// version, and `iv`/`at` decoding to the exact AEAD sizes — constraints
+/// organic data effectively never satisfies by accident. Model code should
+/// prefer [`EncryptedValue::parse_column`], which distinguishes plaintext
+/// from a malformed envelope instead of collapsing both to `false`.
 #[must_use]
 pub fn is_encrypted_format(value: &str) -> bool {
-    // Quick check before parsing
-    if !value.starts_with('{') || !value.contains("\"p\"") || !value.contains("\"h\"") {
-        return false;
-    }
-    let Ok(parsed) = EncryptedValue::from_json(value) else {
-        return false;
-    };
-    matches!(parsed.iv(), Ok(iv) if iv.len() == NONCE_SIZE)
-        && matches!(parsed.auth_tag(), Ok(at) if at.len() == TAG_SIZE)
-        && parsed.ciphertext().is_ok()
+    matches!(EncryptedValue::parse_column(value), Ok(Some(_)))
 }
 
 /// Metadata about an encrypted value (for debugging)
@@ -377,8 +399,7 @@ mod tests {
     #[test]
     fn test_rails_compatible_format() {
         // Example Rails-format JSON
-        let rails_json =
-            r#"{"p":"dGVzdCBkYXRh","h":{"iv":"MTIzNDU2Nzg5MDEy","at":"MDEyMzQ1Njc4OWFiY2RlZg=="}}"#;
+        let rails_json = r#"{"p":"dGVzdCBkYXRh","h":{"v":1,"iv":"MTIzNDU2Nzg5MDEy","at":"MDEyMzQ1Njc4OWFiY2RlZg=="}}"#;
 
         let parsed = EncryptedValue::from_json(rails_json).unwrap();
         assert_eq!(parsed.ciphertext().unwrap(), b"test data");
@@ -389,7 +410,7 @@ mod tests {
     fn test_is_encrypted_format() {
         // 12-byte iv + 16-byte at, both valid base64: a well-formed envelope.
         assert!(is_encrypted_format(
-            r#"{"p":"dGVzdCBkYXRh","h":{"iv":"MTIzNDU2Nzg5MDEy","at":"MDEyMzQ1Njc4OWFiY2RlZg=="}}"#
+            r#"{"p":"dGVzdCBkYXRh","h":{"v":1,"iv":"MTIzNDU2Nzg5MDEy","at":"MDEyMzQ1Njc4OWFiY2RlZg=="}}"#
         ));
         assert!(!is_encrypted_format("plain text"));
         assert!(!is_encrypted_format(r#"{"other": "json"}"#));
@@ -401,11 +422,11 @@ mod tests {
         // Structurally an envelope (has `p` and `h`/`iv`/`at`) but `iv` and
         // `at` decode to 3 bytes, not the AEAD sizes. Organic JSON that merely
         // resembles the envelope must not be mistaken for ciphertext.
-        let fake = r#"{"p":"aGVsbG8=","h":{"iv":"YWJj","at":"YWJj"}}"#;
+        let fake = r#"{"p":"aGVsbG8=","h":{"v":1,"iv":"YWJj","at":"YWJj"}}"#;
         assert!(!is_encrypted_format(fake));
 
         // Non-base64 iv/at also rejected.
-        let not_b64 = r#"{"p":"abc","h":{"iv":"def","at":"ghi"}}"#;
+        let not_b64 = r#"{"p":"abc","h":{"v":1,"iv":"def","at":"ghi"}}"#;
         assert!(!is_encrypted_format(not_b64));
     }
 
@@ -420,41 +441,54 @@ mod tests {
     }
 
     #[test]
-    fn test_inspect_encrypted_accepts_legacy_kid_alias() {
-        // Pre-versioning envelopes used `kid` instead of `i`. The serde
-        // alias keeps them readable so existing data isn't stranded.
-        let legacy = r#"{"p":"dGVzdCBkYXRh","h":{"iv":"MTIzNDU2Nzg5MDEy","at":"MDEyMzQ1Njc4OWFiY2RlZg==","kid":"primary"}}"#;
-        let meta = inspect_encrypted(legacy).unwrap();
-        assert!(meta.has_key_id);
-        assert_eq!(meta.key_id, Some("primary".to_string()));
+    fn test_from_json_rejects_other_versions_and_missing_version() {
+        for bad in [
+            r#"{"p":"dGVzdA==","h":{"v":99,"iv":"MTIzNDU2Nzg5MDEy","at":"MDEyMzQ1Njc4OWFiY2RlZg=="}}"#,
+            r#"{"p":"dGVzdA==","h":{"v":0,"iv":"MTIzNDU2Nzg5MDEy","at":"MDEyMzQ1Njc4OWFiY2RlZg=="}}"#,
+            r#"{"p":"dGVzdA==","h":{"iv":"MTIzNDU2Nzg5MDEy","at":"MDEyMzQ1Njc4OWFiY2RlZg=="}}"#,
+        ] {
+            let err = EncryptedValue::from_json(bad).unwrap_err();
+            assert!(
+                matches!(err, EncryptionError::InvalidFormat(_)),
+                "{bad}: {err}"
+            );
+        }
+        // `kid` is unknown and ignored by serde; the value is still valid.
+        let with_kid = r#"{"p":"dGVzdA==","h":{"v":1,"iv":"MTIzNDU2Nzg5MDEy","at":"MDEyMzQ1Njc4OWFiY2RlZg==","kid":"x"}}"#;
+        assert!(EncryptedValue::from_json(with_kid)
+            .unwrap()
+            .key_id()
+            .is_none());
     }
 
     #[test]
-    fn test_from_json_rejects_unknown_future_version() {
-        // h.v=99 is not a version this build understands.
-        let future = r#"{"p":"dGVzdA==","h":{"v":99,"iv":"MTIzNDU2Nzg5MDEy","at":"MDEyMzQ1Njc4OWFiY2RlZg=="}}"#;
-        let err = EncryptedValue::from_json(future).unwrap_err();
-        assert!(matches!(err, EncryptionError::InvalidFormat(_)));
-    }
-
-    #[test]
-    fn test_from_json_accepts_missing_version() {
-        // Legacy pre-versioned envelopes (no h.v field) must continue to work.
-        let legacy =
-            r#"{"p":"dGVzdA==","h":{"iv":"MTIzNDU2Nzg5MDEy","at":"MDEyMzQ1Njc4OWFiY2RlZg=="}}"#;
-        let parsed = EncryptedValue::from_json(legacy).unwrap();
-        assert_eq!(parsed.h.v, None);
+    fn test_parse_column_distinguishes_plaintext_from_bad_envelope() {
+        assert_eq!(
+            EncryptedValue::parse_column("hello").unwrap().map(|_| ()),
+            None
+        );
+        assert_eq!(
+            EncryptedValue::parse_column(r#"{"name":"x"}"#)
+                .unwrap()
+                .map(|_| ()),
+            None
+        );
+        let valid = r#"{"p":"dGVzdA==","h":{"v":1,"iv":"MTIzNDU2Nzg5MDEy","at":"MDEyMzQ1Njc4OWFiY2RlZg=="}}"#;
+        assert!(EncryptedValue::parse_column(valid).unwrap().is_some());
+        // Envelope shape with an unsupported version is an error, not plaintext.
+        let future = r#"{"p":"dGVzdA==","h":{"v":7,"iv":"MTIzNDU2Nzg5MDEy","at":"MDEyMzQ1Njc4OWFiY2RlZg=="}}"#;
+        assert!(EncryptedValue::parse_column(future).is_err());
     }
 
     #[test]
     fn test_new_envelope_carries_current_version() {
         let v = EncryptedValue::new(b"ct", b"123456789012", b"0123456789abcdef", None);
-        assert_eq!(v.h.v, Some(CURRENT_ENVELOPE_VERSION));
+        assert_eq!(v.h.v, ENVELOPE_VERSION);
     }
 
     #[test]
     fn test_inspect_encrypted_no_key_id() {
-        let json = r#"{"p":"abc","h":{"iv":"def","at":"ghi"}}"#;
+        let json = r#"{"p":"dGVzdA==","h":{"v":1,"iv":"MTIzNDU2Nzg5MDEy","at":"MDEyMzQ1Njc4OWFiY2RlZg=="}}"#;
         let meta = inspect_encrypted(json).unwrap();
 
         assert!(!meta.has_key_id);
@@ -496,8 +530,7 @@ mod tests {
 
     #[test]
     fn test_estimate_decrypted_size() {
-        let json =
-            r#"{"p":"dGVzdCBkYXRh","h":{"iv":"MTIzNDU2Nzg5MDEy","at":"MDEyMzQ1Njc4OWFiY2RlZg=="}}"#;
+        let json = r#"{"p":"dGVzdCBkYXRh","h":{"v":1,"iv":"MTIzNDU2Nzg5MDEy","at":"MDEyMzQ1Njc4OWFiY2RlZg=="}}"#;
         let estimated = estimate_decrypted_size(json);
 
         // "dGVzdCBkYXRh" is base64 for "test data" (9 bytes)

@@ -57,7 +57,7 @@ use serde::{de::DeserializeOwned, Serialize};
 use super::{
     cipher::{decrypt, encrypt, encrypt_compressed, encrypt_deterministic},
     errors::{EncryptionError, EncryptionResult},
-    format::{is_encrypted_format, EncryptedValue, CURRENT_ENVELOPE_VERSION},
+    format::EncryptedValue,
     key_provider::{KeyProvider, SecureKey},
     registry::{self, SharedKeyProvider},
     scope::RowScope,
@@ -105,12 +105,12 @@ impl EncryptableValue for Option<String> {
 ///
 /// Returns:
 /// - `Ok(None)` when the envelope is fully current (decrypts under the
-///   current primary — or deterministic — key, carries the current envelope
-///   version, and its deterministic flag matches the field's current mode):
+///   current primary — or deterministic — key, and its deterministic flag
+///   matches the field's current mode):
 ///   keep it untouched, so repeated `encrypt_fields` calls stay idempotent
 ///   and unchanged rows are not rewritten with fresh IVs on every save.
 /// - `Ok(Some(plaintext))` when the envelope is stale (written under a
-///   previous key, an older envelope version, or the field's mode changed):
+///   previous key, or the field's mode changed):
 ///   the caller re-encrypts the plaintext with the current scheme, lazily
 ///   migrating the row.
 /// - `Err(..)` when no configured key decrypts it — persisting a value that
@@ -119,12 +119,11 @@ impl EncryptableValue for Option<String> {
 fn stale_envelope_plaintext<P: KeyProvider + ?Sized>(
     provider: &P,
     field_name: &str,
+    envelope: &EncryptedValue,
     envelope_json: &str,
     field_is_deterministic: bool,
     aad: &[u8],
 ) -> EncryptionResult<Option<String>> {
-    let envelope = EncryptedValue::from_json(envelope_json)?;
-    let version_is_current = envelope.h.v.unwrap_or(0) >= CURRENT_ENVELOPE_VERSION;
     let mode_matches = envelope.is_deterministic() == field_is_deterministic;
 
     // Deterministic envelopes only ever use the (non-rotatable) deterministic
@@ -138,14 +137,14 @@ fn stale_envelope_plaintext<P: KeyProvider + ?Sized>(
         })?;
         let field_key = provider.derive_field_key(&det_master, field_name)?;
         let plaintext = decrypt(envelope_json, field_key.as_bytes(), aad)?;
-        return Ok((!(version_is_current && mode_matches)).then_some(plaintext));
+        return Ok((!mode_matches).then_some(plaintext));
     }
 
     // Random-IV envelope: try the current primary first — success means the
     // value is only stale if the version or mode is outdated.
     let primary_key = provider.get_field_key(field_name)?;
     if let Ok(plaintext) = decrypt(envelope_json, primary_key.as_bytes(), aad) {
-        return Ok((!(version_is_current && mode_matches)).then_some(plaintext));
+        return Ok((!mode_matches).then_some(plaintext));
     }
 
     // Walk the full rotation chain (re-deriving the field key per master).
@@ -380,8 +379,8 @@ pub trait Encryptable: ActiveModelTrait {
     ///
     /// A `Set` value that is already an encryption envelope is kept as-is
     /// when it is fully current, and transparently **re-encrypted with the
-    /// current scheme** when it was written under a previous key, an older
-    /// envelope version, or a different deterministic mode — Rails'
+    /// current scheme** when it was written under a previous key or a
+    /// different deterministic mode — Rails'
     /// "previous encryption schemes" behavior. Rows therefore migrate to the
     /// newest key lazily as they are saved.
     ///
@@ -421,21 +420,23 @@ pub trait Encryptable: ActiveModelTrait {
                 .as_ref()
                 .map_or_else(Vec::new, |s| s.field_aad(Self::field_aad(field_name)));
 
-            let plaintext = if is_encrypted_format(&value) {
-                // Already an envelope: keep it when current, or recover the
-                // plaintext so it re-encrypts under the current scheme.
-                match stale_envelope_plaintext(
+            // Already an envelope: keep it when current, or recover the
+            // plaintext so it re-encrypts under the current scheme. A value
+            // with the envelope shape that fails to parse is an error, never
+            // plaintext to be wrapped again.
+            let plaintext = match EncryptedValue::parse_column(&value)? {
+                Some(envelope) => match stale_envelope_plaintext(
                     provider,
                     field_name,
+                    &envelope,
                     &value,
                     is_deterministic,
                     &aad,
                 )? {
                     None => continue,
                     Some(plaintext) => plaintext,
-                }
-            } else {
-                value
+                },
+                None => value,
             };
 
             let encrypted = if is_deterministic {
@@ -558,13 +559,13 @@ where
             let Some(encrypted_str) = encrypted_json.as_str() else {
                 continue;
             };
-            if !is_encrypted_format(encrypted_str) {
+            // Plaintext passes through; a malformed envelope is an error.
+            let Some(envelope) = EncryptedValue::parse_column(encrypted_str)? else {
                 continue;
-            }
+            };
 
-            // Inspect the envelope to decide which master-key list to try.
-            let is_deterministic =
-                EncryptedValue::from_json(encrypted_str).is_ok_and(|v| v.is_deterministic());
+            // The envelope's flag decides which master-key list to try.
+            let is_deterministic = envelope.is_deterministic();
 
             let masters: &[SecureKey] = if is_deterministic {
                 if deterministic_masters.is_empty() {
@@ -678,16 +679,15 @@ pub fn decrypt_field_with_aad<P: KeyProvider + ?Sized>(
     provider: &P,
     aad: &[u8],
 ) -> EncryptionResult<String> {
-    if !is_encrypted_format(encrypted_value) {
+    let Some(envelope) = EncryptedValue::parse_column(encrypted_value)? else {
         return Ok(encrypted_value.to_string());
-    }
+    };
 
     // Route on the envelope's deterministic flag and walk the same master-key
     // lists as `ModelDecryption::decrypt_fields`, so this helper handles key
     // rotation (previous_keys) and deterministic values rather than only the
     // current primary key.
-    let is_deterministic =
-        EncryptedValue::from_json(encrypted_value).is_ok_and(|v| v.is_deterministic());
+    let is_deterministic = envelope.is_deterministic();
 
     let masters: Vec<SecureKey> = if is_deterministic {
         provider.get_deterministic_key()?.into_iter().collect()
@@ -884,7 +884,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::encryption::key_provider::StaticKeyProvider;
+    use crate::encryption::{format::is_encrypted_format, key_provider::StaticKeyProvider};
 
     fn test_provider() -> StaticKeyProvider {
         StaticKeyProvider::from_hex(
@@ -1114,7 +1114,6 @@ mod tests {
 
     mod stale_envelope {
         use super::super::stale_envelope_plaintext;
-        use super::test_provider;
         use crate::encryption::{
             cipher,
             config::{EncryptionConfig, KeyDerivationConfig},
@@ -1145,9 +1144,16 @@ mod tests {
         fn previous_key_envelope_is_stale() {
             let envelope = encrypt_field("secret", "ssn", &provider(OLD, vec![])).unwrap();
             let rotated = provider(NEW, vec![OLD]);
-            let plaintext = stale_envelope_plaintext(&rotated, "ssn", &envelope, false, b"")
-                .unwrap()
-                .expect("previous-key envelope must be marked stale");
+            let plaintext = stale_envelope_plaintext(
+                &rotated,
+                "ssn",
+                &EncryptedValue::from_json(&envelope).unwrap(),
+                &envelope,
+                false,
+                b"",
+            )
+            .unwrap()
+            .expect("previous-key envelope must be marked stale");
             assert_eq!(plaintext, "secret");
         }
 
@@ -1156,7 +1162,15 @@ mod tests {
             let p = provider(NEW, vec![OLD]);
             let envelope = encrypt_field("secret", "ssn", &p).unwrap();
             assert_eq!(
-                stale_envelope_plaintext(&p, "ssn", &envelope, false, b"").unwrap(),
+                stale_envelope_plaintext(
+                    &p,
+                    "ssn",
+                    &EncryptedValue::from_json(&envelope).unwrap(),
+                    &envelope,
+                    false,
+                    b""
+                )
+                .unwrap(),
                 None
             );
         }
@@ -1165,41 +1179,16 @@ mod tests {
         fn undecryptable_envelope_errors() {
             let envelope = encrypt_field("secret", "ssn", &provider(OLD, vec![])).unwrap();
             // NEW only — OLD is not in the rotation chain.
-            let err =
-                stale_envelope_plaintext(&provider(NEW, vec![]), "ssn", &envelope, false, b"")
-                    .unwrap_err();
+            let err = stale_envelope_plaintext(
+                &provider(NEW, vec![]),
+                "ssn",
+                &EncryptedValue::from_json(&envelope).unwrap(),
+                &envelope,
+                false,
+                b"",
+            )
+            .unwrap_err();
             assert!(err.to_string().contains("keys"), "unexpected error: {err}");
-        }
-
-        #[test]
-        fn legacy_v1_envelope_is_stale_even_under_current_key() {
-            use aes_gcm::{
-                aead::{Aead, KeyInit, OsRng},
-                AeadCore, Aes256Gcm,
-            };
-            // StaticKeyProvider: no derivation, so the field key IS the master.
-            let p = test_provider();
-            let key = p.get_field_key("ssn").unwrap();
-            let gcm = Aes256Gcm::new_from_slice(key.as_bytes()).unwrap();
-            let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
-            let ct_with_tag = gcm
-                .encrypt(
-                    &nonce,
-                    aes_gcm::aead::Payload {
-                        msg: b"legacy value",
-                        aad: b"",
-                    },
-                )
-                .unwrap();
-            let (ct, tag) = ct_with_tag.split_at(ct_with_tag.len() - cipher::TAG_SIZE);
-            let mut env = EncryptedValue::new(ct, &nonce, tag, None);
-            env.h.v = Some(1);
-            let envelope = env.to_json().unwrap();
-
-            let plaintext = stale_envelope_plaintext(&p, "ssn", &envelope, false, b"")
-                .unwrap()
-                .expect("v1 envelope must be marked stale for a version upgrade");
-            assert_eq!(plaintext, "legacy value");
         }
 
         #[test]
@@ -1212,18 +1201,32 @@ mod tests {
             let det_env =
                 cipher::encrypt_deterministic("a@b.c", det_key.as_bytes(), None, b"").unwrap();
             assert_eq!(
-                stale_envelope_plaintext(&p, "email", &det_env, false, b"")
-                    .unwrap()
-                    .as_deref(),
+                stale_envelope_plaintext(
+                    &p,
+                    "email",
+                    &EncryptedValue::from_json(&det_env).unwrap(),
+                    &det_env,
+                    false,
+                    b""
+                )
+                .unwrap()
+                .as_deref(),
                 Some("a@b.c")
             );
 
             // Random-IV envelope on a field now marked deterministic.
             let rand_env = encrypt_field("a@b.c", "email", &p).unwrap();
             assert_eq!(
-                stale_envelope_plaintext(&p, "email", &rand_env, true, b"")
-                    .unwrap()
-                    .as_deref(),
+                stale_envelope_plaintext(
+                    &p,
+                    "email",
+                    &EncryptedValue::from_json(&rand_env).unwrap(),
+                    &rand_env,
+                    true,
+                    b""
+                )
+                .unwrap()
+                .as_deref(),
                 Some("a@b.c")
             );
         }
@@ -1236,7 +1239,15 @@ mod tests {
             let envelope =
                 cipher::encrypt_deterministic("a@b.c", det_key.as_bytes(), None, b"").unwrap();
             assert_eq!(
-                stale_envelope_plaintext(&p, "email", &envelope, true, b"").unwrap(),
+                stale_envelope_plaintext(
+                    &p,
+                    "email",
+                    &EncryptedValue::from_json(&envelope).unwrap(),
+                    &envelope,
+                    true,
+                    b""
+                )
+                .unwrap(),
                 None
             );
         }
