@@ -1,7 +1,9 @@
 //! Integration tests for nullable (`Option<String>`) encrypted columns —
 //! the shape `cargo loco generate model x ssn:string:encrypted` emits.
 
-use loco_rs::encryption::{encrypt_query_value, is_encrypted_format, Encryptable, ModelDecryption};
+use loco_rs::encryption::{
+    encrypt_query_value, is_encrypted_format, Encryptable, ModelDecryption, RowScope,
+};
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, Database, DatabaseConnection, EntityTrait,
     QueryFilter, Schema, Set, Statement,
@@ -120,7 +122,8 @@ async fn nullable_deterministic_field_is_queryable_by_equality() {
         .unwrap();
     }
 
-    let needle = encrypt_query_value::<Entity>("email", "bob@example.com", &ctx).unwrap();
+    let needle =
+        encrypt_query_value::<Entity>("email", "bob@example.com", &ctx, &RowScope::new()).unwrap();
     let found = Entity::find()
         .filter(Column::Email.eq(needle))
         .all(&ctx.db)

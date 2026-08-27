@@ -1,7 +1,10 @@
 //! HTTP handlers for the encryption example.
 
 use axum::{extract::Query, routing, Json};
-use loco_rs::{encryption::encrypt_query_value, prelude::*};
+use loco_rs::{
+    encryption::{encrypt_query_value, RowScope},
+    prelude::*,
+};
 use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set, Statement};
 use serde::{Deserialize, Serialize};
 
@@ -55,7 +58,7 @@ async fn by_email(
     Query(q): Query<ByEmailQuery>,
 ) -> Result<Response> {
     // Build the deterministic ciphertext we want to match on.
-    let needle = encrypt_query_value::<Entity>("email", &q.email, &ctx)?;
+    let needle = encrypt_query_value::<Entity>("email", &q.email, &ctx, &RowScope::new())?;
     let mut user = Entity::find()
         .filter(Column::Email.eq(needle))
         .one(&ctx.db)

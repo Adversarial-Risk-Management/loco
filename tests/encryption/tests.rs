@@ -2,7 +2,7 @@
 
 use loco_rs::encryption::{
     cipher, encrypt_query_value, format::is_encrypted_format, registry, EncryptedValue,
-    ModelDecryption,
+    ModelDecryption, RowScope,
 };
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder, Set,
@@ -77,8 +77,8 @@ async fn deterministic_email_is_queryable_by_equality() {
     let _carol = insert_with_encryption(&ctx, "333", "carol@example.com", "Carol").await;
 
     // Build the deterministic query value and search by it.
-    let needle =
-        encrypt_query_value::<Entity>("email", "bob@example.com", &ctx).expect("query encryption");
+    let needle = encrypt_query_value::<Entity>("email", "bob@example.com", &ctx, &RowScope::new())
+        .expect("query encryption");
     let found = Entity::find()
         .filter(Column::Email.eq(needle))
         .one(&ctx.db)
@@ -96,7 +96,7 @@ async fn ssn_is_not_queryable_by_equality_because_iv_is_random() {
 
     // ssn is non-deterministic — `encrypt_query_value` must refuse it so users
     // don't silently produce a query that can never match any row.
-    let err = encrypt_query_value::<Entity>("ssn", "555-12-3456", &ctx)
+    let err = encrypt_query_value::<Entity>("ssn", "555-12-3456", &ctx, &RowScope::new())
         .expect_err("non-deterministic field must error");
     assert!(
         err.to_string().contains("not declared as deterministic"),
@@ -132,7 +132,6 @@ async fn rotation_decrypts_records_written_under_a_previous_key() {
             "Alice".into(),
         ],
     );
-    use sea_orm::ConnectionTrait;
     ctx_b.db.execute_raw(stmt).await.unwrap();
 
     // The most-recently-inserted row has SSN written under A; reading it
@@ -173,7 +172,6 @@ async fn tampered_ciphertext_is_rejected() {
     envelope.p = B64.encode(&bytes);
     let tampered = envelope.to_json().expect("re-serialize envelope");
 
-    use sea_orm::ConnectionTrait;
     ctx.db
         .execute_raw(Statement::from_sql_and_values(
             ctx.db.get_database_backend(),
@@ -208,6 +206,8 @@ async fn deterministic_envelope_carries_d_flag() {
     let det = EncryptedValue::from_json(&raw_email).unwrap();
     let nondet = EncryptedValue::from_json(&raw_ssn).unwrap();
     assert!(det.is_deterministic(), "email envelope must mark h.d=true");
+    assert_eq!(det.key_id(), Some("deterministic"));
+    assert_eq!(nondet.key_id(), Some("primary"));
     assert!(
         !nondet.is_deterministic(),
         "ssn envelope must not be marked"
@@ -220,7 +220,7 @@ async fn deterministic_envelope_carries_d_flag() {
     let again = cipher::encrypt_deterministic(
         "alice@example.com",
         field_key.as_bytes(),
-        provider.get_key_id(),
+        Some("deterministic".to_string()),
         b"",
     )
     .unwrap();
@@ -233,4 +233,32 @@ async fn deterministic_envelope_carries_d_flag() {
     // Silence the unused-binding lint when the compiler decides nondet
     // doesn't need to live to the end.
     let _ = (nondet, entity::Entity);
+}
+
+#[tokio::test]
+async fn plaintext_in_an_encrypted_column_is_an_error_on_read() {
+    // The only plaintext-to-envelope transition is the save path. A stored
+    // plaintext (a row written around the model layer) must not be handed
+    // back as if it had been decrypted.
+    let ctx = ctx_with_encryption(KEY_A, None).await;
+    let saved = insert_with_encryption(&ctx, "123-45-6789", "alice@example.com", "Alice").await;
+    ctx.db
+        .execute_raw(Statement::from_sql_and_values(
+            ctx.db.get_database_backend(),
+            "UPDATE secret_documents SET ssn = ? WHERE id = ?",
+            ["123-45-6789".into(), saved.id.into()],
+        ))
+        .await
+        .unwrap();
+
+    let mut model = Entity::find_by_id(saved.id)
+        .one(&ctx.db)
+        .await
+        .unwrap()
+        .unwrap();
+    let err = model.decrypt_fields_ctx::<Entity>(&ctx).unwrap_err();
+    assert!(
+        matches!(err, loco_rs::encryption::EncryptionError::InvalidFormat(_)),
+        "{err}"
+    );
 }

@@ -2,8 +2,8 @@
 //! `org_id`, on both the macro/ctx path and the explicit-provider path.
 
 use loco_rs::encryption::{
-    decrypt_field_with_aad, encrypt_query_value, encrypt_query_value_scoped,
-    key_provider::ConfigKeyProvider, Encryptable, EncryptionError, ModelDecryption, RowScope,
+    decrypt_field, encrypt_query_value, key_provider::ConfigKeyProvider, Encryptable,
+    EncryptionError, ModelDecryption, RowScope,
 };
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, Database, DatabaseConnection, EntityTrait,
@@ -131,16 +131,16 @@ async fn aad_is_namespace_field_and_hyphenated_uuid() {
     let provider = ConfigKeyProvider::new(&config(KEY_A, None)).unwrap();
     let aad = b"scoped_credentials:credentials\0org_id=\"6f9619ff-8b86-d011-b42d-00c04fc964ff\"";
     assert_eq!(
-        decrypt_field_with_aad(&ct, "credentials", &provider, aad).unwrap(),
+        decrypt_field(&ct, "credentials", &provider, aad).unwrap(),
         "pinned"
     );
 
     let mut raw_bytes = b"scoped_credentials:credentials\0org_id=".to_vec();
     raw_bytes.extend_from_slice(org.as_bytes());
-    assert!(decrypt_field_with_aad(&ct, "credentials", &provider, &raw_bytes).is_err());
+    assert!(decrypt_field(&ct, "credentials", &provider, &raw_bytes).is_err());
     // The unquoted string form is not accepted either.
     let unquoted = format!("scoped_credentials:credentials\0org_id={org}");
-    assert!(decrypt_field_with_aad(&ct, "credentials", &provider, unquoted.as_bytes()).is_err());
+    assert!(decrypt_field(&ct, "credentials", &provider, unquoted.as_bytes()).is_err());
 
     // The trait hooks agree with each other and with the pinned bytes.
     let am = ActiveModel {
@@ -246,8 +246,7 @@ async fn deterministic_scoped_field_queries_within_the_org() {
     // Same plaintext under different orgs is a different ciphertext, so the
     // needle only matches inside org A.
     let scope = RowScope::new().with("org_id", &org_a).unwrap();
-    let needle =
-        encrypt_query_value_scoped::<Entity>("external_id", "shared-ext", &scope, &ctx).unwrap();
+    let needle = encrypt_query_value::<Entity>("external_id", "shared-ext", &ctx, &scope).unwrap();
     let found = Entity::find()
         .filter(Column::ExternalId.eq(needle))
         .all(&ctx.db)
@@ -256,13 +255,9 @@ async fn deterministic_scoped_field_queries_within_the_org() {
     assert_eq!(found.len(), 1);
     assert_eq!(found[0].id, a.id);
 
-    // The unscoped helper refuses a scoped model instead of never matching.
-    let err = encrypt_query_value::<Entity>("external_id", "shared-ext", &ctx).unwrap_err();
-    assert!(matches!(err, EncryptionError::Scope(_)), "{err}");
-
-    // A scope missing the required column is rejected too.
-    let err =
-        encrypt_query_value_scoped::<Entity>("external_id", "shared-ext", &RowScope::new(), &ctx)
-            .unwrap_err();
+    // A scope missing the required column is rejected instead of producing a
+    // needle that never matches.
+    let err = encrypt_query_value::<Entity>("external_id", "shared-ext", &ctx, &RowScope::new())
+        .unwrap_err();
     assert!(matches!(err, EncryptionError::Scope(_)), "{err}");
 }

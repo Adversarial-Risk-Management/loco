@@ -7,7 +7,7 @@ use std::{collections::HashMap, sync::RwLock};
 use loco_rs::{
     app::AppContext,
     encryption::{
-        encrypt_query_value_scoped, key_provider::ConfigKeyProvider, Encryptable, EncryptionError,
+        encrypt_query_value, key_provider::ConfigKeyProvider, Encryptable, EncryptionError,
         EncryptionResult, ModelDecryption, RowScope, SharedKeyProvider,
     },
 };
@@ -199,7 +199,7 @@ async fn scoped_query_uses_the_orgs_provider() {
     let _id_b = insert(&ctx, org_b, "b", "same").await;
 
     let scope = RowScope::new().with("org_id", &org_a).unwrap();
-    let needle = encrypt_query_value_scoped::<Entity>("lookup", "same", &scope, &ctx).unwrap();
+    let needle = encrypt_query_value::<Entity>("lookup", "same", &ctx, &scope).unwrap();
     let found = Entity::find()
         .filter(Column::Lookup.eq(needle))
         .all(&ctx.db)

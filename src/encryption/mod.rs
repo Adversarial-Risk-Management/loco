@@ -95,7 +95,7 @@
 //!     "iv": "base64-encoded-iv",
 //!     "at": "base64-encoded-auth-tag",
 //!     "v": 1,
-//!     "i": "optional-key-id"
+//!     "i": "primary"
 //!   }
 //! }
 //! ```
@@ -122,9 +122,8 @@ pub use cipher::{
 };
 pub use config::EncryptionConfig;
 pub use encryptable::{
-    decrypt_field, decrypt_field_with_aad, encrypt_field, encrypt_field_with_aad,
-    encrypt_query_value, encrypt_query_value_scoped, encrypt_query_value_with, Encryptable,
-    EncryptableValue, ModelDecryption,
+    decrypt_field, encrypt_field, encrypt_query_value, Encryptable, EncryptableValue,
+    ModelDecryption,
 };
 pub use errors::{EncryptionError, EncryptionResult};
 pub use format::{
@@ -153,7 +152,7 @@ pub use scope::RowScope;
 /// use loco_rs::impl_encryptable_fields;
 ///
 /// // ssn: compressed by default. email: deterministic (and not compressed) so
-/// // `WHERE email = encrypt_query_value::<users::Entity>("email", &input, &ctx)?`
+/// // `WHERE email = encrypt_query_value::<users::Entity>("email", &input, &ctx, &RowScope::new())?`
 /// // works. bio: opted out of compression.
 /// impl_encryptable_fields!(users::ActiveModel, [ssn, email(deterministic), bio(no_compress)]);
 /// ```
@@ -202,8 +201,9 @@ pub use scope::RowScope;
 /// is an error; on read, a missing or null scope column is an error. The
 /// scope is also what [`Encryptable::provider_for`](encryptable::Encryptable::provider_for)
 /// receives to select a per-row key provider. Deterministic fields on a
-/// scoped model must be queried with
-/// [`encrypt_query_value_scoped`](encryptable::encrypt_query_value_scoped).
+/// scoped model are queried with
+/// [`encrypt_query_value`](encryptable::encrypt_query_value) and a scope
+/// carrying the same column values.
 ///
 /// # Per-row key providers (`provider_for`)
 ///

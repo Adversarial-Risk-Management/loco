@@ -156,9 +156,10 @@ mod tests {
         register(&ctx, &cfg).unwrap();
 
         let provider = ctx.encryption_provider().expect("provider should resolve");
-        let encrypted = crate::encryption::encrypt_field("secret", "ssn", &*provider).unwrap();
+        let encrypted = crate::encryption::encrypt_field("secret", "ssn", &*provider, b"").unwrap();
         assert!(crate::encryption::is_encrypted_format(&encrypted));
-        let decrypted = crate::encryption::decrypt_field(&encrypted, "ssn", &*provider).unwrap();
+        let decrypted =
+            crate::encryption::decrypt_field(&encrypted, "ssn", &*provider, b"").unwrap();
         assert_eq!(decrypted, "secret");
     }
 }
