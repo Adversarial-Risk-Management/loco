@@ -80,8 +80,9 @@ pub struct Column {
     pub nullable: bool,
     pub unique: bool,
     /// `Some` when the field carries a `:encrypted`/`:encrypted:deterministic`
-    /// qualifier. Encryption never changes the emitted DB column type —
-    /// it is a model-layer serialization concern.
+    /// qualifier. Only `string` and `text` inner types accept it, and the
+    /// emitted DB column is always `text` so the JSON envelope never
+    /// truncates.
     pub encrypted: Option<EncryptionMode>,
 }
 
@@ -146,10 +147,11 @@ impl Flag {
 /// * `binary_len:N` (+ `!`/`^`)        => `ScalarType::BinaryLen`
 /// * `array:inner` (+ `!`/`^`)         => `ColumnKind::Array` (inner is one
 ///   of `string`/`int`/`big_int`/`float`/`double`/`bool`)
-/// * trailing `:encrypted` or `:encrypted:deterministic` (after any base
-///   type, composable with `!`/`^`: `string:encrypted!`,
+/// * trailing `:encrypted` or `:encrypted:deterministic` (after a `string`
+///   or `text` base type, composable with `!`/`^`: `string:encrypted!`,
 ///   `string!:encrypted`) => model-layer encryption qualifier; the DB
-///   column keeps the inner type. References cannot be encrypted.
+///   column is emitted as `text`. Other inner types and references cannot
+///   be encrypted.
 /// * otherwise a bare scalar base name (see `scalar_from_base_name`)
 ///
 /// # Errors
@@ -217,8 +219,7 @@ pub fn parse_column(name: &str, spec: &str) -> Result<Column> {
         }
     }
     // Peel a trailing `:encrypted` / `:encrypted:deterministic` qualifier so
-    // it composes with any base type. The qualifier never changes the emitted
-    // DB column type — encryption is a model-layer serialization concern.
+    // it composes with the string-like base types.
     let encrypted = match parts.as_slice() {
         [_, .., "encrypted", "deterministic"] => {
             parts.truncate(parts.len() - 2);
@@ -238,6 +239,12 @@ pub fn parse_column(name: &str, spec: &str) -> Result<Column> {
     };
 
     let base = parts.join(":");
+    if encrypted.is_some() && !matches!(base.as_str(), "string" | "text") {
+        return Err(Error::Message(format!(
+            "`:encrypted` requires a `string` or `text` inner type (the model field must be \
+             `String` to hold the JSON envelope), got `{spec}`"
+        )));
+    }
     let kind = match parts.as_slice() {
         ["array", rest @ ..] => {
             let [inner_name] = rest else {
@@ -345,6 +352,15 @@ pub fn parse_column(name: &str, spec: &str) -> Result<Column> {
             _ => {}
         }
     }
+
+    // An encrypted column stores a JSON envelope (~90 bytes of overhead plus
+    // 4/3 of the ciphertext length), which overflows `varchar(255)` on long
+    // plaintexts. Emit `text` so the column never truncates.
+    let kind = if encrypted.is_some() {
+        ColumnKind::Scalar(ScalarType::Text)
+    } else {
+        kind
+    };
 
     Ok(Column {
         name: name.to_string(),
@@ -1517,12 +1533,13 @@ mod tests {
 
     #[test]
     fn encrypted_qualifier_composes_with_flags_and_types() {
-        // bare: nullable, non-deterministic
+        // bare: nullable, non-deterministic; `string` is promoted to `text`
+        // so the envelope never truncates
         let c = col("ssn", "string:encrypted");
-        assert_eq!(c.kind, ColumnKind::Scalar(ScalarType::String));
+        assert_eq!(c.kind, ColumnKind::Scalar(ScalarType::Text));
         assert!(c.nullable);
         assert_eq!(c.encrypted, Some(EncryptionMode::NonDeterministic));
-        assert_eq!(c.col_type(), "StringNull");
+        assert_eq!(c.col_type(), "TextNull");
 
         // deterministic
         let c = col("email", "string:encrypted:deterministic");
@@ -1545,15 +1562,10 @@ mod tests {
         assert!(c.unique);
         assert_eq!(c.encrypted, Some(EncryptionMode::Deterministic));
 
-        // parametrized inner type
-        let c = col("code", "enum:a,b:encrypted");
-        assert_eq!(
-            c.kind,
-            ColumnKind::Scalar(ScalarType::Enum {
-                values: vec!["a".to_string(), "b".to_string()]
-            })
-        );
-        assert_eq!(c.encrypted, Some(EncryptionMode::NonDeterministic));
+        // unique + deterministic on a `text` base
+        let c = col("api_key", "text:encrypted:deterministic^");
+        assert!(c.unique);
+        assert_eq!(c.col_type(), "TextUniq");
 
         // unqualified columns parse with `encrypted: None`
         assert_eq!(col("plain", "string").encrypted, None);
@@ -1581,6 +1593,21 @@ mod tests {
 
         // `deterministic` without `encrypted` is not a valid parameter
         assert!(parse_column("ssn", "string:deterministic").is_err());
+
+        // only string-like inner types can hold the JSON envelope
+        for spec in [
+            "int:encrypted",
+            "uuid:encrypted",
+            "enum:a,b:encrypted",
+            "json:encrypted",
+        ] {
+            let err = parse_column("x", spec).unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("requires a `string` or `text` inner type"),
+                "{spec}: unexpected error: {err}"
+            );
+        }
     }
 
     #[test]

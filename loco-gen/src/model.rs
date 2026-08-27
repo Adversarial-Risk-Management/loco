@@ -47,8 +47,7 @@ pub fn get_columns_and_references(
     let mut encrypted_fields = Vec::new();
     for col in column::columns_from_fields(fields)? {
         // Remember `:encrypted` fields so the template can emit the
-        // model-layer macro snippet for the user. The emitted column keeps
-        // its inner type.
+        // model-layer macro snippet for the user.
         if let Some(mode) = col.encrypted {
             encrypted_fields.push(EncryptedField {
                 name: col.name.clone(),
@@ -274,12 +273,12 @@ mod tests {
         let (columns, references, encrypted) =
             get_columns_and_references(&fields).expect("parse encrypted fields");
 
-        // The emitted DB column type is unchanged by the qualifier.
+        // Encrypted columns are emitted as `text` so the envelope fits.
         assert_eq!(
             columns,
             vec![
-                to_field("ssn", "StringNull"),
-                to_field("email", "StringNull"),
+                to_field("ssn", "TextNull"),
+                to_field("email", "TextNull"),
                 to_field("bio", "Text"),
                 to_field("plain", "StringNull"),
             ]
