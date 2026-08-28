@@ -71,6 +71,7 @@ Current base: **upstream v1.0.0** (synced 2026-07-29). Patches carried on top, i
 | Testing deps: axum-test 20 (upstream pins 17; also drops the now-unrepresentable `RequestConfig.default_scheme`) | `deps/testing` | [#8](https://github.com/Adversarial-Risk-Management/loco/pull/8) | — | carried (residual — the rest of #8 landed upstream) |
 | Queue provider downcast: `QueueProvider::as_any` + `Queue::downcast_provider::<T>()`, restoring app access to the queue backend (e.g. `PgQueue.pool`) that the 1.0 `Queue` enum removal took away | `feat/queue-provider-downcast` | — | candidate | carried (new on 1.0; successor to `feature/expose-worker-job-ids` / `feat/work-queue-pagination`) |
 | Testing: Postgres per-test DB teardown uses `DROP DATABASE ... WITH (FORCE)` (PG 13+), so app-held pools outside loco's own (e.g. a session store on a different sqlx major) can't fail cleanup with SQLSTATE 55006 | `fix/testing-drop-db-force` | — | candidate | carried (new on 1.0) |
+| loco-gen `:encrypted` field qualifier (string/text only, `^` only with deterministic, scaffold rejects it): migration/model output prints the `loco_encryption::impl_encryptable_fields!` block and config hint. The encryption runtime lives in the platform crate `loco-encryption`, not in the fork | `encryption-gen` | [#20](https://github.com/Adversarial-Risk-Management/loco/pull/20) | — | open (re-applied on 1.1; supersedes [#19](https://github.com/Adversarial-Risk-Management/loco/pull/19), kept unmerged as the extraction source) |
 
 ### Dropped on the v1.0.0 sync
 
