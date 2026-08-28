@@ -7,7 +7,7 @@ use serde_json::{json, Value};
 
 use crate::{
     column::{self, Column, ColumnKind, ScalarType},
-    model, render_template, AppInfo, GenerateResults, Result,
+    model, render_template, AppInfo, Error, GenerateResults, Result,
 };
 
 /// Loco 1.0 ships a single scaffold flavor built straight from
@@ -37,9 +37,23 @@ pub fn generate(
     // - scaffold is never a link table
     // - never run with migration_only, because the controllers will refer to the
     //   models. the models only arrive after migration and entities sync.
+    let api_columns = column::columns_from_fields(fields)?;
+    // The scaffold's controller writes request bodies straight into the
+    // `ActiveModel` and returns models as-is, so an `:encrypted` field would
+    // be stored and served in plaintext. Generate the model, then wire the
+    // controller by hand.
+    if let Some(col) = api_columns.iter().find(|c| c.encrypted.is_some()) {
+        return Err(Error::Message(format!(
+            "scaffold does not support `:encrypted` fields (`{}`): the generated controller \
+             would store and return the plaintext. Use `generate model` and write the \
+             controller with `insert_encrypted` / `update_encrypted` / `save_encrypted` for \
+             writes and `decrypt_fields_ctx` for reads.",
+            col.name
+        )));
+    }
+
     let mut gen_result = model::generate(rrgen, name, with_tz, fields, appinfo)?;
 
-    let api_columns = column::columns_from_fields(fields)?;
     let api_vars = build_api_context(name, &api_columns, with_tz, auth, appinfo);
 
     // Backend (DTO + controller) -- always emitted.
