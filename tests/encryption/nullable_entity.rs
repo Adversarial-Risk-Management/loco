@@ -11,7 +11,7 @@ use sea_orm::entity::prelude::*;
 #[sea_orm(table_name = "nullable_documents")]
 pub struct Model {
     #[sea_orm(primary_key)]
-    pub id: i32,
+    pub id: i64,
     /// Nullable, non-deterministic.
     #[sea_orm(column_type = "Text", nullable)]
     pub ssn: Option<String>,

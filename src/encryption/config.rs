@@ -19,10 +19,11 @@
 //! `previous_keys` entry that is not a valid key is an error. Empty entries
 //! (an unset templated env var) are skipped.
 
-use serde::{Deserialize, Serialize};
+use serde::{ser::SerializeStruct, Deserialize, Serialize, Serializer};
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 /// Encryption configuration
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Zeroize, ZeroizeOnDrop)]
 pub struct EncryptionConfig {
     /// Master key for non-deterministic fields (32 bytes, hex-encoded).
     pub primary_key: String,
@@ -52,6 +53,37 @@ pub struct EncryptionConfig {
     /// `HKDF(master, salt, info = column name)`. Changing the salt invalidates
     /// every existing ciphertext.
     pub key_derivation_salt: String,
+}
+
+impl std::fmt::Debug for EncryptionConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EncryptionConfig")
+            .field("primary_key", &"[REDACTED]")
+            .field(
+                "previous_keys",
+                &format_args!("[{} REDACTED]", self.previous_keys.len()),
+            )
+            .field("deterministic_key", &"[REDACTED]")
+            .field("key_derivation_salt", &"[REDACTED]")
+            .finish()
+    }
+}
+
+impl Serialize for EncryptionConfig {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut state = serializer.serialize_struct("EncryptionConfig", 4)?;
+        state.serialize_field("primary_key", "[REDACTED]")?;
+        state.serialize_field(
+            "previous_keys",
+            &vec!["[REDACTED]"; self.previous_keys.len()],
+        )?;
+        state.serialize_field("deterministic_key", "[REDACTED]")?;
+        state.serialize_field("key_derivation_salt", "[REDACTED]")?;
+        state.end()
+    }
 }
 
 impl EncryptionConfig {
@@ -119,5 +151,29 @@ previous_keys:
         let minimal = "primary_key: a\ndeterministic_key: b\nkey_derivation_salt: c\n";
         let config: EncryptionConfig = serde_yaml::from_str(minimal).unwrap();
         assert!(config.previous_keys.is_empty());
+    }
+
+    #[test]
+    fn test_debug_and_serialization_redact_keys() {
+        let config = EncryptionConfig {
+            primary_key: "primary-secret".to_string(),
+            previous_keys: vec!["old-secret".to_string()],
+            deterministic_key: "deterministic-secret".to_string(),
+            key_derivation_salt: "salt-secret".to_string(),
+        };
+
+        for rendered in [
+            format!("{config:?}"),
+            serde_yaml::to_string(&config).unwrap(),
+        ] {
+            for secret in [
+                "primary-secret",
+                "old-secret",
+                "deterministic-secret",
+                "salt-secret",
+            ] {
+                assert!(!rendered.contains(secret), "leaked {secret}: {rendered}");
+            }
+        }
     }
 }

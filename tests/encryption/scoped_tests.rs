@@ -29,14 +29,12 @@ async fn insert(ctx: &loco_rs::app::AppContext, org: Uuid, creds: &str, ext: &st
         external_id: Set(ext.to_string()),
         ..Default::default()
     }
-    .encrypt_fields_ctx(ctx)
-    .unwrap()
-    .insert(&ctx.db)
+    .insert_encrypted(ctx)
     .await
     .unwrap()
 }
 
-async fn raw(db: &DatabaseConnection, id: i32, col: &str) -> String {
+async fn raw(db: &DatabaseConnection, id: i64, col: &str) -> String {
     let stmt = Statement::from_sql_and_values(
         db.get_database_backend(),
         format!("SELECT {col} FROM scoped_credentials WHERE id = ?"),
@@ -57,7 +55,7 @@ async fn scoped_fields_round_trip() {
         .await
         .unwrap()
         .unwrap();
-    model.decrypt_fields_ctx::<Entity>(&ctx).unwrap();
+    model.decrypt_fields_ctx(&ctx).unwrap();
     assert_eq!(model.credentials, r#"{"token":"abc"}"#);
     assert_eq!(model.external_id, "ext-1");
     assert_eq!(model.org_id, org);
@@ -88,7 +86,7 @@ async fn envelope_moved_to_another_org_row_fails_to_decrypt() {
         .unwrap()
         .unwrap();
     let err = model
-        .decrypt_fields_ctx::<Entity>(&ctx)
+        .decrypt_fields_ctx(&ctx)
         .expect_err("cross-org relocation must fail authentication");
     assert!(
         matches!(err, EncryptionError::AllKeysFailed { .. }),
@@ -140,9 +138,8 @@ async fn aad_is_namespace_field_and_hyphenated_uuid() {
         ..Default::default()
     };
     let from_active = am.row_scope().unwrap();
-    let from_json =
-        ActiveModel::row_scope_from_json(&serde_json::to_value(&saved).unwrap()).unwrap();
-    assert_eq!(from_active, from_json);
+    let from_model = ActiveModel::row_scope_from_model(&saved).unwrap();
+    assert_eq!(from_active, from_model);
     assert_eq!(
         from_active.field_aad(ActiveModel::field_aad("credentials")),
         aad.to_vec()
@@ -198,7 +195,7 @@ async fn explicit_provider_path_honours_the_scope_and_rotation() {
         .await
         .unwrap()
         .unwrap();
-    model.decrypt_fields::<Entity, _>(&rotated).unwrap();
+    model.decrypt_fields(&rotated).unwrap();
     assert_eq!(model.credentials, "rotate-me");
 
     // Re-save the stale envelope: it is rewritten under KEY_B, still bound
@@ -223,7 +220,7 @@ async fn explicit_provider_path_honours_the_scope_and_rotation() {
         .await
         .unwrap()
         .unwrap();
-    model.decrypt_fields::<Entity, _>(&key_b_only).unwrap();
+    model.decrypt_fields(&key_b_only).unwrap();
     assert_eq!(model.credentials, "rotate-me");
 }
 
@@ -279,9 +276,7 @@ async fn changing_a_scope_column_requires_every_encrypted_field() {
         credentials: Set("creds".to_string()),
         external_id: Set("ext".to_string()),
     }
-    .encrypt_fields_ctx(&ctx)
-    .unwrap()
-    .update(&ctx.db)
+    .update_encrypted(&ctx)
     .await
     .unwrap();
     let mut model = Entity::find_by_id(moved.id)
@@ -289,7 +284,7 @@ async fn changing_a_scope_column_requires_every_encrypted_field() {
         .await
         .unwrap()
         .unwrap();
-    model.decrypt_fields_ctx::<Entity>(&ctx).unwrap();
+    model.decrypt_fields_ctx(&ctx).unwrap();
     assert_eq!(model.org_id, org_b);
     assert_eq!(model.credentials, "creds");
 

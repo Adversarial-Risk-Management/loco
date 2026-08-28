@@ -419,9 +419,11 @@ pub async fn create_context<H: Hooks>(
     };
 
     #[cfg(feature = "encryption")]
-    if let Some(enc_cfg) = ctx.config.encryption.as_ref() {
-        crate::encryption::registry::register(&ctx, enc_cfg)
-            .map_err(|e| Error::Message(format!("encryption: {e}")))?;
+    let mut ctx = ctx;
+
+    #[cfg(feature = "encryption")]
+    if let Some(enc_cfg) = ctx.config.encryption.take() {
+        crate::encryption::registry::register(&ctx, &enc_cfg)?;
     }
 
     H::after_context(ctx).await

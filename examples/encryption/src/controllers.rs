@@ -5,7 +5,7 @@ use loco_rs::{
     encryption::{encrypt_query_value, RowScope},
     prelude::*,
 };
-use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set, Statement};
+use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, Set, Statement};
 use serde::{Deserialize, Serialize};
 
 use crate::models::{ActiveModel, Column, Entity};
@@ -19,7 +19,7 @@ pub struct CreateBody {
 
 #[derive(Serialize)]
 pub struct UserDto {
-    pub id: i32,
+    pub id: i64,
     pub name: String,
     pub ssn: String,
     pub email: String,
@@ -33,11 +33,11 @@ async fn create(State(ctx): State<AppContext>, Json(body): Json<CreateBody>) -> 
         email: Set(body.email),
         ..Default::default()
     };
-    // The single line that drives encryption at write time:
-    let mut user = active.encrypt_fields_ctx(&ctx)?.insert(&ctx.db).await?;
+    // Encryption and persistence stay in one operation.
+    let mut user = active.insert_encrypted(&ctx).await?;
     // `insert` returns the row in its on-disk form (i.e. encrypted). Decrypt
     // before responding so this endpoint round-trips plaintext.
-    user.decrypt_fields_ctx::<Entity>(&ctx)?;
+    user.decrypt_fields_ctx(&ctx)?;
     format::json(UserDto {
         id: user.id,
         name: user.name,
@@ -65,7 +65,7 @@ async fn by_email(
         .await?
         .ok_or_else(|| Error::NotFound)?;
 
-    user.decrypt_fields_ctx::<Entity>(&ctx)?;
+    user.decrypt_fields_ctx(&ctx)?;
     format::json(UserDto {
         id: user.id,
         name: user.name,
@@ -76,12 +76,12 @@ async fn by_email(
 
 #[derive(Deserialize)]
 pub struct RawQuery {
-    pub id: i32,
+    pub id: i64,
 }
 
 #[derive(Serialize)]
 pub struct RawDto {
-    pub id: i32,
+    pub id: i64,
     pub name: String,
     pub ssn: String,
     pub email: String,
@@ -102,7 +102,7 @@ async fn raw(State(ctx): State<AppContext>, Query(q): Query<RawQuery>) -> Result
         .await?
         .ok_or_else(|| Error::NotFound)?;
     let dto = RawDto {
-        id: row.try_get::<i32>("", "id").unwrap_or_default(),
+        id: row.try_get::<i64>("", "id").unwrap_or_default(),
         name: row.try_get::<String>("", "name").unwrap_or_default(),
         ssn: row.try_get::<String>("", "ssn").unwrap_or_default(),
         email: row.try_get::<String>("", "email").unwrap_or_default(),

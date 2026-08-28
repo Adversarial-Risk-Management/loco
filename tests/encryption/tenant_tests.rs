@@ -11,7 +11,7 @@ use loco_rs::{
         EncryptionResult, ModelDecryption, RowScope, SharedKeyProvider,
     },
 };
-use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set, Unchanged};
+use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, Set, Unchanged};
 use uuid::Uuid;
 
 use super::{
@@ -72,16 +72,14 @@ fn provider(primary: &str, previous: Option<&str>) -> SharedKeyProvider {
     std::sync::Arc::new(ConfigKeyProvider::new(&config(primary, previous)).unwrap())
 }
 
-async fn insert(ctx: &AppContext, org: Uuid, secret: &str, lookup: &str) -> i32 {
+async fn insert(ctx: &AppContext, org: Uuid, secret: &str, lookup: &str) -> i64 {
     ActiveModel {
         org_id: Set(org),
         secret: Set(secret.to_string()),
         lookup: Set(lookup.to_string()),
         ..Default::default()
     }
-    .encrypt_fields_ctx(ctx)
-    .unwrap()
-    .insert(&ctx.db)
+    .insert_encrypted(ctx)
     .await
     .unwrap()
     .id
@@ -95,19 +93,15 @@ async fn rows_are_encrypted_under_their_orgs_provider_not_the_registry() {
 
     // Readable through the ctx path (provider_for → org A's provider).
     let mut model = stored.clone();
-    model.decrypt_fields_ctx::<Entity>(&ctx).unwrap();
+    model.decrypt_fields_ctx(&ctx).unwrap();
     assert_eq!(model.secret, "a-secret");
 
     // Decisive: org A's provider alone reads it; the global KEY_B one cannot.
     let mut model = stored.clone();
-    model
-        .decrypt_fields::<Entity, _>(&*provider(KEY_A, None))
-        .unwrap();
+    model.decrypt_fields(&*provider(KEY_A, None)).unwrap();
     assert_eq!(model.secret, "a-secret");
     let mut model = stored;
-    let err = model
-        .decrypt_fields::<Entity, _>(&*provider(KEY_B, None))
-        .unwrap_err();
+    let err = model.decrypt_fields(&*provider(KEY_B, None)).unwrap_err();
     assert!(
         matches!(err, EncryptionError::AllKeysFailed { .. }),
         "{err}"
@@ -140,7 +134,7 @@ async fn provider_cache_miss_is_an_error_not_a_registry_fallback() {
         .unwrap()
         .evict(org_a);
     let mut model = Entity::find_by_id(id).one(&ctx.db).await.unwrap().unwrap();
-    let err = model.decrypt_fields_ctx::<Entity>(&ctx).unwrap_err();
+    let err = model.decrypt_fields_ctx(&ctx).unwrap_err();
     assert!(matches!(err, EncryptionError::NotConfigured(_)), "{err}");
 }
 
@@ -157,7 +151,7 @@ async fn org_key_rotation_reencrypts_on_save_under_the_orgs_new_key() {
 
     // Read still works (retired key), and a re-save rewrites the envelope.
     let mut model = before.clone();
-    model.decrypt_fields_ctx::<Entity>(&ctx).unwrap();
+    model.decrypt_fields_ctx(&ctx).unwrap();
     assert_eq!(model.secret, "rotate");
     ActiveModel {
         id: Set(id),
@@ -165,9 +159,7 @@ async fn org_key_rotation_reencrypts_on_save_under_the_orgs_new_key() {
         secret: Set(before.secret.clone()),
         ..Default::default()
     }
-    .encrypt_fields_ctx(&ctx)
-    .unwrap()
-    .update(&ctx.db)
+    .update_encrypted(&ctx)
     .await
     .unwrap();
     let after = Entity::find_by_id(id).one(&ctx.db).await.unwrap().unwrap();
@@ -175,9 +167,7 @@ async fn org_key_rotation_reencrypts_on_save_under_the_orgs_new_key() {
 
     // Readable with only the new org key.
     let mut model = after;
-    model
-        .decrypt_fields::<Entity, _>(&*provider(KEY_B_ORG, None))
-        .unwrap();
+    model.decrypt_fields(&*provider(KEY_B_ORG, None)).unwrap();
     assert_eq!(model.secret, "rotate");
 }
 

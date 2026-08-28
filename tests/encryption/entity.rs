@@ -17,7 +17,7 @@ use sea_orm::entity::prelude::*;
 #[sea_orm(table_name = "secret_documents")]
 pub struct Model {
     #[sea_orm(primary_key)]
-    pub id: i32,
+    pub id: i64,
     #[sea_orm(column_type = "Text", nullable)]
     pub ssn: String,
     #[sea_orm(column_type = "Text", nullable)]
@@ -28,7 +28,18 @@ pub struct Model {
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
 pub enum Relation {}
 
-impl ActiveModelBehavior for ActiveModel {}
+#[async_trait::async_trait]
+impl ActiveModelBehavior for ActiveModel {
+    async fn before_save<C>(mut self, _db: &C, _insert: bool) -> Result<Self, DbErr>
+    where
+        C: ConnectionTrait,
+    {
+        if let sea_orm::ActiveValue::Set(ssn) = &mut self.ssn {
+            *ssn = ssn.trim().to_string();
+        }
+        Ok(self)
+    }
+}
 
 impl_encryptable_fields!(
     ActiveModel,

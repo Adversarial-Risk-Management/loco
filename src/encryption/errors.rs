@@ -6,6 +6,7 @@ use thiserror::Error;
 
 /// Errors that can occur during encryption/decryption operations
 #[derive(Error, Debug)]
+#[non_exhaustive]
 pub enum EncryptionError {
     /// Invalid encryption key format or length
     #[error("invalid encryption key: {0}")]

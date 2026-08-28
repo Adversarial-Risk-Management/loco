@@ -72,7 +72,7 @@ pub async fn ctx_with_encryption_config(cfg: &EncryptionConfig) -> AppContext {
 pub async fn raw_string_column(
     db: &DatabaseConnection,
     table: &str,
-    id: i32,
+    id: i64,
     column: &str,
 ) -> String {
     raw_nullable_column(db, table, id, column)
@@ -87,7 +87,7 @@ pub async fn raw_string_column(
 pub async fn raw_nullable_column(
     db: &DatabaseConnection,
     table: &str,
-    id: i32,
+    id: i64,
     column: &str,
 ) -> Option<String> {
     let backend = db.get_database_backend();

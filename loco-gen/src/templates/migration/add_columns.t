@@ -19,6 +19,7 @@ message: |
       {% endfor %}
       ], aad_namespace = "{{plural_snake}}");
 
+  Enable the `encryption` feature on your `loco-rs` dependency in `Cargo.toml`.
   Set `encryption.primary_key`, `encryption.deterministic_key` and
   `encryption.key_derivation_salt` in your `config/*.yaml`.
 {% else -%}

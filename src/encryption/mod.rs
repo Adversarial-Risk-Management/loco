@@ -6,8 +6,8 @@
 //!
 //! # Features
 //!
-//! - **Explicit encryption on save**: call `encrypt_fields_ctx` on the
-//!   `ActiveModel` before `insert`/`update`
+//! - **Safe encrypted persistence**: call `insert_encrypted`,
+//!   `update_encrypted`, or `save_encrypted` on the `ActiveModel`
 //! - **Explicit decryption on read**: Manual decryption call required (Rust idiom)
 //! - **Rails-style envelope**: Uses the same JSON envelope *shape* as Rails
 //!   `ActiveRecord` Encryption (`{"p":…,"h":{"iv":…,"at":…}}`). See the
@@ -27,9 +27,9 @@
 //!   - Rails: `user.ssn` automatically decrypts
 //!   - Loco: `user.ssn` returns encrypted JSON; must call `user.decrypt_fields()` first
 //! - **Wire compatibility**: the envelope *shape* matches Rails, but values do
-//!   not interoperate. The deterministic-IV PRF length-prefixes its input, the
-//!   `i` key-id uses semantic labels (`"primary"`) rather than Rails' key
-//!   fingerprint, and per-field keys are derived with HKDF-SHA256 rather than
+//!   not interoperate. The deterministic-IV PRF length-prefixes its input,
+//!   envelope interpretation headers are authenticated, key fingerprints use
+//!   SHA-256, and per-field keys are derived with HKDF-SHA256 rather than
 //!   Rails' PBKDF2. Do not plan a cross-stack migration on the shared shape.
 //! - **Compression**: on by default for non-deterministic fields, as in Rails.
 //!   Opt a field out with the `(no_compress)` modifier (see
@@ -69,24 +69,24 @@
 //! ```rust,ignore
 //! use loco_rs::prelude::*;
 //!
-//! // Encrypt on save:
+//! // Encrypt and save:
 //! let active = users::ActiveModel { ssn: Set(ssn), ..Default::default() };
-//! let user = active.encrypt_fields_ctx(&ctx)?.insert(&ctx.db).await?;
+//! let user = active.insert_encrypted(&ctx).await?;
 //!
 //! // Decrypt on read:
 //! if let Some(mut user) = users::Entity::find_by_id(id).one(&ctx.db).await? {
-//!     user.decrypt_fields_ctx::<users::Entity>(&ctx)?;
+//!     user.decrypt_fields_ctx(&ctx)?;
 //!     println!("{}", user.ssn); // Decrypted
 //! }
 //! ```
 //!
 //! **Note**: `SeaORM`'s `ActiveModelBehavior::before_save` hook has no access
-//! to the `AppContext`, so encryption is invoked explicitly via
-//! `encrypt_fields_ctx` before save rather than from the hook.
+//! to the `AppContext`, so the encrypted persistence methods run the hook,
+//! encrypt its result, and then perform the database write.
 //!
 //! # Encrypted Value Format
 //!
-//! Encrypted values are stored as JSON (Rails-compatible):
+//! Encrypted values are stored as Rails-shaped JSON:
 //!
 //! ```json
 //! {
@@ -95,7 +95,7 @@
 //!     "iv": "base64-encoded-iv",
 //!     "at": "base64-encoded-auth-tag",
 //!     "v": 1,
-//!     "i": "primary"
+//!     "i": "630dcd29"
 //!   }
 //! }
 //! ```
@@ -107,19 +107,17 @@
 //! - Generate keys with: `openssl rand -hex 32`
 //! - Configure `previous_keys` for zero-downtime key rotation
 
-pub mod cipher;
+mod cipher;
 pub mod config;
 pub mod encryptable;
 pub mod errors;
-pub mod format;
+mod format;
 pub mod key_provider;
 pub mod registry;
 pub mod scope;
 
 // Re-export main types for convenience
-pub use cipher::{
-    decrypt, encrypt, encrypt_deterministic, parse_hex_key, KEY_SIZE, NONCE_SIZE, TAG_SIZE,
-};
+pub use cipher::COMPRESS_THRESHOLD;
 pub use config::EncryptionConfig;
 pub use encryptable::{
     decrypt_field, encrypt_field, encrypt_query_value, ColumnValue, Encryptable, EncryptableValue,
@@ -142,6 +140,21 @@ pub use scope::RowScope;
 ///     [ssn, email(deterministic), bio(no_compress)],
 ///     aad_namespace = "users",
 /// );
+/// ```
+///
+/// Duplicate encrypted fields, duplicate `aad_fields`, and overlap between
+/// an encrypted field and an `aad_fields` entry are rejected at compile time:
+///
+/// ```compile_fail
+/// # use loco_rs::impl_encryptable_fields;
+/// # use sea_orm::entity::prelude::*;
+/// # #[derive(Clone, Debug, PartialEq, DeriveEntityModel)]
+/// # #[sea_orm(table_name = "users")]
+/// # pub struct Model { #[sea_orm(primary_key)] pub id: i64, pub ssn: String }
+/// # #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+/// # pub enum Relation {}
+/// # impl ActiveModelBehavior for ActiveModel {}
+/// impl_encryptable_fields!(ActiveModel, [ssn, ssn], aad_namespace = "users");
 /// ```
 ///
 /// Each field is one of:
@@ -180,8 +193,8 @@ pub use scope::RowScope;
 /// );
 /// ```
 ///
-/// The referenced columns must implement `serde::Serialize` and serialize to
-/// a JSON scalar (a `Uuid` renders as its hyphenated lowercase string). On
+/// The referenced `SeaORM` columns must convert to a JSON scalar (a `Uuid`
+/// renders as its hyphenated lowercase string). On
 /// save, a scope column that is `NotSet` while an encrypted field holds a
 /// value is an error, and so is a scope column that is `Set` while an
 /// encrypted field is `NotSet`; on read, a missing or null scope column is an
@@ -251,6 +264,14 @@ macro_rules! __impl_encryptable_fields_inner {
         aad_fields = [$($scope:ident),*],
         provider_for = [$($provider_for:path)?]
     ) => {
+        const _: () = {
+            #[allow(dead_code)]
+            struct EncryptionColumns {
+                $($field: (),)*
+                $($scope: (),)*
+            }
+        };
+
         impl $crate::encryption::Encryptable for $model {
             fn encrypted_fields() -> Vec<String> {
                 vec![$(stringify!($field).to_string()),*]
@@ -316,9 +337,15 @@ macro_rules! __impl_encryptable_fields_inner {
                 #[allow(unused_mut)]
                 let mut scope = $crate::encryption::RowScope::new();
                 $(
-                    match &self.$scope {
+                    let column = stringify!($scope).parse().map_err(|_| {
+                        $crate::encryption::EncryptionError::Scope(format!(
+                            "scope column '{}' is not present on the active model",
+                            stringify!($scope)
+                        ))
+                    })?;
+                    match sea_orm::ActiveModelTrait::get(self, column) {
                         sea_orm::ActiveValue::Set(v) | sea_orm::ActiveValue::Unchanged(v) => {
-                            scope.insert(stringify!($scope), v)?;
+                            scope.insert_sea_value(stringify!($scope), &v)?;
                         }
                         sea_orm::ActiveValue::NotSet => {
                             return Err($crate::encryption::EncryptionError::Scope(format!(
@@ -331,10 +358,29 @@ macro_rules! __impl_encryptable_fields_inner {
                 Ok(scope)
             }
 
-            fn row_scope_from_json(
-                row: &$crate::encryption::scope::Value,
-            ) -> $crate::encryption::EncryptionResult<$crate::encryption::RowScope> {
-                $crate::encryption::RowScope::from_json_row(row, &[$(stringify!($scope)),*])
+            fn row_scope_from_model<M>(
+                row: &M,
+            ) -> $crate::encryption::EncryptionResult<$crate::encryption::RowScope>
+            where
+                M: sea_orm::ModelTrait<
+                    Entity = <Self as sea_orm::ActiveModelTrait>::Entity,
+                >,
+            {
+                #[allow(unused_mut)]
+                let mut scope = $crate::encryption::RowScope::new();
+                $(
+                    let column = stringify!($scope).parse().map_err(|_| {
+                        $crate::encryption::EncryptionError::Scope(format!(
+                            "scope column '{}' is not present on the model",
+                            stringify!($scope)
+                        ))
+                    })?;
+                    scope.insert_sea_value(
+                        stringify!($scope),
+                        &sea_orm::ModelTrait::get(row, column),
+                    )?;
+                )*
+                Ok(scope)
             }
 
             fn scope_changed(&self) -> bool {

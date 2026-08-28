@@ -2,8 +2,8 @@
 //!
 //! [`RowScope`] carries the values of the columns an `Encryptable` model
 //! names in `aad_fields = [...]` (for example a tenant id). Both sides of
-//! the round trip derive it — the `ActiveModel` on encrypt, the `Model`'s
-//! JSON on decrypt — and feed it into the AES-GCM associated data, so a
+//! the round trip derive it — the `ActiveModel` on encrypt and the `Model` on
+//! decrypt — and feed it into the AES-GCM associated data, so a
 //! ciphertext copied onto a row with different scope values fails
 //! authentication. The same scope is what `Encryptable::provider_for` uses
 //! to pick a per-row key provider.
@@ -15,11 +15,11 @@ use super::errors::{EncryptionError, EncryptionResult};
 
 /// Ordered `(column, value)` pairs that scope a row's ciphertexts.
 ///
-/// Values are JSON scalars only (string, number, bool). Rendering goes
-/// through `serde_json` on both the encrypt and decrypt side, so a `Uuid`
-/// column is always its hyphenated lowercase string form; raw bytes, arrays,
-/// objects, and `null` are rejected because they have no single canonical
-/// byte encoding.
+/// Values are JSON scalars only (string, number, bool). The model macro
+/// converts `SeaORM` values to the same JSON representation on both the encrypt
+/// and decrypt paths, so a `Uuid` column is always its hyphenated lowercase
+/// string form. Raw bytes, arrays, objects, and `null` are rejected because
+/// they have no single canonical byte encoding.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RowScope {
     entries: Vec<(String, Value)>,
@@ -58,6 +58,35 @@ impl RowScope {
     ) -> EncryptionResult<()> {
         let column = column.into();
         let value = serde_json::to_value(value)?;
+        Self::check_scalar(&column, &value)?;
+        self.entries.push((column, value));
+        Ok(())
+    }
+
+    /// Add a scope value read from a `SeaORM` model.
+    ///
+    /// This is public for macro expansion in application crates. Use
+    /// [`insert`](Self::insert) when building a scope directly.
+    ///
+    /// # Errors
+    /// Returns [`EncryptionError::Scope`] for byte and array columns, `NULL`,
+    /// or any value that does not convert to a JSON scalar.
+    #[doc(hidden)]
+    pub fn insert_sea_value(
+        &mut self,
+        column: impl Into<String>,
+        value: &sea_orm::Value,
+    ) -> EncryptionResult<()> {
+        let column = column.into();
+        if matches!(
+            value,
+            sea_orm::Value::Bytes(_) | sea_orm::Value::Array(_, _)
+        ) {
+            return Err(EncryptionError::Scope(format!(
+                "scope column '{column}' must be a string, number, or bool"
+            )));
+        }
+        let value = sea_orm::sea_query::sea_value_to_json_value(value);
         Self::check_scalar(&column, &value)?;
         self.entries.push((column, value));
         Ok(())
@@ -242,5 +271,11 @@ mod tests {
         let none: Option<i32> = None;
         assert!(RowScope::new().with("org_id", &none).is_err());
         assert!(RowScope::new().with("org_id", &Some(3)).is_ok());
+    }
+
+    #[test]
+    fn sea_value_bytes_are_rejected_without_utf8_conversion() {
+        let bytes = sea_orm::Value::Bytes(Some(vec![0xff]));
+        assert!(RowScope::new().insert_sea_value("org_id", &bytes).is_err());
     }
 }

@@ -15,7 +15,11 @@ top = false
 flair =[]
 +++
 
-Loco ships with column-level encryption for your models. You declare which fields hold sensitive data, and Loco encrypts them before they hit the database. Encryption happens automatically when you save; decryption is **explicit** — you call `decrypt_fields_ctx` on a loaded model rather than having the getter decrypt for you. This is the one workflow difference from Rails' Active Record Encryption, whose attribute readers decrypt transparently. The cryptographic design otherwise follows Rails, with one notable difference: Loco uses HKDF-SHA256 instead of PBKDF2 for per-field key derivation.
+Loco ships with optional column-level encryption for your models. You declare which fields hold sensitive data, then use `insert_encrypted`, `update_encrypted`, or `save_encrypted` so encryption and persistence stay in one operation. Decryption is **explicit** — call `decrypt_fields_ctx` on a loaded model before reading its encrypted fields.
+
+The feature supplies the core Rails Active Record Encryption workflow: random and deterministic encryption, equality queries, compression, authenticated row scopes, custom providers, and lazy primary-key rotation. It is Rails-shaped, not Rails wire-compatible. Loco uses HKDF-SHA256 field keys and its own authenticated envelope details, and Rust does not support transparent attribute getters like Ruby does.
+
+This initial scope does not include transparent ordinary `save`/`find` calls, plaintext-and-ciphertext coexistence during migrations, case-folded deterministic fields, arbitrary attribute serializers, automatic request-parameter filtering, or block-scoped encryption contexts. Use the explicit encrypted persistence and decryption methods described below; add application-level normalization and log redaction where your data flow needs them.
 
 ## What it protects against
 
@@ -26,6 +30,12 @@ It does **not** protect against a compromised application server. The app holds 
 Under the hood, Loco uses AES-256-GCM, an AEAD cipher. Each ciphertext carries an authentication tag, so any tampering with the stored bytes will fail decryption rather than silently return garbage.
 
 ## Configuration
+
+Enable the optional feature on the application dependency first:
+
+```toml
+loco-rs = { version = "1", features = ["encryption"] }
+```
 
 Encryption is configured per environment in your `config/<env>.yaml`:
 
@@ -50,7 +60,7 @@ openssl rand -hex 32
 
 `deterministic_key` is the master key for fields in deterministic mode (see below). It must differ from `primary_key` and from every `previous_keys` entry; a shared key across the two modes would risk AES-GCM nonce reuse.
 
-`key_derivation_salt` feeds HKDF-SHA256. No field is ever encrypted with a master key directly: each field uses a subkey derived from the master, the salt, and the column name. A leaked subkey for column `ssn` cannot decrypt ciphertexts from a column with a different name. Derivation is keyed by column name only, not `(table, column)`; the AAD namespace (below) is what separates tables. The salt is a stable, environment-scoped secret: changing it invalidates every existing ciphertext.
+`key_derivation_salt` feeds HKDF-SHA256. The built-in config provider never encrypts a field with a master key directly: each field uses a subkey derived from the master, the salt, and the column name. A leaked subkey for column `ssn` cannot decrypt ciphertexts from a column with a different name. Derivation is keyed by column name only, not `(table, column)`; the AAD namespace (below) is what separates tables. The salt is a stable, environment-scoped secret: changing it invalidates every existing ciphertext.
 
 `previous_keys` lists retired primary keys. Reads fall back through the list; writes always use the current primary. Leave it empty for a greenfield app.
 
@@ -92,31 +102,33 @@ Both `String` (`ssn:string!:encrypted`) and nullable `Option<String>` (`ssn:stri
 
 ## Saving and reading encrypted models
 
-Encryption is explicit at the call site. You build an `ActiveModel` as usual, then call `encrypt_fields_ctx` before saving:
+Build an `ActiveModel` as usual, then use the matching encrypted persistence method:
 
 ```rust
 use loco_rs::prelude::*;
 
-// Save
+// Encrypt and insert
 let active = users::ActiveModel {
     ssn: Set(ssn),
     ..Default::default()
 };
-let user = active.encrypt_fields_ctx(&ctx)?.insert(&ctx.db).await?;
+let user = active.insert_encrypted(&ctx).await?;
 ```
 
-`encrypt_fields_ctx` walks the active model, encrypts every registered field that holds a value, and returns the active model with those fields rewritten to ciphertext. `NotSet` fields are left alone, so partial updates work the same as they always have in SeaORM. `Unchanged` fields are processed too: SeaORM's `insert` writes them, so a decrypted `Model` turned back into an `ActiveModel` does not leak its plaintext. A value that is already a current envelope is kept byte-for-byte, which makes the call idempotent.
+`insert_encrypted`, `update_encrypted`, and `save_encrypted` run SeaORM's `before_save` hook, encrypt the resulting active model, perform the matching database operation, and then run `after_save`. Running the hook first lets validation and normalization operate on plaintext and prevents a hook from replacing an encrypted value after the encryption step. This also avoids a split normal path where a caller can transform the model and then forget to persist the transformed value. The lower-level `encrypt_fields_ctx` remains available for custom writes, including conditional `ON CONFLICT` upserts.
+
+The encryption step walks the active model and rewrites every registered field that holds a value. `NotSet` fields are left alone, so partial updates work like normal SeaORM updates. `Unchanged` fields are processed too: SeaORM's `insert` writes them, so a decrypted `Model` turned back into an `ActiveModel` does not leak its plaintext. A value that is already a current envelope is kept byte-for-byte, which makes repeated calls idempotent.
 
 Reading is the symmetric operation:
 
 ```rust
 if let Some(mut user) = users::Entity::find_by_id(id).one(&ctx.db).await? {
-    user.decrypt_fields_ctx::<users::Entity>(&ctx)?;
+    user.decrypt_fields_ctx(&ctx)?;
     println!("{}", user.ssn);
 }
 ```
 
-`decrypt_fields_ctx` mutates the model in place. After it returns, the encrypted columns hold the original plaintext. The turbofish (`::<users::Entity>`) tells the helper which entity's field set to operate on; this is needed because `decrypt_fields_ctx` works on the generated `Model`, which doesn't carry its `Entity` as a type parameter.
+`decrypt_fields_ctx` mutates the model in place. After it returns, the encrypted columns hold the original plaintext. SeaORM's `ModelTrait` identifies the model's entity and exposes its columns, so no entity turbofish or Serde round-trip is needed.
 
 Reads fail closed. Every registered field must be present on the model, and each must hold `NULL` or a valid envelope: a plaintext string in an encrypted column is an error, not a passthrough. The only plaintext-to-envelope transition is the save path, so a row written around the model layer surfaces on its first read instead of being served as if it had been decrypted.
 
@@ -177,11 +189,11 @@ Rotation works by stacking keys. To rotate:
 3. Move the old `primary_key` to the front of `previous_keys`.
 4. Restart the app.
 
-From that moment on, every new write uses the new key. Reads of older rows fail to decrypt under the new primary, fall through to `previous_keys`, find a match, and succeed. The envelope's `h.i` field records a label of the key used for the write, and decryption walks the configured key list in order — primary first, then each previous key — until GCM authentication succeeds. There's no separate index over key ids, so a row that lands on the last entry of `previous_keys` costs `len(previous_keys)` AES-GCM decryption attempts. In practice this is microseconds and not worth pre-routing on `h.i`, but it's why long `previous_keys` lists are worth pruning after re-encryption.
+From that moment on, every new write uses the new key. Reads of older rows use the envelope's authenticated `h.i` key fingerprint to try the matching configured key first, then fall back through the full key list until GCM authentication succeeds. The fallback keeps custom providers and older envelopes without an id readable. A forged key id cannot redirect decryption because `h.i` is part of the authenticated data.
 
-Rows also **migrate lazily on save**, matching Rails' previous-encryption-schemes behavior: when `encrypt_fields_ctx` sees a value that is already an envelope, it keeps it untouched if it is current, but transparently decrypts and re-encrypts it under the current scheme when it was written under a `previous_keys` entry or when the field's mode changed (a random-IV envelope on a field now marked deterministic, or the reverse). A deterministic envelope on a deterministic field is always current, since that key does not rotate. An envelope that none of the configured keys can decrypt fails the save instead of being persisted unreadable; that surfaces a prematurely-pruned `previous_keys` entry (or, for AAD-bound fields, a relocated ciphertext) at write time.
+Rows also **migrate lazily on save**, matching Rails' previous-encryption-schemes behavior: when an encrypted persistence method sees a value that is already an envelope, it keeps it untouched if it is current, but decrypts and re-encrypts it under the current scheme when it was written under a `previous_keys` entry or when the field's mode changed (a random-IV envelope on a field now marked deterministic, or the reverse). A deterministic envelope on a deterministic field is always current, since that key does not rotate. An envelope that none of the configured keys can decrypt fails the save instead of being persisted unreadable; that surfaces a prematurely-pruned `previous_keys` entry (or, for AAD-bound fields, a relocated ciphertext) at write time.
 
-To actively finish a rotation — rewrite every old row rather than waiting for organic saves — page through the table, call `encrypt_fields_ctx` on each row's `ActiveModel` with the stored (encrypted) values `Set`, and save it back. Once every row has been re-encrypted, drop the old key from `previous_keys`.
+To actively finish a rotation — rewrite every old row rather than waiting for organic saves — page through the table, put the stored envelopes into each row's `ActiveModel` as `Set`, and call `update_encrypted`. Once every row has been re-encrypted, drop the old key from `previous_keys`.
 
 Deterministic keys cannot be rotated. This matches Rails' behavior and follows from the design: deterministic ciphertexts are a function of `(plaintext, deterministic_key)`, and any equality query you run has to use the same key the data was written with. If you rotate the deterministic key, every existing query helper stops matching existing rows. If you absolutely have to rotate it, you must re-encrypt every deterministic column in lockstep with the configuration change, which usually means downtime or a careful dual-write migration.
 
@@ -208,11 +220,11 @@ impl_encryptable_fields!(
 );
 ```
 
-The AAD for `credentials` becomes `integration_credential:credentials` followed by `\0org_id=<json>` for each listed column, in declaration order, where `<json>` is the value's JSON text — strings quoted (`"6f96…"`), numbers and booleans bare. Values are rendered through `serde_json` on both the save path (from the `ActiveModel`) and the read path (from the `Model`), so they agree byte-for-byte: a `Uuid` is its quoted hyphenated lowercase string. Quoting makes the encoding injective — the string `"7"` and the number `7` bind differently, and a string cannot spell a second entry. Only scalar columns are accepted; `Option` columns must be `Some`.
+The AAD for `credentials` becomes `integration_credential:credentials` followed by `\0org_id=<json>` for each listed column, in declaration order, where `<json>` is the value's JSON text — strings quoted (`"6f96…"`), numbers and booleans bare. The macro converts SeaORM values to the same JSON representation on the save and read paths, so they agree byte-for-byte: a `Uuid` is its quoted hyphenated lowercase string. Quoting makes the encoding injective — the string `"7"` and the number `7` bind differently, and a string cannot spell a second entry. Only scalar columns are accepted; `Option` columns must be `Some`.
 
 The rules are strict on purpose. On save, a scope column that is `NotSet` while an encrypted field holds a value is an error, and so is a scope column that is `Set` while an encrypted field is `NotSet` — moving a row to another tenant must re-supply every encrypted field, or the ciphertexts left behind would be bound to the old scope. A partial update that touches no encrypted column and leaves the scope `NotSet` or `Unchanged` is fine. On read, a missing or `null` scope column is an error. Silently binding to an empty scope would write rows that later fail to decrypt.
 
-An `ON CONFLICT` upsert that must `Set` the scope column but intentionally leaves an encrypted field `NotSet` (the column is excluded from the conflict update set, so the stored ciphertext stays valid) trips this rule. Call `encrypt_fields` only when the caller supplied a new value for the encrypted field; when none is supplied, skip it and save the model as-is.
+An `ON CONFLICT` upsert that must `Set` the scope column but intentionally leaves an encrypted field `NotSet` trips this rule. If the scope is part of the conflict key and the encrypted column is excluded from the conflict update set, the existing row cannot move and its stored ciphertext stays valid. In that specific branch, call `encrypt_fields_ctx` only when the caller supplied a new encrypted value; when none is supplied, skip encryption and execute the upsert with the encrypted column omitted. Keep the strict default for normal inserts and updates because an `ActiveModel` alone cannot prove the upsert's conflict semantics.
 
 Deterministic fields on a scoped model are bound to the scope as well, so the same plaintext under two tenants is two different ciphertexts. Pass the same scope values to `encrypt_query_value`; a scope missing one of the model's columns is an error rather than a query that never matches:
 
@@ -221,7 +233,7 @@ let scope = RowScope::new().with("org_id", &org_id)?;
 let needle = encrypt_query_value::<credentials::Entity>("external_id", &input, &ctx, &scope)?;
 ```
 
-`Encryptable::row_scope` / `row_scope_from_json` are the generated hooks; implement them by hand if your scope is not a plain list of columns. Outside the model layer, `encrypt_field` / `decrypt_field` take the AAD bytes directly: `scope.field_aad(ActiveModel::field_aad("credentials"))` reproduces what the model layer binds.
+`Encryptable::row_scope` / `row_scope_from_model` are the generated hooks; implement them by hand if your scope is not a plain list of columns. Outside the model layer, `encrypt_field` / `decrypt_field` take the AAD bytes directly: `scope.field_aad(ActiveModel::field_aad("credentials"))` reproduces what the model layer binds.
 
 Finally, AES-GCM with random IVs has a birthday-bound limit. Roughly: after about 2^32 encryptions under a single key, the probability of an IV collision becomes non-negligible. If you are encrypting at that scale, rotate keys before you get there. For most applications this is far beyond anything you'll hit, but it is the reason to take key rotation seriously even when nothing has gone wrong.
 
@@ -230,16 +242,16 @@ Finally, AES-GCM with random IVs has a birthday-bound limit. Roughly: after abou
 Each encrypted value is a JSON envelope stored as text:
 
 ```json
-{"p": "<base64-ciphertext>", "h": {"v": 1, "iv": "<b64>", "at": "<b64>", "i": "primary", "d": true}}
+{"p": "<base64-ciphertext>", "h": {"v": 1, "iv": "<b64>", "at": "<b64>", "i": "630dcd29"}}
 ```
 
 The fields are:
 
 - `p` — the base64-encoded ciphertext.
-- `h.v` — envelope version, always `1`. The version and the `d`/`c` flags are folded into the AES-GCM authenticated data, so a storage-layer attacker cannot flip them to force a mis-decryption or to suppress decompression — tampering with any of them fails authentication. There is exactly one accepted version: an envelope with any other `v` is rejected as malformed rather than read under a fallback scheme. A future format change bumps the version together with an explicit migration.
+- `h.v` — envelope version, always `1`. The version, key id, and `d`/`c` flags are folded into the AES-GCM authenticated data, so a storage-layer attacker cannot change them to force a mis-decryption or suppress decompression. There is exactly one accepted version: an envelope with any other `v` is rejected as malformed rather than read under a fallback scheme. A future format change bumps the version together with an explicit migration.
 - `h.iv` — base64-encoded IV (12 bytes, as required by GCM).
 - `h.at` — base64-encoded authentication tag.
-- `h.i` — key id label: what the provider's `get_key_id()` returned for a random-IV value (`"primary"` for the config-driven provider), or `"deterministic"` for values written under the deterministic key. The field name `i` matches Rails' envelope shape, though the value is a semantic label rather than Rails' key fingerprint, so envelopes are not wire-compatible across the two stacks.
+- `h.i` — key id: what the provider's `get_key_id()` returned for a random-IV value (the first 8 hexadecimal characters of SHA-256 over the master key for the config provider), or `"deterministic"` for values written under the deterministic key. It is an authenticated selection hint, not a secret.
 - `h.d` — `true` if the value was encrypted with the deterministic key, `false` or absent otherwise.
 - `h.c` — `true` if the plaintext was zlib-compressed before encryption, `false` or absent otherwise.
 
@@ -247,7 +259,7 @@ You shouldn't need to parse this yourself. It's documented because the format is
 
 ## Custom key providers
 
-The `KeyProvider` trait is public. If you want keys to come from somewhere other than the YAML config — AWS KMS, HashiCorp Vault, an HSM, an internal secrets service — you can implement the trait and register your provider during application boot:
+The `KeyProvider` trait is public. If you want key material to come from somewhere other than the YAML config — AWS KMS data keys, HashiCorp Vault, or an internal secrets service — you can implement the trait and register your provider during application boot:
 
 ```rust
 async fn after_context(ctx: AppContext) -> Result<AppContext> {
@@ -256,7 +268,7 @@ async fn after_context(ctx: AppContext) -> Result<AppContext> {
 }
 ```
 
-`Hooks::after_context` runs after the config-driven provider (if any) has been registered, so `install` replaces it for that context. There is no process-wide provider: each `AppContext` carries its own, and a context without one reports `NotConfigured` instead of borrowing another's key. Once installed, a custom provider replaces the YAML-driven one wholesale; the rest of the encryption machinery (envelope format, deterministic mode, key derivation, rotation through `previous_keys`) is unchanged. This is the supported extension point for organizations that want centralized key management without giving up the rest of the feature.
+`Hooks::after_context` runs after the config-driven provider (if any) has been registered, so `install` replaces it for that context. There is no process-wide provider: each `AppContext` carries its own, and a context without one reports `NotConfigured` instead of borrowing another's key. Once installed, a custom provider replaces the YAML-driven one wholesale; the envelope format and deterministic-mode dispatch stay the same, while key derivation and the rotation list follow the provider's `derive_field_key` and `get_decryption_keys` implementations. This is the supported extension point for organizations that want centralized key management without giving up the rest of the feature.
 
 ### Per-row key providers
 
@@ -284,4 +296,4 @@ The hook is synchronous. Building a tenant's provider usually needs I/O — read
 
 A hook declared through the macro is fail-closed: `Ok(None)` becomes an error instead of falling back to the global provider, which would write the row under a key the tenant does not own and read it back successfully. Only the trait's default (no `provider_for` declared) means "use the registry".
 
-The per-tenant provider still implements the whole `KeyProvider` trait, so retired tenant keys go in `get_decryption_keys()` after the active key (the first entry must be the current one), and rows written under a retired key re-encrypt under the active key on their next save, as described under [Key rotation](#key-rotation). `h.i` records whatever `get_key_id()` returns for random-IV values — a tenant key's row id is a reasonable choice — and `"deterministic"` for deterministic ones. The explicit-provider methods (`encrypt_fields(&p)`, `decrypt_fields::<E, _>(&p)`) bypass `provider_for` entirely; use them when you already hold the tenant's provider.
+The per-tenant provider still implements the whole `KeyProvider` trait, so retired tenant keys go in `get_decryption_keys()` after the active key (the first entry must be the current one), and rows written under a retired key re-encrypt under the active key on their next save, as described under [Key rotation](#key-rotation). `h.i` records whatever `get_key_id()` returns for random-IV values — a tenant key's row id is a reasonable choice — and `"deterministic"` for deterministic ones. The explicit-provider methods (`encrypt_fields(&p)`, `decrypt_fields(&p)`) bypass `provider_for` entirely; use them when you already hold the tenant's provider.

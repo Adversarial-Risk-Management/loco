@@ -39,7 +39,8 @@ pub fn generate(
         return Err(Error::Message(format!(
             "scaffold does not support `:encrypted` fields (`{}`): the generated controller \
              would store and return the plaintext. Use `generate model` and write the \
-             controller with `encrypt_fields_ctx` / `decrypt_fields_ctx`.",
+             controller with `insert_encrypted` / `update_encrypted` / `save_encrypted` for \
+             writes and `decrypt_fields_ctx` for reads.",
             col.name
         )));
     }

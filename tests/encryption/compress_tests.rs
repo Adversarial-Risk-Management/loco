@@ -1,7 +1,7 @@
 //! Compression integration tests.
 
-use loco_rs::encryption::{format::EncryptedValue, Encryptable, ModelDecryption};
-use sea_orm::{ActiveModelTrait, ConnectionTrait, DatabaseConnection, EntityTrait, Set, Statement};
+use loco_rs::encryption::{Encryptable, EncryptedValue, ModelDecryption};
+use sea_orm::{ConnectionTrait, DatabaseConnection, EntityTrait, Set, Statement};
 
 use super::{
     compress_entity::{ActiveModel, Entity, Model},
@@ -20,14 +20,10 @@ async fn insert(ctx: &loco_rs::app::AppContext, bio: &str, note: &str) -> Model 
         note: Set(note.into()),
         ..Default::default()
     };
-    am.encrypt_fields_ctx(ctx)
-        .unwrap()
-        .insert(&ctx.db)
-        .await
-        .unwrap()
+    am.insert_encrypted(ctx).await.unwrap()
 }
 
-async fn raw(db: &DatabaseConnection, id: i32, col: &str) -> String {
+async fn raw(db: &DatabaseConnection, id: i64, col: &str) -> String {
     let stmt = Statement::from_sql_and_values(
         db.get_database_backend(),
         format!("SELECT {col} FROM long_documents WHERE id = ?"),
@@ -49,7 +45,7 @@ async fn long_compressed_field_round_trips() {
         .await
         .unwrap()
         .unwrap();
-    model.decrypt_fields_ctx::<Entity>(&ctx).unwrap();
+    model.decrypt_fields_ctx(&ctx).unwrap();
     assert_eq!(model.bio, bio);
     assert_eq!(model.note, note);
 }
@@ -109,6 +105,6 @@ async fn short_compressed_plaintext_is_stored_uncompressed() {
         .await
         .unwrap()
         .unwrap();
-    model.decrypt_fields_ctx::<Entity>(&ctx).unwrap();
+    model.decrypt_fields_ctx(&ctx).unwrap();
     assert_eq!(model.bio, bio);
 }

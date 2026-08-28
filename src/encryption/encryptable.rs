@@ -31,28 +31,31 @@
 //! ```rust,ignore
 //! use loco_rs::prelude::*;
 //!
-//! // Save with encryption
+//! // Encrypt and save
 //! let active = users::ActiveModel { ssn: Set(ssn), ..Default::default() };
-//! let user = active.encrypt_fields_ctx(&ctx)?.insert(&ctx.db).await?;
+//! let user = active.insert_encrypted(&ctx).await?;
 //!
 //! // Find and decrypt
 //! if let Some(mut user) = users::Entity::find_by_id(id).one(&ctx.db).await? {
-//!     user.decrypt_fields_ctx::<users::Entity>(&ctx)?;
+//!     user.decrypt_fields_ctx(&ctx)?;
 //!     println!("{}", user.ssn);
 //! }
 //! ```
 //!
 //! The provider is registered automatically at boot when `config.encryption`
-//! is present. For custom providers (KMS, Vault, HSM), call
+//! is present. For custom providers that load key material from KMS, Vault, or
+//! another secret store, call
 //! [`crate::encryption::registry::install`] in your `Hooks::after_context`
 //! implementation.
 //!
 //! **Note**: `SeaORM`'s `ActiveModelBehavior::before_save` hook has no access
-//! to the `AppContext`, so encryption is invoked explicitly via
-//! `encrypt_fields_ctx` rather than from the hook.
+//! to the `AppContext`, so the encrypted persistence methods run the hook,
+//! encrypt its result, and then perform the database write.
 
-use sea_orm::{ActiveModelTrait, EntityTrait};
-use serde::{de::DeserializeOwned, Serialize};
+use sea_orm::{
+    ActiveModelBehavior, ActiveModelTrait, EntityTrait, IntoActiveModel, Iterable, ModelTrait,
+    PrimaryKeyToColumn, Value,
+};
 
 use super::{
     cipher::{decrypt, encrypt, encrypt_compressed, encrypt_deterministic},
@@ -103,7 +106,7 @@ impl EncryptableValue for Option<String> {
 /// The state of one encrypted column on an `ActiveModel`, as seen by
 /// [`Encryptable::encrypt_fields`].
 ///
-/// `Set` and `Unchanged` are not distinguished: SeaORM's `insert` writes
+/// `Set` and `Unchanged` are not distinguished: `SeaORM`'s `insert` writes
 /// `Unchanged` columns too, so an `Unchanged` plaintext (a decrypted `Model`
 /// turned back into an `ActiveModel`) must be encrypted like a `Set` one.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -136,15 +139,27 @@ fn decrypt_envelope<P: KeyProvider + ?Sized>(
     envelope_json: &str,
     aad: &[u8],
 ) -> EncryptionResult<Decrypted> {
-    let masters: Vec<SecureKey> = if envelope.is_deterministic() {
-        provider.get_deterministic_key()?.into_iter().collect()
+    let mut masters: Vec<(SecureKey, Option<String>, bool)> = if envelope.is_deterministic() {
+        provider
+            .get_deterministic_key()?
+            .into_iter()
+            .map(|key| (key, None, true))
+            .collect()
     } else {
         provider
             .get_decryption_keys()?
             .into_iter()
-            .map(|(master, _key_id)| master)
+            .enumerate()
+            .map(|(index, (master, key_id))| (master, key_id, index == 0))
             .collect()
     };
+    if let Some(key_id) = envelope.key_id()
+        && let Some(index) = masters
+            .iter()
+            .position(|(_, candidate_id, _)| candidate_id.as_deref() == Some(key_id))
+    {
+        masters.swap(0, index);
+    }
     if masters.is_empty() {
         return Err(EncryptionError::NotConfigured(format!(
             "field '{field_name}' holds a deterministic ciphertext but the provider has no \
@@ -153,7 +168,7 @@ fn decrypt_envelope<P: KeyProvider + ?Sized>(
     }
 
     let mut last_error = None;
-    for (i, master) in masters.iter().enumerate() {
+    for (key_index, (master, _, current_key)) in masters.iter().enumerate() {
         match provider
             .derive_field_key(master, field_name)
             .and_then(|key| decrypt(envelope_json, key.as_bytes(), aad))
@@ -161,11 +176,11 @@ fn decrypt_envelope<P: KeyProvider + ?Sized>(
             Ok(plaintext) => {
                 return Ok(Decrypted {
                     plaintext,
-                    current_key: i == 0,
+                    current_key: *current_key,
                 })
             }
             Err(e) => {
-                tracing::debug!(field = %field_name, key_index = i, error = %e, "decryption attempt failed");
+                tracing::debug!(field = %field_name, key_index, error = %e, "decryption attempt failed");
                 last_error = Some(e);
             }
         }
@@ -242,6 +257,7 @@ fn stale_envelope_plaintext<P: KeyProvider + ?Sized>(
 /// Trait for marking a model as having encryptable fields
 ///
 /// Implement this on your `ActiveModel` to specify which fields should be encrypted.
+#[allow(async_fn_in_trait)]
 pub trait Encryptable: ActiveModelTrait {
     /// Returns the list of field names that should be encrypted
     ///
@@ -279,7 +295,7 @@ pub trait Encryptable: ActiveModelTrait {
     /// Compression is on by default for every non-deterministic field (as in
     /// Rails Active Record Encryption); list a field here to opt it out. It
     /// only ever kicks in when the plaintext is at least
-    /// [`crate::encryption::cipher::COMPRESS_THRESHOLD`] bytes long anyway —
+    /// [`crate::encryption::COMPRESS_THRESHOLD`] bytes long anyway —
     /// smaller values are stored uncompressed because the zlib header overhead
     /// outweighs any savings. The envelope header `h.c` records per-value
     /// whether a given ciphertext was compressed, so moving a field on or off
@@ -323,7 +339,7 @@ pub trait Encryptable: ActiveModelTrait {
     ///
     /// The macro's `aad_fields = [org_id]` argument fills this list and
     /// generates [`row_scope`](Self::row_scope) /
-    /// [`row_scope_from_json`](Self::row_scope_from_json). The values are
+    /// [`row_scope_from_model`](Self::row_scope_from_model). The values are
     /// appended to every field's AAD (see [`RowScope::aad_bytes`]), so a
     /// ciphertext copied onto a row with a different tenant id fails
     /// authentication. Deterministic fields on a scoped model need the same
@@ -357,7 +373,7 @@ pub trait Encryptable: ActiveModelTrait {
         false
     }
 
-    /// Row scope from a `Model` serialized to JSON (the decrypt side).
+    /// Row scope from a `Model` (the decrypt side).
     ///
     /// Must produce byte-identical [`RowScope::aad_bytes`] to
     /// [`row_scope`](Self::row_scope) for the same row.
@@ -365,7 +381,10 @@ pub trait Encryptable: ActiveModelTrait {
     /// # Errors
     /// Returns [`EncryptionError::Scope`] when a scope column is missing,
     /// null, or not a JSON scalar.
-    fn row_scope_from_json(row: &serde_json::Value) -> EncryptionResult<RowScope> {
+    fn row_scope_from_model<M>(row: &M) -> EncryptionResult<RowScope>
+    where
+        M: ModelTrait<Entity = Self::Entity>,
+    {
         let _ = row;
         Ok(RowScope::new())
     }
@@ -439,6 +458,82 @@ pub trait Encryptable: ActiveModelTrait {
         let scope = self.row_scope()?;
         let provider = resolve_provider::<Self>(&scope, ctx)?;
         self.encrypt_fields(&*provider)
+    }
+
+    /// Encrypt this active model and insert it in one operation.
+    ///
+    /// This is the normal persistence path. Keep
+    /// [`encrypt_fields_ctx`](Self::encrypt_fields_ctx) for custom writes such
+    /// as conditional `ON CONFLICT` upserts. `SeaORM`'s `before_save` hook runs
+    /// before encryption and `after_save` runs after the insert.
+    ///
+    /// # Errors
+    /// Returns an error when encryption or the database insert fails.
+    async fn insert_encrypted(
+        self,
+        ctx: &AppContext,
+    ) -> crate::Result<<Self::Entity as EntityTrait>::Model>
+    where
+        Self: Sized + ActiveModelBehavior + Send,
+        <Self::Entity as EntityTrait>::Model: IntoActiveModel<Self>,
+    {
+        let active = ActiveModelBehavior::before_save(self, &ctx.db, true).await?;
+        let active = active.encrypt_fields_ctx(ctx)?;
+        let model = Self::Entity::insert(active)
+            .exec_with_returning(&ctx.db)
+            .await?;
+        Ok(<Self as ActiveModelBehavior>::after_save(model, &ctx.db, true).await?)
+    }
+
+    /// Encrypt this active model and update it in one operation.
+    ///
+    /// `SeaORM`'s `before_save` hook runs before encryption and `after_save`
+    /// runs after the update.
+    ///
+    /// # Errors
+    /// Returns an error when encryption or the database update fails.
+    async fn update_encrypted(
+        self,
+        ctx: &AppContext,
+    ) -> crate::Result<<Self::Entity as EntityTrait>::Model>
+    where
+        Self: Sized + ActiveModelBehavior + Send,
+        <Self::Entity as EntityTrait>::Model: IntoActiveModel<Self>,
+    {
+        let active = ActiveModelBehavior::before_save(self, &ctx.db, false).await?;
+        let active = active.encrypt_fields_ctx(ctx)?;
+        let model = Self::Entity::update(active).exec(&ctx.db).await?;
+        Ok(<Self as ActiveModelBehavior>::after_save(model, &ctx.db, false).await?)
+    }
+
+    /// Encrypt this active model and insert or update it in one operation.
+    ///
+    /// `SeaORM`'s `before_save` hook runs before encryption and `after_save`
+    /// runs after the database write.
+    ///
+    /// # Errors
+    /// Returns an error when encryption or the database save fails.
+    async fn save_encrypted(self, ctx: &AppContext) -> crate::Result<Self>
+    where
+        Self: Sized + ActiveModelBehavior + Send,
+        <Self::Entity as EntityTrait>::Model: IntoActiveModel<Self>,
+    {
+        let insert = <Self::Entity as EntityTrait>::PrimaryKey::iter()
+            .any(|key| self.is_not_set(key.into_column()));
+        let active = ActiveModelBehavior::before_save(self, &ctx.db, insert).await?;
+        let active = active.encrypt_fields_ctx(ctx)?;
+        let model = if insert {
+            Self::Entity::insert(active)
+                .exec_with_returning(&ctx.db)
+                .await?
+        } else {
+            Self::Entity::update(active).exec(&ctx.db).await?
+        };
+        Ok(
+            <Self as ActiveModelBehavior>::after_save(model, &ctx.db, insert)
+                .await?
+                .into_active_model(),
+        )
     }
 
     /// Encrypt all specified fields before saving, using an explicit provider.
@@ -536,54 +631,41 @@ pub trait Encryptable: ActiveModelTrait {
     }
 }
 
-/// Extension trait for decrypting fields on a Model
+/// Extension trait for decrypting fields on a `Model`.
 ///
 /// This trait provides a generic `decrypt_fields` method that works with any
 /// `Model` whose corresponding `ActiveModel` implements `Encryptable`.
-pub trait ModelDecryption: Sized + Serialize + DeserializeOwned {
+pub trait ModelDecryption: ModelTrait {
     /// Decrypt all encrypted fields in-place using the provider resolved from
     /// an [`AppContext`](crate::app::AppContext).
-    ///
-    /// The model round-trips through `serde_json` for runtime field access.
-    /// Every declared field must be present and hold `null` or an envelope;
-    /// see [`decrypt_fields`](Self::decrypt_fields).
     ///
     /// # Errors
     /// Returns an error if no provider resolves, a declared field is missing
     /// or holds a value that is not an envelope, or no key decrypts a value.
-    fn decrypt_fields_ctx<E>(&mut self, ctx: &AppContext) -> EncryptionResult<()>
+    fn decrypt_fields_ctx(&mut self, ctx: &AppContext) -> EncryptionResult<()>
     where
-        E: EntityTrait,
-        <E as EntityTrait>::Model: Serialize + DeserializeOwned,
-        <E as EntityTrait>::ActiveModel: Encryptable,
+        <Self::Entity as EntityTrait>::ActiveModel: Encryptable,
     {
-        let mut value = serde_json::to_value(&self)?;
-        let scope = <<E as EntityTrait>::ActiveModel as Encryptable>::row_scope_from_json(&value)?;
-        let provider = resolve_provider::<<E as EntityTrait>::ActiveModel>(&scope, ctx)?;
-        decrypt_row_fields::<E, _>(&mut value, &scope, &*provider)?;
-        *self = serde_json::from_value(value)?;
-        Ok(())
+        type Active<M> = <<M as ModelTrait>::Entity as EntityTrait>::ActiveModel;
+        let scope = Active::<Self>::row_scope_from_model(self)?;
+        let provider = resolve_provider::<Active<Self>>(&scope, ctx)?;
+        decrypt_row_fields(self, &scope, &*provider)
     }
 
     /// Decrypt all encrypted fields in-place using an explicit provider.
     ///
     /// # Errors
-    /// Returns an error if the model cannot round-trip through JSON, a
-    /// declared field is missing or holds a value that is not an envelope
-    /// (a plaintext in an encrypted column is an error, not a passthrough),
-    /// or no key decrypts a value.
-    fn decrypt_fields<E, P>(&mut self, provider: &P) -> EncryptionResult<()>
+    /// Returns an error if a declared field is missing or holds a value that
+    /// is not an envelope (a plaintext in an encrypted column is an error,
+    /// not a passthrough), or no key decrypts a value.
+    fn decrypt_fields<P>(&mut self, provider: &P) -> EncryptionResult<()>
     where
-        E: EntityTrait,
-        <E as EntityTrait>::Model: Serialize + DeserializeOwned,
-        <E as EntityTrait>::ActiveModel: Encryptable,
+        <Self::Entity as EntityTrait>::ActiveModel: Encryptable,
         P: KeyProvider + ?Sized,
     {
-        let mut value = serde_json::to_value(&self)?;
-        let scope = <<E as EntityTrait>::ActiveModel as Encryptable>::row_scope_from_json(&value)?;
-        decrypt_row_fields::<E, P>(&mut value, &scope, provider)?;
-        *self = serde_json::from_value(value)?;
-        Ok(())
+        type Active<M> = <<M as ModelTrait>::Entity as EntityTrait>::ActiveModel;
+        let scope = Active::<Self>::row_scope_from_model(self)?;
+        decrypt_row_fields(self, &scope, provider)
     }
 }
 
@@ -596,59 +678,57 @@ fn resolve_provider<A: Encryptable>(
     A::provider_for(scope, ctx)?.map_or_else(|| registry::require(ctx), Ok)
 }
 
-/// Decrypt every encrypted field of a model serialized as a JSON object,
-/// in place. Shared by the ctx-aware and explicit-provider entry points.
+/// Decrypt every encrypted field of a model in place. Shared by the ctx-aware
+/// and explicit-provider entry points.
 ///
-/// Every declared field must be present in the JSON. `null` (a nullable
-/// column with no value) is left alone; any other value must be a valid
-/// envelope. A plaintext string in an encrypted column is an error: the only
-/// plaintext-to-envelope transition is the save path.
-fn decrypt_row_fields<E, P>(
-    value: &mut serde_json::Value,
-    scope: &RowScope,
-    provider: &P,
-) -> EncryptionResult<()>
+/// Every declared field must name a model column. `NULL` is left alone; any
+/// other value must be a valid envelope in a string column. A plaintext string
+/// in an encrypted column is an error: the only plaintext-to-envelope
+/// transition is the save path.
+fn decrypt_row_fields<M, P>(model: &mut M, scope: &RowScope, provider: &P) -> EncryptionResult<()>
 where
-    E: EntityTrait,
-    <E as EntityTrait>::ActiveModel: Encryptable,
+    M: ModelTrait,
+    <M::Entity as EntityTrait>::ActiveModel: Encryptable,
     P: KeyProvider + ?Sized,
 {
-    let obj = value.as_object_mut().ok_or_else(|| {
-        EncryptionError::DecryptionFailed("failed to convert model to JSON object".into())
-    })?;
-
-    for field_name in <<E as EntityTrait>::ActiveModel as Encryptable>::encrypted_fields() {
-        let Some(stored) = obj.get_mut(&field_name) else {
-            return Err(EncryptionError::InvalidFormat(format!(
-                "encrypted field '{field_name}' is not present on the model (check the \
-                 field list and any `#[serde(rename)]`)"
-            )));
-        };
-        if stored.is_null() {
-            continue;
-        }
-        let envelope_json = stored.as_str().ok_or_else(|| {
+    type Active<M> = <<M as ModelTrait>::Entity as EntityTrait>::ActiveModel;
+    let mut decrypted_model = model.clone();
+    for field_name in Active::<M>::encrypted_fields() {
+        let column = field_name.parse().map_err(|_| {
             EncryptionError::InvalidFormat(format!(
-                "encrypted field '{field_name}' is not a string column"
+                "encrypted field '{field_name}' is not a column on the model"
             ))
         })?;
-        let envelope = EncryptedValue::parse_column(envelope_json)?.ok_or_else(|| {
+        let envelope_json = match model.get(column) {
+            Value::String(None) => continue,
+            Value::String(Some(value)) => value,
+            _ => {
+                return Err(EncryptionError::InvalidFormat(format!(
+                    "encrypted field '{field_name}' is not a string column"
+                )))
+            }
+        };
+        let envelope = EncryptedValue::parse_column(&envelope_json)?.ok_or_else(|| {
             EncryptionError::InvalidFormat(format!(
                 "encrypted field '{field_name}' holds a value that is not an encryption \
                  envelope"
             ))
         })?;
-        let aad = scope.field_aad(<<E as EntityTrait>::ActiveModel as Encryptable>::field_aad(
-            &field_name,
-        ));
-        let decrypted = decrypt_envelope(provider, &field_name, &envelope, envelope_json, &aad)?;
-        *stored = serde_json::Value::String(decrypted.plaintext);
+        let aad = scope.field_aad(Active::<M>::field_aad(&field_name));
+        let decrypted = decrypt_envelope(provider, &field_name, &envelope, &envelope_json, &aad)?;
+        decrypted_model
+            .try_set(column, Value::String(Some(decrypted.plaintext)))
+            .map_err(|e| {
+                EncryptionError::InvalidFormat(format!(
+                    "failed to set encrypted field '{field_name}': {e}"
+                ))
+            })?;
     }
+    *model = decrypted_model;
     Ok(())
 }
 
-// Blanket implementation for all types that implement Serialize + DeserializeOwned
-impl<M> ModelDecryption for M where M: Serialize + DeserializeOwned {}
+impl<M: ModelTrait> ModelDecryption for M {}
 
 /// Decrypt one envelope outside the model layer.
 ///

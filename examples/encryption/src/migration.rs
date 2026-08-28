@@ -29,7 +29,7 @@ impl MigrationTrait for CreateUsers {
                     .table(models::Entity)
                     .col(
                         ColumnDef::new(models::Column::Id)
-                            .integer()
+                            .big_integer()
                             .not_null()
                             .auto_increment()
                             .primary_key(),

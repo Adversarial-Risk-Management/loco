@@ -5,8 +5,7 @@ use loco_rs::encryption::{
     encrypt_query_value, is_encrypted_format, Encryptable, ModelDecryption, RowScope,
 };
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait, QueryFilter,
-    Set, Statement,
+    ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait, QueryFilter, Set, Statement,
 };
 
 use super::{
@@ -20,7 +19,7 @@ async fn ctx() -> loco_rs::app::AppContext {
     c
 }
 
-async fn raw(db: &DatabaseConnection, id: i32, col: &str) -> Option<String> {
+async fn raw(db: &DatabaseConnection, id: i64, col: &str) -> Option<String> {
     let backend = db.get_database_backend();
     let stmt = Statement::from_sql_and_values(
         backend,
@@ -40,9 +39,7 @@ async fn nullable_some_value_encrypts_and_round_trips() {
         name: Set("Alice".to_string()),
         ..Default::default()
     }
-    .encrypt_fields_ctx(&ctx)
-    .unwrap()
-    .insert(&ctx.db)
+    .insert_encrypted(&ctx)
     .await
     .unwrap();
 
@@ -62,7 +59,7 @@ async fn nullable_some_value_encrypts_and_round_trips() {
         .await
         .unwrap()
         .unwrap();
-    model.decrypt_fields_ctx::<Entity>(&ctx).unwrap();
+    model.decrypt_fields_ctx(&ctx).unwrap();
     assert_eq!(model.ssn.as_deref(), Some("111-22-3333"));
     assert_eq!(model.email.as_deref(), Some("alice@example.com"));
 }
@@ -76,9 +73,7 @@ async fn nullable_none_stays_null_and_decrypts_as_none() {
         name: Set("Blank".to_string()),
         ..Default::default()
     }
-    .encrypt_fields_ctx(&ctx)
-    .unwrap()
-    .insert(&ctx.db)
+    .insert_encrypted(&ctx)
     .await
     .unwrap();
 
@@ -92,7 +87,7 @@ async fn nullable_none_stays_null_and_decrypts_as_none() {
         .await
         .unwrap()
         .unwrap();
-    model.decrypt_fields_ctx::<Entity>(&ctx).unwrap();
+    model.decrypt_fields_ctx(&ctx).unwrap();
     assert_eq!(model.ssn, None);
     assert_eq!(model.email, None);
 }
@@ -107,9 +102,7 @@ async fn nullable_deterministic_field_is_queryable_by_equality() {
             name: Set(name.to_string()),
             ..Default::default()
         }
-        .encrypt_fields_ctx(&ctx)
-        .unwrap()
-        .insert(&ctx.db)
+        .insert_encrypted(&ctx)
         .await
         .unwrap();
     }

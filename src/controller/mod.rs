@@ -314,6 +314,12 @@ impl IntoResponse for Error {
                 ErrorDetail::new("internal_server_error", "Internal Server Error"),
             ),
 
+            #[cfg(feature = "encryption")]
+            Self::Encryption(_) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ErrorDetail::new("internal_server_error", "Internal Server Error"),
+            ),
+
             // Other `ModelError` variants are internal/infrastructure errors
             // (DB, generic `Any`, free-form `Message`, and, when `auth`
             // is enabled, `Jwt`) and are collapsed to 500 like their

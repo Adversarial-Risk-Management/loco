@@ -1,7 +1,8 @@
-//! Rails-compatible encrypted value format
+//! Rails-shaped encrypted value format
 //!
 //! This module provides serialization/deserialization for encrypted values
-//! in a format compatible with Rails `ActiveRecord` Encryption.
+//! in a format shaped like Rails `ActiveRecord` Encryption. The values are not
+//! wire-compatible.
 //!
 //! # Format
 //!
@@ -10,7 +11,7 @@
 //! {
 //!   "p": "base64-encoded-ciphertext",
 //!   "h": {
-//!     "v": 2,
+//!     "v": 1,
 //!     "iv": "base64-encoded-iv",
 //!     "at": "base64-encoded-auth-tag",
 //!     "i": "optional-key-id",
@@ -26,10 +27,10 @@
 //!   other version are rejected.
 //! - `iv` — AES-GCM nonce (12 bytes, base64).
 //! - `at` — AES-GCM authentication tag (16 bytes, base64).
-//! - `i` — optional key identifier for rotation. Rails uses this for the
-//!   first 4 hex of `SHA1(key)`; this implementation uses semantic labels
-//!   like `"primary"` / `"previous_0"` / `"deterministic"`. The names match
-//!   Rails; the values differ.
+//! - `i` — optional key identifier for rotation. The config provider uses the
+//!   first 8 hexadecimal characters of `SHA256(key)` for random-IV values;
+//!   deterministic values use `"deterministic"`. The field is an
+//!   authenticated key-selection hint.
 //! - `d` — set when the ciphertext was produced by deterministic
 //!   encryption. Elided when false.
 //! - `c` — set when the plaintext was zlib-deflated before encryption.
@@ -83,7 +84,7 @@ pub struct EncryptedHeaders {
     pub c: Option<bool>,
 }
 
-/// Rails-compatible encrypted value structure
+/// Rails-shaped encrypted value structure.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EncryptedValue {
     /// Base64-encoded ciphertext (payload)
@@ -217,10 +218,20 @@ impl EncryptedValue {
     }
 }
 
-/// Cheap shape test: a JSON object carrying `p` and `h` keys.
+/// Shape test: a top-level JSON object carrying `p` and `h` keys.
 fn looks_like_envelope(value: &str) -> bool {
     let value = value.trim_start();
-    value.starts_with('{') && value.contains("\"p\"") && value.contains("\"h\"")
+    match serde_json::from_str::<serde_json::Value>(value) {
+        Ok(serde_json::Value::Object(object)) => {
+            object.contains_key("p") && object.contains_key("h")
+        }
+        Ok(_) => false,
+        Err(_) => {
+            // Fail closed for malformed data that still advertises the
+            // envelope keys. Valid nested JSON does not take this path.
+            value.starts_with('{') && value.contains("\"p\"") && value.contains("\"h\"")
+        }
+    }
 }
 
 /// Whether a string is a valid encryption envelope.
@@ -282,11 +293,11 @@ mod tests {
     }
 
     #[test]
-    fn test_rails_compatible_format() {
-        // Example Rails-format JSON
-        let rails_json = r#"{"p":"dGVzdCBkYXRh","h":{"v":1,"iv":"MTIzNDU2Nzg5MDEy","at":"MDEyMzQ1Njc4OWFiY2RlZg=="}}"#;
+    fn test_rails_shaped_format() {
+        // Example of Loco's Rails-shaped, but not wire-compatible, JSON.
+        let rails_shaped_json = r#"{"p":"dGVzdCBkYXRh","h":{"v":1,"iv":"MTIzNDU2Nzg5MDEy","at":"MDEyMzQ1Njc4OWFiY2RlZg=="}}"#;
 
-        let parsed = EncryptedValue::from_json(rails_json).unwrap();
+        let parsed = EncryptedValue::from_json(rails_shaped_json).unwrap();
         assert_eq!(parsed.ciphertext().unwrap(), b"test data");
         assert_eq!(parsed.iv().unwrap(), b"123456789012");
     }
@@ -353,6 +364,12 @@ mod tests {
         // Envelope shape with an unsupported version is an error, not plaintext.
         let future = r#"{"p":"dGVzdA==","h":{"v":7,"iv":"MTIzNDU2Nzg5MDEy","at":"MDEyMzQ1Njc4OWFiY2RlZg=="}}"#;
         assert!(EncryptedValue::parse_column(future).is_err());
+    }
+
+    #[test]
+    fn test_nested_p_and_h_keys_are_plaintext() {
+        let value = r#"{"nested":{"p":"organic","h":"data"}}"#;
+        assert!(EncryptedValue::parse_column(value).unwrap().is_none());
     }
 
     #[test]

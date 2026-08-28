@@ -44,6 +44,6 @@ pub async fn ctx_with_encryption(primary: &str, previous: Option<&str>) -> AppCo
 }
 
 /// Fetch one string column of a `secret_documents` row exactly as stored.
-pub async fn raw_string_column(db: &DatabaseConnection, id: i32, column: &str) -> String {
+pub async fn raw_string_column(db: &DatabaseConnection, id: i64, column: &str) -> String {
     testing::encryption::raw_string_column(db, "secret_documents", id, column).await
 }

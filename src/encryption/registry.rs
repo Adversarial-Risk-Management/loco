@@ -6,7 +6,7 @@
 //! fallback: a context without a provider is not configured, and says so.
 //!
 //! Registration happens automatically during `boot::create_context` when
-//! `config.encryption` is set. Custom providers (KMS, Vault, HSM) call
+//! `config.encryption` is set. Custom key-source providers call
 //! [`install`] from `Hooks::after_context`, which replaces the config-driven
 //! one for that context.
 
@@ -28,7 +28,6 @@ pub type SharedKeyProvider = Arc<dyn KeyProvider + Send + Sync>;
 /// Returns an error if the configuration fails validation or the primary key
 /// cannot be parsed.
 pub fn register(ctx: &AppContext, cfg: &EncryptionConfig) -> EncryptionResult<()> {
-    super::validate_config(cfg)?;
     install(ctx, Arc::new(ConfigKeyProvider::new(cfg)?));
     Ok(())
 }

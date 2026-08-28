@@ -7,7 +7,7 @@ use sea_orm::entity::prelude::*;
 #[sea_orm(table_name = "long_documents")]
 pub struct Model {
     #[sea_orm(primary_key)]
-    pub id: i32,
+    pub id: i64,
     #[sea_orm(column_type = "Text", nullable)]
     pub bio: String,
     #[sea_orm(column_type = "Text", nullable)]

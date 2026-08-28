@@ -8,7 +8,7 @@ use sea_orm::entity::prelude::*;
 #[sea_orm(table_name = "users")]
 pub struct Model {
     #[sea_orm(primary_key)]
-    pub id: i32,
+    pub id: i64,
     pub name: String,
     /// Stored as encrypted JSON; decrypted via `decrypt_fields_ctx`.
     #[sea_orm(column_type = "Text", nullable)]

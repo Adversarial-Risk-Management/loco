@@ -38,7 +38,7 @@ curl -s "localhost:5150/users/raw?id=1"
 - `src/models.rs` — entity + `impl_encryptable_fields!` with the
   deterministic marker on `email`.
 - `src/controllers.rs` — three handlers that show the three relevant
-  call sites: `encrypt_fields_ctx` on save, `decrypt_fields_ctx` on
+  call sites: `insert_encrypted` on save, `decrypt_fields_ctx` on
   read, and `encrypt_query_value` for equality queries.
 - `src/app.rs` — `Hooks::boot` is the standard `create_app` call;
   the encryption provider auto-registers from `config.encryption`.

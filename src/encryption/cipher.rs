@@ -29,16 +29,27 @@ const AAD_HEADER_DOMAIN: &[u8] = b"loco-enc-hdr\x00";
 /// flags alongside any caller-supplied AAD.
 ///
 /// The encoding is `domain || version || deterministic || compressed ||
-/// user_aad`. The domain and the three flag bytes are fixed-width, so the
-/// boundary with `user_aad` is unambiguous without a length prefix. Encryption
-/// and decryption must build this identically; because the flags are baked
-/// into the tag, flipping `d`/`c`/`v` in storage makes authentication fail.
-fn header_aad(version: u8, deterministic: bool, compressed: bool, user_aad: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(AAD_HEADER_DOMAIN.len() + 3 + user_aad.len());
+/// key_id_present || key_id_len_u64 || key_id || user_aad`. Encryption and
+/// decryption must build it identically; changing any interpreted header field
+/// makes authentication fail.
+fn header_aad(
+    version: u8,
+    deterministic: bool,
+    compressed: bool,
+    key_id: Option<&str>,
+    user_aad: &[u8],
+) -> Vec<u8> {
+    let has_key_id = key_id.is_some();
+    let key_id = key_id.unwrap_or_default().as_bytes();
+    let key_id_len = u64::try_from(key_id.len()).expect("key identifier length must fit in u64");
+    let mut out = Vec::with_capacity(AAD_HEADER_DOMAIN.len() + 12 + key_id.len() + user_aad.len());
     out.extend_from_slice(AAD_HEADER_DOMAIN);
     out.push(version);
     out.push(u8::from(deterministic));
     out.push(u8::from(compressed));
+    out.push(u8::from(has_key_id));
+    out.extend_from_slice(&key_id_len.to_be_bytes());
+    out.extend_from_slice(key_id);
     out.extend_from_slice(user_aad);
     out
 }
@@ -57,10 +68,11 @@ pub const NONCE_SIZE: usize = 12;
 /// AES-GCM authentication tag size in bytes
 pub const TAG_SIZE: usize = 16;
 
-/// Upper bound on the inflated size of a compressed value. The compressed
-/// bytes are AES-GCM-authenticated, so only a key holder can reach the
-/// inflater, but a bound keeps a corrupt or hostile payload from allocating
-/// without limit.
+/// Upper bound on the inflated size of a compressed value.
+///
+/// The compressed bytes are AES-GCM-authenticated, so only a key holder can
+/// reach the inflater. The bound still prevents unlimited allocation from a
+/// corrupt or hostile payload.
 pub const MAX_INFLATED_BYTES: usize = 64 * 1024 * 1024;
 
 /// AES-256-GCM seal shared by the three encryption modes: authenticate the
@@ -80,7 +92,13 @@ fn seal(
 
     // Bind the envelope's version and flags into the auth data so the headers
     // cannot be changed independently of the ciphertext.
-    let aad = header_aad(ENVELOPE_VERSION, deterministic, compressed, aad);
+    let aad = header_aad(
+        ENVELOPE_VERSION,
+        deterministic,
+        compressed,
+        key_id.as_deref(),
+        aad,
+    );
     let ciphertext_with_tag = cipher
         .encrypt(&nonce, aes_gcm::aead::Payload { msg, aad: &aad })
         .map_err(|e| EncryptionError::EncryptionFailed(e.to_string()))?;
@@ -156,6 +174,7 @@ pub fn decrypt(encrypted_json: &str, key: &[u8], aad: &[u8]) -> EncryptionResult
         encrypted.h.v,
         encrypted.is_deterministic(),
         encrypted.is_compressed(),
+        encrypted.key_id(),
         aad,
     );
     let plaintext_bytes = cipher
@@ -204,7 +223,7 @@ pub fn encrypt_compressed(
     key_id: Option<String>,
     aad: &[u8],
 ) -> EncryptionResult<String> {
-    if plaintext.len() < COMPRESS_THRESHOLD {
+    if plaintext.len() < COMPRESS_THRESHOLD || plaintext.len() > MAX_INFLATED_BYTES {
         return encrypt(plaintext, key, key_id, aad);
     }
 
@@ -566,13 +585,27 @@ mod tests {
 
     #[test]
     fn test_inflate_is_capped() {
-        // A key holder writes a compressed value that inflates past the cap;
-        // decrypt refuses it instead of allocating without bound.
+        // The writer must not emit a compressed value its own reader rejects.
+        // Values above the inflation cap remain uncompressed and readable.
         let key = test_key();
         let huge = "a".repeat(MAX_INFLATED_BYTES + 1);
         let env = encrypt_compressed(&huge, &key, None, b"").unwrap();
-        let err = decrypt(&env, &key, b"").unwrap_err();
-        assert!(err.to_string().contains("exceeds"), "{err}");
+        assert!(!EncryptedValue::from_json(&env).unwrap().is_compressed());
+        assert_eq!(decrypt(&env, &key, b"").unwrap(), huge);
+    }
+
+    #[test]
+    fn test_key_id_is_authenticated() {
+        let key = test_key();
+        let env = encrypt("secret", &key, Some("key-a".to_string()), b"").unwrap();
+        let mut parsed = EncryptedValue::from_json(&env).unwrap();
+        parsed.h.i = Some("key-b".to_string());
+        assert!(decrypt(&parsed.to_json().unwrap(), &key, b"").is_err());
+
+        let env = encrypt("secret", &key, None, b"").unwrap();
+        let mut parsed = EncryptedValue::from_json(&env).unwrap();
+        parsed.h.i = Some(String::new());
+        assert!(decrypt(&parsed.to_json().unwrap(), &key, b"").is_err());
     }
 
     #[test]

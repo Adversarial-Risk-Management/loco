@@ -30,7 +30,7 @@ impl From<serde_json::Error> for Error {
 #[cfg(feature = "encryption")]
 impl From<crate::encryption::EncryptionError> for Error {
     fn from(val: crate::encryption::EncryptionError) -> Self {
-        Self::Message(val.to_string()).bt()
+        Self::Encryption(val).bt()
     }
 }
 
@@ -141,6 +141,10 @@ pub enum Error {
     #[cfg(feature = "with-db")]
     #[error(transparent)]
     DB(#[from] sea_orm::DbErr),
+
+    #[cfg(feature = "encryption")]
+    #[error(transparent)]
+    Encryption(crate::encryption::EncryptionError),
 
     #[error(transparent)]
     ParseAddress(#[from] AddressError),

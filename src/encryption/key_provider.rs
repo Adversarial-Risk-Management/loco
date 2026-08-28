@@ -10,7 +10,7 @@
 //! through other memory disclosure vulnerabilities.
 
 use hkdf::Hkdf;
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use super::{
@@ -47,6 +47,20 @@ impl SecureKey {
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
+
+    /// Stable, non-secret identifier for envelope key selection.
+    #[must_use]
+    fn fingerprint(&self) -> String {
+        use std::fmt::Write;
+
+        let digest = Sha256::digest(self.as_bytes());
+        digest[..4]
+            .iter()
+            .fold(String::with_capacity(8), |mut out, byte| {
+                write!(out, "{byte:02x}").expect("writing to a String cannot fail");
+                out
+            })
+    }
 }
 
 impl std::fmt::Debug for SecureKey {
@@ -60,7 +74,8 @@ impl std::fmt::Debug for SecureKey {
 
 /// Trait for providing encryption keys
 ///
-/// Implement this trait to create custom key providers (e.g., `HashiCorp` Vault, AWS KMS).
+/// Implement this trait to load key material from a custom source such as
+/// `HashiCorp` Vault or AWS KMS data keys.
 pub trait KeyProvider: Send + Sync {
     /// Get the primary encryption key
     ///
@@ -211,7 +226,7 @@ impl KeyProvider for ConfigKeyProvider {
     }
 
     fn get_key_id(&self) -> Option<String> {
-        Some("primary".to_string())
+        Some(self.primary_key.fingerprint())
     }
 
     fn derive_field_key(
@@ -228,9 +243,12 @@ impl KeyProvider for ConfigKeyProvider {
 
     fn get_decryption_keys(&self) -> EncryptionResult<Vec<(SecureKey, Option<String>)>> {
         let mut keys = Vec::with_capacity(1 + self.previous_keys.len());
-        keys.push((self.primary_key.clone(), Some("primary".to_string())));
-        for (i, key) in self.previous_keys.iter().enumerate() {
-            keys.push((key.clone(), Some(format!("previous_{i}"))));
+        keys.push((
+            self.primary_key.clone(),
+            Some(self.primary_key.fingerprint()),
+        ));
+        for key in &self.previous_keys {
+            keys.push((key.clone(), Some(key.fingerprint())));
         }
         Ok(keys)
     }
@@ -323,19 +341,15 @@ mod tests {
 
     #[test]
     fn test_config_key_provider_rejects_bad_keys() {
+        let mut bad_salt = cfg(PRIMARY, &[], DET);
+        bad_salt.key_derivation_salt = "short".to_string();
         for (label, config) in [
             ("primary", cfg("", &[], DET)),
             ("primary", cfg("too_short", &[], DET)),
             ("deterministic", cfg(PRIMARY, &[], "")),
             ("deterministic", cfg(PRIMARY, &[], "not-hex")),
             ("previous", cfg(PRIMARY, &["bad"], DET)),
-            (
-                "salt",
-                EncryptionConfig {
-                    key_derivation_salt: "short".to_string(),
-                    ..cfg(PRIMARY, &[], DET)
-                },
-            ),
+            ("salt", bad_salt),
         ] {
             let err = ConfigKeyProvider::new(&config).unwrap_err();
             assert!(
@@ -351,8 +365,8 @@ mod tests {
         let provider = ConfigKeyProvider::new(&cfg(PRIMARY, &["", PREVIOUS, "  "], DET)).unwrap();
         let decryption_keys = provider.get_decryption_keys().unwrap();
         assert_eq!(decryption_keys.len(), 2);
-        assert_eq!(decryption_keys[0].1, Some("primary".to_string()));
-        assert_eq!(decryption_keys[1].1, Some("previous_0".to_string()));
+        assert_eq!(decryption_keys[0].1, provider.get_key_id());
+        assert_ne!(decryption_keys[0].1, decryption_keys[1].1);
     }
 
     #[test]
@@ -376,10 +390,8 @@ mod tests {
         );
 
         // Distinct across salts.
-        let other_salt = EncryptionConfig {
-            key_derivation_salt: DET.to_string(),
-            ..cfg(PRIMARY, &[], DET)
-        };
+        let mut other_salt = cfg(PRIMARY, &[], DET);
+        other_salt.key_derivation_salt = DET.to_string();
         let other = ConfigKeyProvider::new(&other_salt).unwrap();
         assert_ne!(
             field_key.as_bytes(),

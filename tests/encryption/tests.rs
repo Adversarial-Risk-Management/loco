@@ -1,12 +1,11 @@
 //! End-to-end encryption tests against a real SeaORM entity backed by sqlite.
 
 use loco_rs::encryption::{
-    cipher, encrypt_query_value, format::is_encrypted_format, registry, Encryptable,
-    EncryptedValue, ModelDecryption, RowScope,
+    encrypt_query_value, is_encrypted_format, registry, Encryptable, EncryptedValue,
+    ModelDecryption, RowScope,
 };
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder, Set,
-    Statement, Unchanged,
+    ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder, Set, Statement, Unchanged,
 };
 
 use super::{
@@ -14,7 +13,7 @@ use super::{
     helpers::{ctx_with_encryption, raw_string_column, KEY_A, KEY_B},
 };
 
-/// Insert a row through `encrypt_fields_ctx` and read the raw column value back
+/// Insert a row through `insert_encrypted` and read the raw column value back
 /// via a SQL query so we can assert on the persisted ciphertext.
 async fn insert_with_encryption(
     ctx: &loco_rs::app::AppContext,
@@ -28,10 +27,9 @@ async fn insert_with_encryption(
         name: Set(name.to_string()),
         ..Default::default()
     };
-    let am = am
-        .encrypt_fields_ctx(ctx)
-        .expect("encrypt fields via context");
-    am.insert(&ctx.db).await.expect("insert encrypted row")
+    am.insert_encrypted(ctx)
+        .await
+        .expect("insert encrypted row")
 }
 
 #[tokio::test]
@@ -59,11 +57,39 @@ async fn encrypts_at_rest_and_decrypts_on_read() {
         .unwrap()
         .unwrap();
     model
-        .decrypt_fields_ctx::<Entity>(&ctx)
+        .decrypt_fields_ctx(&ctx)
         .expect("decrypt fields via context");
     assert_eq!(model.ssn, "123-45-6789");
     assert_eq!(model.email, "alice@example.com");
     assert_eq!(model.name, "Alice");
+}
+
+#[tokio::test]
+async fn save_encrypted_encrypts_before_persistence() {
+    let ctx = ctx_with_encryption(KEY_A, None).await;
+    let active = ActiveModel {
+        ssn: Set("123-45-6789".to_string()),
+        email: Set("alice@example.com".to_string()),
+        name: Set("Alice".to_string()),
+        ..Default::default()
+    }
+    .save_encrypted(&ctx)
+    .await
+    .unwrap();
+
+    assert!(is_encrypted_format(
+        &raw_string_column(&ctx.db, active.id.unwrap(), "ssn").await
+    ));
+}
+
+#[tokio::test]
+async fn before_save_runs_before_encryption() {
+    let ctx = ctx_with_encryption(KEY_A, None).await;
+    let mut saved =
+        insert_with_encryption(&ctx, "  123-45-6789  ", "alice@example.com", "Alice").await;
+
+    saved.decrypt_fields_ctx(&ctx).unwrap();
+    assert_eq!(saved.ssn, "123-45-6789");
 }
 
 #[tokio::test]
@@ -142,7 +168,7 @@ async fn rotation_decrypts_records_written_under_a_previous_key() {
         .unwrap();
     let mut model = last.clone();
     model
-        .decrypt_fields_ctx::<Entity>(&ctx_b)
+        .decrypt_fields_ctx(&ctx_b)
         .expect("decrypt under rotated config");
     assert_eq!(
         model.ssn, "old",
@@ -185,7 +211,7 @@ async fn tampered_ciphertext_is_rejected() {
         .unwrap()
         .unwrap();
     let err = model
-        .decrypt_fields_ctx::<Entity>(&ctx)
+        .decrypt_fields_ctx(&ctx)
         .expect_err("tampered ciphertext must fail GCM authentication");
     assert!(
         err.to_string().to_lowercase().contains("keys"),
@@ -203,25 +229,18 @@ async fn deterministic_envelope_carries_d_flag() {
 
     let det = EncryptedValue::from_json(&raw_email).unwrap();
     let nondet = EncryptedValue::from_json(&raw_ssn).unwrap();
+    let provider = registry::require(&ctx).unwrap();
     assert!(det.is_deterministic(), "email envelope must mark h.d=true");
     assert_eq!(det.key_id(), Some("deterministic"));
-    assert_eq!(nondet.key_id(), Some("primary"));
+    assert_eq!(nondet.key_id(), provider.get_key_id().as_deref());
     assert!(
         !nondet.is_deterministic(),
         "ssn envelope must not be marked"
     );
 
-    // And the cipher primitive directly should produce a stable ciphertext.
-    let provider = registry::require(&ctx).unwrap();
-    let det_master = provider.get_deterministic_key().unwrap().unwrap();
-    let field_key = provider.derive_field_key(&det_master, "email").unwrap();
-    let again = cipher::encrypt_deterministic(
-        "alice@example.com",
-        field_key.as_bytes(),
-        Some("deterministic".to_string()),
-        &ActiveModel::field_aad("email"),
-    )
-    .unwrap();
+    // The query helper must reproduce the stored deterministic envelope.
+    let again = encrypt_query_value::<Entity>("email", "alice@example.com", &ctx, &RowScope::new())
+        .unwrap();
     let stored = raw_email.clone();
     assert_eq!(
         again, stored,
@@ -254,11 +273,36 @@ async fn plaintext_in_an_encrypted_column_is_an_error_on_read() {
         .await
         .unwrap()
         .unwrap();
-    let err = model.decrypt_fields_ctx::<Entity>(&ctx).unwrap_err();
+    let err = model.decrypt_fields_ctx(&ctx).unwrap_err();
     assert!(
         matches!(err, loco_rs::encryption::EncryptionError::InvalidFormat(_)),
         "{err}"
     );
+}
+
+#[tokio::test]
+async fn failed_decryption_leaves_the_model_unchanged() {
+    let ctx = ctx_with_encryption(KEY_A, None).await;
+    let saved = insert_with_encryption(&ctx, "123-45-6789", "alice@example.com", "Alice").await;
+    ctx.db
+        .execute_raw(Statement::from_sql_and_values(
+            ctx.db.get_database_backend(),
+            "UPDATE secret_documents SET email = ? WHERE id = ?",
+            ["not-an-envelope".into(), saved.id.into()],
+        ))
+        .await
+        .unwrap();
+
+    let mut model = Entity::find_by_id(saved.id)
+        .one(&ctx.db)
+        .await
+        .unwrap()
+        .unwrap();
+    let encrypted_ssn = model.ssn.clone();
+    model.decrypt_fields_ctx(&ctx).unwrap_err();
+
+    assert_eq!(model.ssn, encrypted_ssn);
+    assert_eq!(model.email, "not-an-envelope");
 }
 
 #[tokio::test]
@@ -272,9 +316,7 @@ async fn unchanged_plaintext_is_encrypted_on_save() {
         name: Set("Alice".to_string()),
         ..Default::default()
     }
-    .encrypt_fields_ctx(&ctx)
-    .unwrap()
-    .insert(&ctx.db)
+    .insert_encrypted(&ctx)
     .await
     .unwrap();
 
@@ -289,6 +331,6 @@ async fn unchanged_plaintext_is_encrypted_on_save() {
         .await
         .unwrap()
         .unwrap();
-    model.decrypt_fields_ctx::<Entity>(&ctx).unwrap();
+    model.decrypt_fields_ctx(&ctx).unwrap();
     assert_eq!(model.ssn, "123-45-6789");
 }

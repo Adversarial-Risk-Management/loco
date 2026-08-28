@@ -8,7 +8,7 @@ use sea_orm::entity::prelude::*;
 #[sea_orm(table_name = "scoped_credentials")]
 pub struct Model {
     #[sea_orm(primary_key)]
-    pub id: i32,
+    pub id: i64,
     pub org_id: Uuid,
     #[sea_orm(column_type = "Text")]
     pub credentials: String,

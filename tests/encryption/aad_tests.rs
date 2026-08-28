@@ -5,7 +5,7 @@
 //! class.
 
 use loco_rs::encryption::{Encryptable, ModelDecryption};
-use sea_orm::{ActiveModelTrait, ConnectionTrait, DatabaseConnection, EntityTrait, Set, Statement};
+use sea_orm::{ConnectionTrait, DatabaseConnection, EntityTrait, Set, Statement};
 
 use super::{
     aad_entity::{ActiveModel, Entity, Model},
@@ -24,14 +24,10 @@ async fn insert(ctx: &loco_rs::app::AppContext, ssn: &str, email: &str) -> Model
         email: Set(email.into()),
         ..Default::default()
     };
-    am.encrypt_fields_ctx(ctx)
-        .unwrap()
-        .insert(&ctx.db)
-        .await
-        .unwrap()
+    am.insert_encrypted(ctx).await.unwrap()
 }
 
-async fn raw(db: &DatabaseConnection, id: i32, col: &str) -> String {
+async fn raw(db: &DatabaseConnection, id: i64, col: &str) -> String {
     let backend = db.get_database_backend();
     let stmt = Statement::from_sql_and_values(
         backend,
@@ -52,7 +48,7 @@ async fn aad_bound_field_round_trips_normally() {
         .await
         .unwrap()
         .unwrap();
-    model.decrypt_fields_ctx::<Entity>(&ctx).unwrap();
+    model.decrypt_fields_ctx(&ctx).unwrap();
     assert_eq!(model.ssn, "111-22-3333");
     assert_eq!(model.email, "alice@example.com");
 }
@@ -83,7 +79,7 @@ async fn aad_defeats_cross_column_relocation() {
         .unwrap()
         .unwrap();
     let err = model
-        .decrypt_fields_ctx::<Entity>(&ctx)
+        .decrypt_fields_ctx(&ctx)
         .expect_err("relocated ciphertext must fail authentication");
     assert!(
         err.to_string().to_lowercase().contains("keys"),
@@ -99,21 +95,20 @@ async fn changing_aad_invalidates_existing_ciphertexts() {
     let saved = insert(&ctx, "111-22-3333", "alice@example.com").await;
     let ssn_ct = raw(&ctx.db, saved.id, "ssn").await;
 
-    use loco_rs::encryption::{cipher, registry};
+    use loco_rs::encryption::{decrypt_field, registry};
     let provider = registry::require(&ctx).unwrap();
-    let key = provider.get_field_key("ssn").unwrap();
 
     // Empty AAD against a bound ciphertext: must fail.
-    let err = cipher::decrypt(&ssn_ct, key.as_bytes(), b"").unwrap_err();
+    let err = decrypt_field(&ssn_ct, "ssn", &*provider, b"").unwrap_err();
     assert!(matches!(
         err,
-        loco_rs::encryption::EncryptionError::DecryptionFailed(_)
+        loco_rs::encryption::EncryptionError::AllKeysFailed { .. }
     ));
 
     // Correct AAD: succeeds.
     let aad = ActiveModel::field_aad("ssn");
     assert_eq!(
-        cipher::decrypt(&ssn_ct, key.as_bytes(), &aad).unwrap(),
+        decrypt_field(&ssn_ct, "ssn", &*provider, &aad).unwrap(),
         "111-22-3333"
     );
 }
