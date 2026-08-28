@@ -59,7 +59,5 @@ pub fn with_credentials(
         .endpoint(endpoint)
         .account_key(access_key);
 
-    Ok(Box::new(OpendalAdapter::new(
-        Operator::new(azure)?.finish(),
-    )))
+    Ok(Box::new(OpendalAdapter::new(Operator::new(azure)?)))
 }

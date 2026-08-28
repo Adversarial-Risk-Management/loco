@@ -7,6 +7,7 @@
 
 use std::{
     collections::BTreeSet,
+    fmt::Write as _,
     fs,
     path::{Path, PathBuf},
 };
@@ -104,10 +105,7 @@ pub fn run(base_dir: &Path) -> Result<()> {
     if !broken_links.is_empty() || version_mismatch.is_some() {
         let mut msg = String::new();
         if !broken_links.is_empty() {
-            msg.push_str(&format!(
-                "{} broken link(s) in {LLMS_TXT}",
-                broken_links.len()
-            ));
+            let _ = write!(msg, "{} broken link(s) in {LLMS_TXT}", broken_links.len());
         }
         if let Some(vm) = &version_mismatch {
             if !msg.is_empty() {

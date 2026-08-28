@@ -17,7 +17,7 @@ use crate::storage::{drivers::opendal_adapter::OpendalAdapter, StorageResult};
 pub fn new(bucket_name: &str) -> StorageResult<Box<dyn StoreDriver>> {
     let gcs = Gcs::default().bucket(bucket_name);
 
-    Ok(Box::new(OpendalAdapter::new(Operator::new(gcs)?.finish())))
+    Ok(Box::new(OpendalAdapter::new(Operator::new(gcs)?)))
 }
 
 /// Create new GCP storage with an explicit service-account credential file.

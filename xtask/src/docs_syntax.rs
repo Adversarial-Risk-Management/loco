@@ -1,4 +1,4 @@
-//! Parse every ```rust block in the docs tree and fail on the ones that are
+//! Parse every Rust code block in the docs tree and fail on the ones that are
 //! not Rust.
 //!
 //! **This checks syntax, not types.** It will not tell you a snippet calls a
@@ -34,7 +34,7 @@ use eyre::{bail, eyre, Result};
 use regex::Regex;
 
 const DOCS_DIR: &str = "website/src/content/docs";
-/// Crate sources whose doc comments carry ```rust blocks. `cargo test --doc`
+/// Crate sources whose doc comments carry Rust code blocks. `cargo test --doc`
 /// compiles the runnable ones; the `ignore` ones — every example that names a
 /// type from the user's app rather than from `loco-rs` — are never even
 /// parsed, so this is the only thing standing between them and a truncated
@@ -50,6 +50,11 @@ struct Block {
     skipped: bool,
 }
 
+/// Checks the documentation tree for invalid Rust code blocks.
+///
+/// # Errors
+///
+/// Returns an error if the documentation cannot be read or a checked block is invalid.
 pub fn run(project_dir: &Path) -> Result<()> {
     let root = project_dir.join(DOCS_DIR);
     if !root.is_dir() {

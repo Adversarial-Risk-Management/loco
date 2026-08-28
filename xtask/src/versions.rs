@@ -71,6 +71,11 @@ fn bump_version_in_file(
     Ok(())
 }
 
+/// Updates all crate and generated-app version references.
+///
+/// # Errors
+///
+/// Returns an error if validation fails or a versioned file cannot be updated.
 pub fn bump_version(version: &Version) -> Result<()> {
     // testing loco-new will test 4 combinations of starters
     // sets LOCO_DEV_MODE_PATH=/<path-to>/projects/loco/ and shared cargo build path

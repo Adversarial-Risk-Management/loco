@@ -29,7 +29,7 @@ enum Commands {
     /// against the real docs tree: broken links, orphan pages, version
     /// markers. Verifies only — never regenerates the curated files.
     LlmsCheck,
-    /// Parse every ```rust block in the docs tree and fail on the ones that
+    /// Parse every Rust code block in the docs tree and fail on the ones that
     /// are not valid Rust. Syntax only — see `xtask::docs_syntax`.
     DocsSyntax,
 }
@@ -37,7 +37,7 @@ enum Commands {
 fn main() -> eyre::Result<()> {
     let cli = Cli::parse();
     let project_dir = env::current_dir()?;
-    println!("running in: {project_dir:?}");
+    println!("running in: {}", project_dir.display());
 
     let res = match cli.command {
         Commands::Test { quick } => {

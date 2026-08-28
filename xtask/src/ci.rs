@@ -5,7 +5,10 @@ use std::{
 
 use duct::cmd;
 
-use crate::{errors::Result, utils};
+use crate::{
+    errors::{Error, Result},
+    utils,
+};
 
 const FMT_TEST: [&str; 3] = ["test", "--all-features", "--all"];
 const FMT_ARGS: [&str; 2] = ["fmt", "--all"];
@@ -41,7 +44,8 @@ impl RunResults {
 /// when could not run ci on the given resource
 pub fn all_resources(base_dir: &Path) -> Result<Vec<RunResults>> {
     let mut result = vec![];
-    result.push(run(base_dir).expect("loco lib mast be tested"));
+    result
+        .push(run(base_dir).ok_or_else(|| Error::Message("loco lib must be tested".to_string()))?);
     result.extend(run_all_in_folder(&base_dir.join("examples"))?);
     result.extend(run_all_in_folder(&base_dir.join("loco-new"))?);
 
@@ -85,6 +89,10 @@ pub fn run(dir: &Path) -> Option<RunResults> {
 }
 
 /// Run cargo test on the given directory.
+///
+/// # Errors
+///
+/// Returns an error if the command cannot run or exits unsuccessfully.
 pub fn cargo_test(dir: &Path, serial: bool) -> Result<Output> {
     let mut params = FMT_TEST.to_vec();
     if serial {
@@ -101,6 +109,10 @@ pub fn cargo_test(dir: &Path, serial: bool) -> Result<Output> {
 }
 
 /// Run cargo fmt on the given directory.
+///
+/// # Errors
+///
+/// Returns an error if the command cannot run or exits unsuccessfully.
 pub fn cargo_fmt(dir: &Path) -> Result<Output> {
     println!(
         "Running `cargo {}` in folder {}",
@@ -111,6 +123,10 @@ pub fn cargo_fmt(dir: &Path) -> Result<Output> {
 }
 
 /// Run cargo clippy on the given directory.
+///
+/// # Errors
+///
+/// Returns an error if the command cannot run or exits unsuccessfully.
 pub fn cargo_clippy(dir: &Path) -> Result<Output> {
     println!(
         "Running `cargo {}` in folder {}",

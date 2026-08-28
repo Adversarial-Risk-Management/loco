@@ -1,5 +1,8 @@
 #![allow(clippy::missing_const_for_fn)]
 #![allow(clippy::module_name_repetitions)]
+// Axum extractor implementations use the trait's async method shape even when
+// a specific extractor completes without awaiting.
+#![allow(clippy::unused_async_trait_impl)]
 // Fires across the `Hooks` and `Mailer` trait methods, which return `Result` —
 // already `#[must_use]` — and are exported API a `#[must_use]` cannot be added
 // to without churn. Suppressed on Linux CI but not on macOS, so it also made

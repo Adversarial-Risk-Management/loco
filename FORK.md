@@ -10,7 +10,7 @@ untouched so they never conflict on sync.
 - **`master` mirrors upstream `master` exactly.** No fork commits ever land on it; syncing is a
   fast-forward.
 - **One branch per upstream version line carries the patches** — `0.16.x-arm`, `1.0.x-arm`, … Each
-  starts at an upstream **release tag** (`1.0.x-arm` starts even with `v1.0.0`) and carries one
+  starts at an upstream **release tag** (`1.1.x-arm` starts even with `v1.1.0`) and carries one
   commit per patch, kept linear so any single patch can be cherry-picked (e.g. backported from
   `1.0.x-arm` to `0.16.x-arm`) in isolation. The newest line branch is the integration branch we
   build and release from.
@@ -28,7 +28,7 @@ Fork releases are **git tags**, not Cargo version bumps:
 v<upstream-version>-arm.<N>
 ```
 
-e.g. `v0.16.4-arm.1`, `v1.0.0-arm.1`. Tags are cut on the **version-line branch** tip. The
+e.g. `v0.16.4-arm.1`, `v1.1.0-arm.1`. Tags are cut on the **version-line branch** tip. The
 workspace `Cargo.toml` version stays at upstream's value; downstream consumers pin the fork by
 git tag or rev. Reset `N` to `1` on each new upstream version; bump `N` for additional fork-only
 changes on the same upstream base. Do **not** record releases in `CHANGELOG.md` (that file is
@@ -62,16 +62,16 @@ upstream absorbs it.
 
 ## Patch ledger
 
-Current base: **upstream v1.0.0** (synced 2026-07-29). Patches carried on top, in commit order:
+Current base: **upstream v1.1.0** (synced 2026-08-28). Patches carried on top, in commit order:
 
 | Patch | Branch | Local PR | Upstream PR | Status |
 |---|---|---|---|---|
-| Fork docs + tooling | `fork-meta` | [#5](https://github.com/Adversarial-Risk-Management/loco/pull/5) | — | carried (re-applied on 1.0) |
-| Default auth for GCP/Azure storage drivers (`new()` uses ambient creds; `with_credentials(...)` for explicit, credential last) | `feat/storage-default-auth` | [#14](https://github.com/Adversarial-Risk-Management/loco/pull/14) | candidate | carried (re-applied on 1.0 / opendal 0.57) |
+| Fork docs + tooling | `fork-meta` | [#5](https://github.com/Adversarial-Risk-Management/loco/pull/5) | — | carried (re-applied on 1.1) |
+| Default auth for GCP/Azure storage drivers (`new()` uses ambient creds; `with_credentials(...)` for explicit, credential last) | `feat/storage-default-auth` | [#14](https://github.com/Adversarial-Risk-Management/loco/pull/14) | candidate | carried (re-applied on 1.1 / opendal 0.58) |
 | Testing deps: axum-test 20 (upstream pins 17; also drops the now-unrepresentable `RequestConfig.default_scheme`) | `deps/testing` | [#8](https://github.com/Adversarial-Risk-Management/loco/pull/8) | — | carried (residual — the rest of #8 landed upstream) |
-| Queue provider downcast: `QueueProvider::as_any` + `Queue::downcast_provider::<T>()`, restoring app access to the queue backend (e.g. `PgQueue.pool`) that the 1.0 `Queue` enum removal took away | `feat/queue-provider-downcast` | — | candidate | carried (new on 1.0; successor to `feature/expose-worker-job-ids` / `feat/work-queue-pagination`) |
-| Testing: Postgres per-test DB teardown uses `DROP DATABASE ... WITH (FORCE)` (PG 13+), so app-held pools outside loco's own (e.g. a session store on a different sqlx major) can't fail cleanup with SQLSTATE 55006 | `fix/testing-drop-db-force` | — | candidate | carried (new on 1.0) |
-| `perform_all_later` / `Queue::enqueue_batch` batch enqueueing (atomic multi-row INSERT on pg/sqlite, `MULTI`/`EXEC` pipeline on redis; `QueueProvider::enqueue_batch` has a non-atomic loop default for third-party providers) | `perform-all-later` | [#3](https://github.com/Adversarial-Risk-Management/loco/pull/3) | — | carried (reworked for the 1.0 provider architecture; returns job ids, shared tags/priority per batch) |
+| Queue provider downcast: `QueueProvider::as_any` + `Queue::downcast_provider::<T>()`, restoring app access to the queue backend (e.g. `PgQueue.pool`) that the 1.0 `Queue` enum removal took away | `feat/queue-provider-downcast` | — | candidate | carried (re-applied on 1.1; successor to `feature/expose-worker-job-ids` / `feat/work-queue-pagination`) |
+| Testing: Postgres per-test DB teardown uses `DROP DATABASE ... WITH (FORCE)` (PG 13+), so app-held pools outside loco's own (e.g. a session store on a different sqlx major) can't fail cleanup with SQLSTATE 55006 | `fix/testing-drop-db-force` | — | candidate | carried (re-applied on 1.1) |
+| `perform_all_later` / `Queue::enqueue_batch` batch enqueueing (atomic multi-row INSERT on pg/sqlite, `MULTI`/`EXEC` pipeline on redis; `QueueProvider::enqueue_batch` has a non-atomic loop default for third-party providers) | `perform-all-later` | [#3](https://github.com/Adversarial-Risk-Management/loco/pull/3) | — | carried (re-applied on 1.1; returns job ids, shared tags/priority per batch) |
 
 ### Dropped on the v1.0.0 sync
 
