@@ -5,7 +5,9 @@ use rrgen::RRgen;
 use serde_json::json;
 
 use crate::{
-    infer, model::get_columns_and_references, render_template, AppInfo, GenerateResults, Result,
+    infer,
+    model::{encrypted_fields_json, get_columns_and_references},
+    render_template, AppInfo, GenerateResults, Result,
 };
 
 /// skipping some fields from the generated models.
@@ -27,22 +29,22 @@ pub fn generate(
     match res {
         // NOTE: re-uses the 'new model' migration template!
         infer::MigrationType::CreateTable { table } => {
-            let (columns, references) = get_columns_and_references(fields)?;
-            let vars = json!({"name": table, "ts": ts, "with_tz": with_tz,"pkg_name": pkg_name, "is_link": false, "columns": columns, "references": references});
+            let (columns, references, encrypted) = get_columns_and_references(fields)?;
+            let vars = json!({"name": table, "ts": ts, "with_tz": with_tz,"pkg_name": pkg_name, "is_link": false, "columns": columns, "references": references, "encrypted_fields": encrypted_fields_json(&encrypted)});
             render_template(rrgen, Path::new("model/model.t"), &vars)
         }
         infer::MigrationType::AddColumns { table } => {
-            let (columns, references) = get_columns_and_references(fields)?;
-            let vars = json!({"name": name, "table": table, "ts": ts, "pkg_name": pkg_name, "is_link": false, "columns": columns, "references": references});
+            let (columns, references, encrypted) = get_columns_and_references(fields)?;
+            let vars = json!({"name": name, "table": table, "ts": ts, "pkg_name": pkg_name, "is_link": false, "columns": columns, "references": references, "encrypted_fields": encrypted_fields_json(&encrypted)});
             render_template(rrgen, Path::new("migration/add_columns.t"), &vars)
         }
         infer::MigrationType::RemoveColumns { table } => {
-            let (columns, _references) = get_columns_and_references(fields)?;
+            let (columns, _references, _encrypted) = get_columns_and_references(fields)?;
             let vars = json!({"name": name, "table": table, "ts": ts, "pkg_name": pkg_name, "columns": columns});
             render_template(rrgen, Path::new("migration/remove_columns.t"), &vars)
         }
         infer::MigrationType::AddReference { table } => {
-            let (columns, references) = get_columns_and_references(fields)?;
+            let (columns, references, _encrypted) = get_columns_and_references(fields)?;
             let vars = json!({"name": name, "table": table, "ts": ts, "pkg_name": pkg_name, "columns": columns, "references": references});
             render_template(rrgen, Path::new("migration/add_references.t"), &vars)
         }
@@ -52,7 +54,7 @@ pub fn generate(
         }
         infer::MigrationType::CreateJoinTable { table_a, table_b } => {
             let table = format!("{table_a}_{table_b}");
-            let (columns, extra_references) = get_columns_and_references(fields)?;
+            let (columns, extra_references, _encrypted) = get_columns_and_references(fields)?;
 
             let references = [(table_a, String::new()), (table_b, String::new())]
                 .into_iter()
