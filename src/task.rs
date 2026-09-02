@@ -2,14 +2,14 @@
 //!
 //! This module defines the task management framework used to manage and execute
 //! tasks in a web server application.
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, fmt};
 
 use async_trait::async_trait;
 
 use crate::{app::AppContext, errors::Error, Result};
 
 /// Struct representing a collection of task arguments.
-#[derive(Default, Debug)]
+#[derive(Clone, Default, Debug)]
 pub struct Vars {
     /// A list of cli arguments.
     pub cli: BTreeMap<String, String>,
@@ -84,6 +84,14 @@ pub trait Task: Send + Sync {
 #[derive(Default)]
 pub struct Tasks {
     registry: BTreeMap<String, Box<dyn Task>>,
+}
+
+impl fmt::Debug for Tasks {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Tasks")
+            .field("names", &self.names())
+            .finish()
+    }
 }
 
 impl Tasks {
