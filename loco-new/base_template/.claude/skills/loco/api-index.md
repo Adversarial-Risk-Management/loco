@@ -1394,7 +1394,7 @@ since they restate the trait's own API.
 
 ### `Job`
 
-- `fn` **prepare_command**`(self: &Self, binary_path: &Path, default_output: &Output, environment: &Environment) -> JobDescription` — Prepares a command description based on the job's configuration
+- `fn` **prepare_command**`(self: &Self, default_output: &Output, environment: &Environment) -> JobDescription` — Prepares the shell command for a job configured with `shell: true`
 
 ### `JobDescription`
 
@@ -1408,8 +1408,8 @@ since they restate the trait's own API.
 ### `Scheduler`
 
 - `fn` **by_spec**`(self: Self, include_jobs: &Spec) -> Self` — Filters the scheduler's jobs based on the provided specification
-- `fn` **from_config**`(config: &Path, environment: &Environment) -> Result<Self>` — Creates a new scheduler instance from the given configuration file
-- `fn` **new**`(data: &Config, environment: &Environment) -> Result<Self>` — Creates a new scheduler instance from the provided configuration data
+- `fn` **from_config**`(config: &Path, app_context: &AppContext) -> Result<Self>` — Creates a new scheduler instance from the given configuration file
+- `fn` **new**`(data: &Config, app_context: &AppContext) -> Result<Self>` — Creates a new scheduler instance from the provided configuration data
 - `fn` **run**`(self: Self) -> Result<()>` — Runs the scheduled jobs according to their cron expressions
 ## `schema`
 
