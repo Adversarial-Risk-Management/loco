@@ -98,6 +98,8 @@ SCHEDULER_CONFIG=config/scheduler.yaml cargo loco start --all
 
 Task jobs run in the scheduler process with its existing `AppContext`. They do not need a shell and reuse the scheduler's database, cache, queue, logging, and tracing resources. Shell jobs spawn a subprocess (`/bin/sh -c` on Unix, `cmd.exe /C` on Windows) with `LOCO_ENV` propagated from the scheduler.
 
+On shutdown, Loco stops new firings and waits for active task and shell jobs to finish. In combined start modes this is part of the application-wide drain; `Hooks::on_shutdown` runs after the server, workers, and scheduler have all stopped. A standalone scheduler uses the same final hook.
+
 ## 5. Run a subset by name or tag
 
 ```sh

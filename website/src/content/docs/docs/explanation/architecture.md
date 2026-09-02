@@ -55,7 +55,7 @@ Each `Hooks` method in that chain has a sensible default (see the reference for 
 
 ### `AppContext` is assembled once, here
 
-`create_context` is the one place `AppContext`'s eight fields (`environment`, `db`, `queue_provider`, `config`, `mailer`, `storage`, `cache`, `shared_store`) get their real values, before `Hooks::after_context` gets a final chance to post-process the struct (e.g. to stash a custom service into `shared_store`). Everything downstream — routing, middleware, handlers, background workers, tasks, the scheduler — receives the *same* `AppContext` value (it's cheaply `Clone`), which is why it's the natural place to reach for shared state. See [AppContext and dependency injection](/docs/explanation/appcontext-and-di) for the full story on that struct and its `shared_store` extensibility slot.
+`create_context` is the one place `AppContext`'s nine fields (`environment`, `db`, `queue_provider`, `config`, `mailer`, `storage`, `cache`, `shared_store`, `shutdown`) get their real values, before `Hooks::after_context` gets a final chance to post-process the struct (e.g. to stash a custom service into `shared_store`). Everything downstream — routing, middleware, handlers, background workers, tasks, the scheduler — receives the *same* `AppContext` value (it's cheaply `Clone`), which is why it carries both shared state and the application-wide shutdown signal. See [AppContext and dependency injection](/docs/explanation/appcontext-and-di) for the full story on that struct and its `shared_store` extensibility slot.
 
 ## Request handling: the onion
 

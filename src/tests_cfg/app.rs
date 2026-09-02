@@ -27,5 +27,6 @@ pub async fn get_app_context() -> AppContext {
         storage: Storage::single(storage::drivers::mem::new()).into(),
         cache: cache.into(),
         shared_store: std::sync::Arc::new(SharedStore::default()),
+        shutdown: tokio_util::sync::CancellationToken::new(),
     }
 }

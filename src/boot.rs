@@ -10,7 +10,8 @@ use std::{
 use axum::Router;
 #[cfg(feature = "with-db")]
 use sea_orm_migration::MigratorTrait;
-use tokio::{select, signal, task::JoinHandle};
+use tokio::{signal, task::JoinHandle};
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 #[cfg(feature = "with-db")]
@@ -93,15 +94,20 @@ pub async fn start<H: Hooks>(
     server_config: ServeParams,
     no_banner: bool,
 ) -> Result<()> {
-    if boot.run_scheduler {
-        let scheduler = scheduler::<H>(&boot.app_context, None, None, None)?;
-        let app_context = boot.app_context.clone();
-        tokio::spawn(async move {
-            if let Err(err) = scheduler.run(&app_context).await {
-                error!(err = err.to_string(), "error while running scheduler");
-            }
-        });
-    }
+    start_until::<H>(boot, server_config, no_banner, shutdown_signal()).await
+}
+
+async fn start_until<H: Hooks>(
+    boot: BootResult,
+    server_config: ServeParams,
+    no_banner: bool,
+    shutdown: impl std::future::Future<Output = ()>,
+) -> Result<()> {
+    let scheduler = if boot.run_scheduler {
+        Some(scheduler::<H>(&boot.app_context, None, None, None)?)
+    } else {
+        None
+    };
 
     if !no_banner {
         print_banner(&boot, &server_config);
@@ -114,55 +120,102 @@ pub async fn start<H: Hooks>(
         app_context,
     } = boot;
 
-    match (router, worker) {
-        (Some(router), None) => {
-            H::serve(router, &app_context, &server_config).await?;
-        }
-        (Some(router), Some(tags)) => {
-            let handle = if app_context.config.workers.mode == WorkerMode::BackgroundQueue {
-                Some(start_queue_worker(&app_context, tags)?)
-            } else {
-                None
-            };
+    let worker_handle = if app_context.config.workers.mode == WorkerMode::BackgroundQueue {
+        worker
+            .map(|tags| start_queue_worker(&app_context, tags))
+            .transpose()?
+    } else {
+        None
+    };
 
-            H::serve(router, &app_context, &server_config).await?;
-
-            if let Some(handle) = handle {
-                shutdown_and_await_queue_worker(&app_context, handle).await?;
+    let scheduler_handle = scheduler.map(|scheduler| {
+        let app_context = app_context.clone();
+        tokio::spawn(async move {
+            let shutdown = app_context.shutdown.clone();
+            if let Err(err) = scheduler.run_until(&app_context, shutdown).await {
+                error!(err = err.to_string(), "error while running scheduler");
             }
-        }
-        (None, Some(tags)) => {
-            let handle = if app_context.config.workers.mode == WorkerMode::BackgroundQueue {
-                Some(start_queue_worker(&app_context, tags)?)
-            } else {
-                None
-            };
+        })
+    });
 
-            await_shutdown_then_run_hook::<H>(&app_context, shutdown_signal()).await;
+    let mut server = router.map(|router| H::serve(router, &app_context, &server_config));
+    let shutdown_token = app_context.shutdown.clone();
+    tokio::pin!(shutdown);
 
-            if let Some(handle) = handle {
-                shutdown_and_await_queue_worker(&app_context, handle).await?;
-            }
+    let mut server_result = if let Some(server) = server.as_mut() {
+        tokio::select! {
+            result = &mut *server => Some(result),
+            () = shutdown.as_mut() => None,
+            () = shutdown_token.cancelled() => None,
         }
-        _ => {}
-    }
+    } else {
+        tokio::select! {
+            () = shutdown.as_mut() => {},
+            () = shutdown_token.cancelled() => {},
+        }
+        None
+    };
+
+    info!("shutting down...");
+    app_context.shutdown.cancel();
+
+    let queue_shutdown_result = if worker_handle.is_some() {
+        app_context
+            .queue_provider
+            .as_ref()
+            .ok_or(Error::QueueProviderMissing)
+            .and_then(|queue| queue.shutdown())
+    } else {
+        Ok(())
+    };
+
+    let drained = drain_or_force_quit(async move {
+        if server_result.is_none()
+            && let Some(server) = server.as_mut()
+        {
+            server_result = Some(server.await);
+        }
+
+        if let Some(handle) = worker_handle
+            && let Err(err) = handle.await
+        {
+            error!(err = err.to_string(), "failed to join queue worker task");
+        }
+
+        if let Some(handle) = scheduler_handle
+            && let Err(err) = handle.await
+        {
+            error!(err = err.to_string(), "failed to join scheduler task");
+        }
+
+        server_result
+    })
+    .await;
+
+    H::on_shutdown(&app_context).await;
+
+    drained.flatten().unwrap_or(Ok(()))?;
+    queue_shutdown_result?;
+
     Ok(())
 }
 
-/// Waits for `shutdown` to resolve, then runs [`Hooks::on_shutdown`].
+/// Awaits `drain` until it completes or a second shutdown signal arrives.
 ///
-/// This is used by the worker-only / worker-and-scheduler start modes, which
-/// (unlike the server modes) have no Axum graceful-shutdown hook of their own
-/// to invoke `on_shutdown` from. Extracted out of [`start`] purely so the
-/// "wait, then hook" sequence can be exercised in tests with an
-/// already-resolved `shutdown` future, instead of the real
-/// [`shutdown_signal`] (which blocks on OS signals).
-async fn await_shutdown_then_run_hook<H: Hooks>(
-    app_context: &AppContext,
-    shutdown: impl std::future::Future<Output = ()>,
-) {
-    shutdown.await;
-    H::on_shutdown(app_context).await;
+/// Returns `None` when the operator forces the exit before `drain` completes.
+/// The pending `drain` future is dropped in that case, so a stuck job cannot
+/// block process exit.
+pub(crate) async fn drain_or_force_quit<T>(
+    drain: impl std::future::Future<Output = T>,
+) -> Option<T> {
+    info!("press ctrl-c again to force quit");
+    tokio::select! {
+        result = drain => Some(result),
+        () = shutdown_signal() => {
+            warn!("forced shutdown: running tasks did not finish");
+            None
+        }
+    }
 }
 
 fn start_queue_worker(app_context: &AppContext, tags: Vec<String>) -> Result<JoinHandle<()>> {
@@ -179,22 +232,6 @@ fn start_queue_worker(app_context: &AppContext, tags: Vec<String>) -> Result<Joi
     }
 
     Err(Error::QueueProviderMissing)
-}
-
-async fn shutdown_and_await_queue_worker(
-    app_context: &AppContext,
-    handle: JoinHandle<()>,
-) -> Result<(), Error> {
-    if let Some(queue) = &app_context.queue_provider {
-        queue.shutdown()?;
-    }
-
-    println!("press ctrl-c again to force quit");
-    select! {
-        _ = handle => {}
-        () = shutdown_signal() => {}
-    }
-    Ok(())
 }
 
 /// Run task
@@ -279,7 +316,9 @@ pub async fn run_scheduler<H: Hooks>(
         println!("{scheduler}");
         Ok(())
     } else {
-        Ok(scheduler.run(app_context).await?)
+        let result = scheduler.run(app_context).await;
+        H::on_shutdown(app_context).await;
+        Ok(result?)
     }
 }
 
@@ -417,6 +456,7 @@ pub async fn create_context<H: Hooks>(
         config,
         mailer,
         shared_store: Arc::new(crate::app::SharedStore::default()),
+        shutdown: CancellationToken::new(),
     };
 
     H::after_context(ctx).await
@@ -634,24 +674,19 @@ fn create_mailer(config: &config::Mailer) -> Result<Option<EmailSender>> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Mutex;
 
     use async_trait::async_trait;
 
     use super::*;
     use crate::{bgworker::Queue, controller::AppRoutes, tests_cfg::app::get_app_context};
 
-    /// A `Hooks` impl whose only interesting behavior is `on_shutdown`: it
-    /// flips a flag stashed in the `AppContext`'s `shared_store` so tests can
-    /// observe whether the hook actually ran. Every other method is an
-    /// unreachable stub because `await_shutdown_then_run_hook` never calls
-    /// them.
-    struct ShutdownFlagHooks;
+    struct LifecycleHooks;
 
     #[async_trait]
-    impl Hooks for ShutdownFlagHooks {
+    impl Hooks for LifecycleHooks {
         fn app_name() -> &'static str {
-            "shutdown_flag_hooks_test"
+            "lifecycle_hooks_test"
         }
 
         async fn boot(
@@ -682,59 +717,56 @@ mod tests {
             unreachable!("not exercised by this test")
         }
 
+        async fn serve(
+            _app: axum::Router,
+            ctx: &AppContext,
+            _serve_params: &ServeParams,
+        ) -> Result<()> {
+            ctx.shutdown.cancelled().await;
+            ctx.shared_store
+                .get::<Arc<Mutex<Vec<&'static str>>>>()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .push("server stopped");
+            Ok(())
+        }
+
         async fn on_shutdown(ctx: &AppContext) {
-            if let Some(flag) = ctx.shared_store.get::<Arc<AtomicBool>>() {
-                flag.store(true, Ordering::SeqCst);
-            }
+            ctx.shared_store
+                .get::<Arc<Mutex<Vec<&'static str>>>>()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .push("hook");
         }
     }
 
     #[tokio::test]
-    async fn test_await_shutdown_then_run_hook_invokes_on_shutdown() {
+    async fn shutdown_drains_components_before_running_hook() {
         let app_context = get_app_context().await;
-        let shutdown_hook_fired = Arc::new(AtomicBool::new(false));
-        app_context.shared_store.insert(shutdown_hook_fired.clone());
+        let events = Arc::new(Mutex::new(Vec::<&'static str>::new()));
+        app_context.shared_store.insert(Arc::clone(&events));
+        let shutdown = app_context.shutdown.clone();
 
-        // An already-resolved future stands in for `shutdown_signal()`, so
-        // the test doesn't have to wait on (or fake) an OS signal.
-        await_shutdown_then_run_hook::<ShutdownFlagHooks>(&app_context, std::future::ready(()))
-            .await;
+        start_until::<LifecycleHooks>(
+            BootResult {
+                app_context,
+                router: Some(axum::Router::new()),
+                worker: None,
+                run_scheduler: false,
+            },
+            ServeParams {
+                port: 0,
+                binding: "127.0.0.1".to_string(),
+            },
+            true,
+            std::future::ready(()),
+        )
+        .await
+        .unwrap();
 
-        assert!(
-            shutdown_hook_fired.load(Ordering::SeqCst),
-            "on_shutdown should fire once the shutdown future resolves"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_await_shutdown_then_run_hook_waits_for_shutdown_before_running_hook() {
-        let app_context = get_app_context().await;
-        let shutdown_hook_fired = Arc::new(AtomicBool::new(false));
-        app_context.shared_store.insert(shutdown_hook_fired.clone());
-
-        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
-        let shutdown = async move {
-            let _ = rx.await;
-        };
-
-        let fut = await_shutdown_then_run_hook::<ShutdownFlagHooks>(&app_context, shutdown);
-        futures_util::pin_mut!(fut);
-
-        // Poll once: the shutdown future hasn't resolved yet, so the hook
-        // must not have run.
-        let still_pending = futures_util::poll!(&mut fut);
-        assert!(matches!(still_pending, std::task::Poll::Pending));
-        assert!(
-            !shutdown_hook_fired.load(Ordering::SeqCst),
-            "on_shutdown must not fire before shutdown resolves"
-        );
-
-        tx.send(()).expect("receiver dropped");
-        fut.await;
-
-        assert!(
-            shutdown_hook_fired.load(Ordering::SeqCst),
-            "on_shutdown should fire after shutdown resolves"
-        );
+        assert!(shutdown.is_cancelled());
+        assert_eq!(*events.lock().unwrap(), ["server stopped", "hook"]);
     }
 }

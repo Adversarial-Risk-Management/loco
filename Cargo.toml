@@ -95,7 +95,7 @@ sea-orm = { version = "2.0", features = [
 ], optional = true }
 
 tokio = { version = "1.45", default-features = false }
-tokio-util = "0.7"
+tokio-util = { version = "0.7", features = ["rt"] }
 # the rest
 
 serde = { workspace = true }
