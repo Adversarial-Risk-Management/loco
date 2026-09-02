@@ -8,8 +8,19 @@ use async_trait::async_trait;
 
 use crate::{app::AppContext, errors::Error, Result};
 
+/// Splits a `KEY:VALUE` argument at the first `:`.
+///
+/// # Errors
+///
+/// When the argument has no `:`.
+pub fn parse_key_val(arg: &str) -> std::result::Result<(String, String), String> {
+    arg.split_once(':')
+        .map(|(key, value)| (key.to_string(), value.to_string()))
+        .ok_or_else(|| format!("expected `key:value`, found no `:` in `{arg}`"))
+}
+
 /// Struct representing a collection of task arguments.
-#[derive(Default, Debug)]
+#[derive(Clone, Default, Debug)]
 pub struct Vars {
     /// A list of cli arguments.
     pub cli: BTreeMap<String, String>,

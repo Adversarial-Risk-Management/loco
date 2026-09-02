@@ -114,7 +114,7 @@ enum Commands {
         /// Task name (identifier)
         name: Option<String>,
         /// Task params (e.g. <`my_task`> foo:bar baz:qux)
-        #[clap(value_parser = parse_key_val::<String,String>)]
+        #[clap(value_parser = task::parse_key_val)]
         params: Vec<(String, String)>,
     },
     #[cfg(feature = "worker")]
@@ -212,7 +212,7 @@ enum ComponentArg {
         without_tz: bool,
 
         /// Model fields, eg. title:string hits:int
-        #[clap(value_parser = parse_key_val::<String,String>)]
+        #[clap(value_parser = task::parse_key_val)]
         fields: Vec<(String, String)>,
     },
     #[cfg(feature = "with-db")]
@@ -265,7 +265,7 @@ After running the migration, follow these steps to complete the process:
         without_tz: bool,
 
         /// Table fields, eg. title:string hits:int
-        #[clap(value_parser = parse_key_val::<String,String>, )]
+        #[clap(value_parser = task::parse_key_val, )]
         fields: Vec<(String, String)>,
     },
     #[cfg(feature = "with-db")]
@@ -300,7 +300,7 @@ After running the migration, follow these steps to complete the process:
         htmx: bool,
 
         /// Model fields, eg. title:string hits:int
-        #[clap(value_parser = parse_key_val::<String,String>)]
+        #[clap(value_parser = task::parse_key_val)]
         fields: Vec<(String, String)>,
     },
     /// Generate a new controller with the given controller name, and test file.
@@ -687,22 +687,6 @@ enum JobsCommands {
         #[arg(long, default_value_t = 0)]
         from_age: i64,
     },
-}
-
-/// Parse a single key-value pair
-fn parse_key_val<T, U>(
-    s: &str,
-) -> std::result::Result<(T, U), Box<dyn std::error::Error + Send + Sync>>
-where
-    T: std::str::FromStr,
-    T::Err: std::error::Error + Send + Sync + 'static,
-    U: std::str::FromStr,
-    U::Err: std::error::Error + Send + Sync + 'static,
-{
-    let pos = s
-        .find(':')
-        .ok_or_else(|| format!("expected `key:value`, found no `:` in `{s}`"))?;
-    Ok((s[..pos].parse()?, s[pos + 1..].parse()?))
 }
 
 #[cfg(feature = "with-db")]
@@ -1211,10 +1195,10 @@ mod tests {
     #[test]
     fn key_value_pairs_split_on_the_first_colon() {
         assert_eq!(
-            parse_key_val::<String, String>("url:http://example.com").unwrap(),
+            task::parse_key_val("url:http://example.com").unwrap(),
             ("url".to_string(), "http://example.com".to_string())
         );
-        assert!(parse_key_val::<String, String>("no-separator")
+        assert!(task::parse_key_val("no-separator")
             .unwrap_err()
             .to_string()
             .contains("key:value"));
