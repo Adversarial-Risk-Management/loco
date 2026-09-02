@@ -95,8 +95,9 @@ pub async fn start<H: Hooks>(
 ) -> Result<()> {
     if boot.run_scheduler {
         let scheduler = scheduler::<H>(&boot.app_context, None, None, None)?;
+        let app_context = boot.app_context.clone();
         tokio::spawn(async move {
-            if let Err(err) = scheduler.run().await {
+            if let Err(err) = scheduler.run(&app_context).await {
                 error!(err = err.to_string(), "error while running scheduler");
             }
         });
@@ -278,7 +279,7 @@ pub async fn run_scheduler<H: Hooks>(
         println!("{scheduler}");
         Ok(())
     } else {
-        Ok(scheduler.run().await?)
+        Ok(scheduler.run(app_context).await?)
     }
 }
 
