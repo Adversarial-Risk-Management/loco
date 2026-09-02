@@ -9,7 +9,7 @@ Rust doesn't let you reach for a mutable global app instance the way Rails or Dj
 
 ## `AppContext` as the one shared-state object
 
-Every handler, background worker, task, and scheduled job in a Loco app receives the same `AppContext` value — assembled once at boot (see [Architecture](/docs/explanation/architecture)) and cloned cheaply wherever it's needed, because most of its fields are already `Arc<...>`-wrapped or otherwise cheap to clone. It carries eight fields:
+Every handler, background worker, task, and scheduled job in a Loco app receives the same `AppContext` value — assembled once at boot (see [Architecture](/docs/explanation/architecture)) and cloned cheaply wherever it's needed, because most of its fields are already `Arc<...>`-wrapped or otherwise cheap to clone. It carries nine fields:
 
 ```rust
 #[derive(Clone, FromRef)]
@@ -24,6 +24,7 @@ pub struct AppContext {
     pub storage: Arc<Storage>,
     pub cache: Arc<cache::Cache>,
     pub shared_store: Arc<SharedStore>,
+    pub shutdown: CancellationToken,
 }
 ```
 
@@ -36,7 +37,7 @@ The full field-by-field reference — types, feature gates, purpose — lives in
 
 ## The gap `AppContext`'s fixed fields can't fill
 
-`AppContext`'s eight fields cover what *every* Loco app needs. They obviously can't cover what *your* app needs — a third-party API client, a feature-flag SDK handle, an app-specific cache of precomputed data. Two options exist, and they aren't in tension, they're the same design carried into two different lifecycles:
+`AppContext`'s nine fields cover what *every* Loco app needs. They obviously can't cover what *your* app needs — a third-party API client, a feature-flag SDK handle, an app-specific cache of precomputed data. Two options exist, and they aren't in tension, they're the same design carried into two different lifecycles:
 
 - **`Initializer`** (see [Add middleware](/docs/how-to/add-middleware)) is the *install-time* extension point: a trait with `before_run`, `after_routes`, and `check` hooks, used to wire a whole piece of infrastructure into the app (register an Axum `Extension`, mount a session layer, install a doctor health check).
 - **`SharedStore`** is the *storage* extension point: a place to actually hold a value of a type Loco has never heard of, so it can be read back out in a handler, a worker, or anywhere else `AppContext` reaches.

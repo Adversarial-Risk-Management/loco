@@ -25,7 +25,7 @@ forced it, never because Loco disagreed with Rails.
 
 ## Everything hangs off `AppContext`
 
-Handlers receive it as `State(ctx): State<AppContext>`. Eight fields, and they
+Handlers receive it as `State(ctx): State<AppContext>`. Nine fields, and they
 are the answer to most "how do I get at X" questions:
 
 | Field | Use |
@@ -38,6 +38,7 @@ are the answer to most "how do I get at X" questions:
 | `ctx.queue_provider` | background queue (workers use it via `&ctx`) |
 | `ctx.shared_store` | `Arc<SharedStore>`, typed DI slot; populated in `Hooks::after_context` |
 | `ctx.environment` | current environment |
+| `ctx.shutdown` | `CancellationToken`, the application-wide shutdown signal; cancelled before Loco stops accepting work |
 
 ## Which file does what
 
