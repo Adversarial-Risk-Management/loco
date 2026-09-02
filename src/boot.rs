@@ -237,10 +237,10 @@ fn scheduler<H: Hooks>(
     );
 
     let scheduler = match config_path {
-        Some(path) => Scheduler::from_config::<H>(path, &app_context.environment)?,
+        Some(path) => Scheduler::from_config::<H>(path, app_context)?,
         None => {
             if let Some(config) = &app_context.config.scheduler {
-                Scheduler::new::<H>(config, &app_context.environment)?
+                Scheduler::new::<H>(config, app_context)?
             } else {
                 return Err(Error::Scheduler(scheduler::Error::Empty));
             }

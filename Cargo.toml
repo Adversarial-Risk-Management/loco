@@ -180,6 +180,7 @@ bb8 = { version = "0.9", optional = true }
 # Scheduler
 tokio-cron-scheduler = { version = "0.15", features = ["signal"] }
 english-to-cron = { version = "0.1.2" }
+shell-words = { version = "1.1" }
 
 # worker: pg + sqlite backed queue workers.
 # `tls-rustls-ring-webpki` gives the standalone pg/sqlite worker pool a TLS
