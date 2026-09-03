@@ -30,7 +30,7 @@ Have a default implementation; override to change behavior.
 | Method | Signature | Default behavior |
 |---|---|---|
 | `app_version` | `fn app_version() -> String` (`:285`) | Returns `"dev".to_string()`. |
-| `serve` | `async fn serve(app: AxumRouter, ctx: &AppContext, serve_params: &ServeParams) -> Result<()>` (`:331-351`) | Binds a `tokio::net::TcpListener` on `serve_params.binding:serve_params.port` and runs `axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())` with graceful shutdown; on shutdown, calls `Self::on_shutdown(&ctx)`. |
+| `serve` | `async fn serve(app: AxumRouter, ctx: &AppContext, serve_params: &ServeParams) -> Result<()>` (`:331-351`) | Binds a `tokio::net::TcpListener` on `serve_params.binding:serve_params.port` and runs `axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())` with graceful shutdown driven by `ctx.shutdown`. |
 | `init_logger` | `fn init_logger(_ctx: &AppContext) -> Result<bool>` (`:360-362`) | Returns `Ok(false)`, meaning Loco initializes its own tracing/logging stack. |
 | `load_config` | `async fn load_config(env: &Environment) -> Result<Config>` (`:368-370`) | Returns `env.load()` — the standard `config/{env}.yaml` (+ `.local.yaml` overlay) loading path. |
 | `before_routes` | `async fn before_routes(_ctx: &AppContext) -> Result<AxumRouter<AppContext>>` (`:378`) | Returns `Ok(AxumRouter::new())` — an empty router. |
@@ -40,7 +40,7 @@ Have a default implementation; override to change behavior.
 | `before_run` | `async fn before_run(_app_context: &AppContext) -> Result<()>` (`:408`) | Returns `Ok(())` — no-op. |
 | `after_context` | `async fn after_context(ctx: AppContext) -> Result<AppContext>` (`:416`) | Returns `Ok(ctx)` unchanged. |
 | `dump` | `#[cfg(feature = "with-db")] async fn dump(ctx: &AppContext, base: &Path) -> Result<()>` (`:593-596`) | Dumps every table to YAML fixtures under `base` via schema introspection (`db::dump_tables`). The counterpart to `seed`, backing `cargo loco db seed --dump`. Override it to dump specific entities with the typed, streaming `db::dump::<users::ActiveModel>(..)` instead, for full type fidelity and bounded memory. Only on the trait when `with-db` is enabled. |
-| `on_shutdown` | `async fn on_shutdown(_ctx: &AppContext)` (`:442`) | No-op. |
+| `on_shutdown` | `async fn on_shutdown(_ctx: &AppContext)` (`:442`) | No-op. Runs once after active server requests, queue jobs, and scheduler jobs drain. |
 
 ## Override points
 
@@ -97,7 +97,13 @@ Runs before the app starts serving/running (applies to the server and to other r
 async fn serve(app: AxumRouter, ctx: &AppContext, serve_params: &ServeParams) -> Result<()>
 ```
 
-Runs when the app is started in server mode. The default binds a `TcpListener` and calls `axum::serve` with `app.into_make_service_with_connect_info::<SocketAddr>()` — the `connect_info` layer is required for `remote_ip`/client-address extraction in controllers — wrapped in graceful shutdown that calls `on_shutdown`. Override only to change the transport/serve mechanics (e.g. custom TLS termination); overriding without preserving `into_make_service_with_connect_info` will break connect-info extraction.
+Runs when the app is started in server mode. The default binds a `TcpListener` and calls `axum::serve` with `app.into_make_service_with_connect_info::<SocketAddr>()` — the `connect_info` layer is required for `remote_ip`/client-address extraction in controllers — wrapped in graceful shutdown driven by `ctx.shutdown`. An override must also stop accepting requests when `ctx.shutdown.cancelled()` resolves. Override only to change the transport/serve mechanics (e.g. custom TLS termination); overriding without preserving `into_make_service_with_connect_info` will break connect-info extraction.
+
+## Shutdown lifecycle
+
+Loco handles `SIGINT` and `SIGTERM` once for the whole application. It cancels `ctx.shutdown`, makes `/_readiness` return `503` while `/_health` remains live, stops the HTTP server, queue workers, and scheduler from taking new work, then waits for active work to finish. `Hooks::on_shutdown` runs once after that drain. Use it to flush telemetry and release app-wide resources.
+
+Loco does not impose its own shutdown timeout. The deployment platform owns the hard deadline. For example, [Cloud Run sends `SIGKILL` 10 seconds after `SIGTERM`](https://docs.cloud.google.com/run/docs/container-contract), so the application must drain and finish `on_shutdown` within that period.
 
 ### `app_version` — composite version string
 

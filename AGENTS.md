@@ -21,9 +21,10 @@ https://loco.rs/llms-full.txt.
    boilerplate. `scaffold`/`controller` require exactly one of `--api`/
    `--html`/`--htmx` (no default; omitting all is a hard error).
 2. **Everything hangs off `AppContext`.** Handlers, workers, tasks, and
-   initializers receive `&AppContext` (`ctx`), with 8 fields: `db` (`with-db`
+   initializers receive `&AppContext` (`ctx`), with 9 fields: `db` (`with-db`
    only), `config`, `mailer`, `storage`, `cache`, `queue_provider`,
-   `shared_store` (a type-keyed DI container), `environment`. Do not create
+   `shared_store` (a type-keyed DI container), `environment`, `shutdown` (the
+   application-wide cancellation token). Do not create
    your own DB pool, HTTP server, or job queue.
 3. **`use loco_rs::prelude::*;`** at the top of controllers/models/workers/tasks
    brings in the common types (`AppContext`, `Result`, `Routes`, `Json`,
