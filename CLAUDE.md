@@ -8,22 +8,31 @@ for the fork model, the patch ledger, the release-tag scheme, and the upstream-s
 
 - **`master` mirrors upstream exactly** — never commit fork-only changes to it; syncs are
   fast-forwards.
-- **Patches live on the version-line branch** (`1.0.x-arm`, previously `0.16.x-arm`): one commit
-  per patch, linear, so any patch can be cherry-picked/backported in isolation. New patches get
-  their own branch + PR targeting the active line branch, and a row in the `FORK.md` ledger.
+- **Patches live on the version-line branch** (currently `1.2.x-arm`; older lines `1.1.x-arm`,
+  `1.0.x-arm`, `0.16.x-arm`): one commit per patch, linear, so any patch can be
+  cherry-picked/backported in isolation. New patches get their own branch + PR targeting the
+  active line branch, and a row in the `FORK.md` ledger.
 - **One branch per patch**, kept rebased on the active line branch. The repo is squash-merge only.
-- **Releases are git tags** `v<upstream-version>-arm.<N>` (e.g. `v1.0.0-arm.1`), cut on the
+- **Releases are git tags** `v<upstream-version>-arm.<N>` (e.g. `v1.2.0-arm.1`), cut on the
   version-line branch tip. The `Cargo.toml` version stays at upstream's value. Never add fork
   releases to `CHANGELOG.md`.
 - To sync upstream or cut a release, use the `fork-sync` skill (`.claude/skills/fork-sync/`).
 
 ## Before pushing any Rust change
 
-CI's `style` gate fails the build on either of these, so run both locally first:
+CI's `style` gate fails the build on either of these, so run both locally first, on the toolchain
+CI pins (`RUST_TOOLCHAIN` in `.github/workflows/loco-rs-ci.yml`, e.g. `cargo +1.98 ...`):
 
 ```sh
 cargo fmt --all -- --check
-cargo clippy --all-features -- -D warnings -W clippy::pedantic -W clippy::nursery -W rust-2018-idioms
+cargo clippy --workspace --all-features -- -D warnings -W clippy::pedantic -W clippy::nursery -W rust-2018-idioms
+```
+
+If the change touches `loco-rs`'s public API, also regenerate the agent-skill API index and commit
+it with the change — the `docs` workflow fails any PR where it is stale:
+
+```sh
+cargo +nightly run -p xtask -- agent-skill
 ```
 
 ## Existing upstream docs (don't duplicate — link to them)

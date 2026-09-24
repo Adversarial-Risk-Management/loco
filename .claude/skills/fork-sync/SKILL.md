@@ -31,7 +31,8 @@ the remote.
   branch (`git merge v1.0.1`; append-only, no force-push), dropping any patch upstream absorbed
   (record it in the ledger). Rebase onto the tag instead only when a linear history is worth a
   force-push.
-- New upstream version line: create `M.x-arm` from `master` and cherry-pick each still-needed
+- New upstream version line: create `M.x-arm` from the upstream release tag
+  (`git checkout -b 1.2.x-arm v1.2.0`) and cherry-pick each still-needed
   patch commit from the previous line branch, one commit per patch, so every patch stays
   individually backportable.
 
@@ -43,9 +44,14 @@ For every branch in the ledger that is not yet merged into the line branch:
 - Run the **CI style gate** and fix fallout (newer toolchains add lints):
   ```sh
   cargo fmt --all
-  cargo clippy --all-features -- -D warnings -W clippy::pedantic -W clippy::nursery -W rust-2018-idioms
+  cargo clippy --workspace --all-features -- -D warnings -W clippy::pedantic -W clippy::nursery -W rust-2018-idioms
   ```
+  Use the toolchain CI pins (`RUST_TOOLCHAIN` in `.github/workflows/loco-rs-ci.yml`, e.g.
+  `cargo +1.98 clippy ...`), not whatever `stable` is locally.
   Fold formatting/lint fixes into the patch commits (amend the tip), keeping history linear.
+- If the patch changes `loco-rs`'s public API, regenerate the agent-skill API index
+  (`cargo +nightly run -p xtask -- agent-skill`) and fold the result into the patch commit; the
+  `docs` workflow runs `agent-skill --check` on every PR.
 - `cargo check --workspace --all-features` must pass.
 - Report which branches rebased cleanly and which needed conflict resolution.
 
