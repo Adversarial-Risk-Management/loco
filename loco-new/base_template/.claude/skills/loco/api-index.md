@@ -1043,6 +1043,7 @@ since they restate the trait's own API.
 - `variant` **IO**
 - `variant` **InvalidConfigSchema**
 - `variant` **InvalidCronSyntax**
+- `variant` **InvalidTaskArgument**
 - `variant` **Question**
 - `variant` **TaskNotFound**
 
@@ -1064,7 +1065,7 @@ since they restate the trait's own API.
 - `fn` **by_spec**`(self: Self, include_jobs: &Spec) -> Self` — Filters the scheduler's jobs based on the provided specification
 - `fn` **from_config**`(config: &Path, environment: &Environment) -> Result<Self>` — Creates a new scheduler instance from the given configuration file
 - `fn` **new**`(data: &Config, environment: &Environment) -> Result<Self>` — Creates a new scheduler instance from the provided configuration data
-- `fn` **run**`(self: Self) -> Result<()>` — Runs the scheduled jobs according to their cron expressions
+- `fn` **run**`(self: Self, app_context: &AppContext) -> Result<()>` — Runs the scheduled jobs according to their cron expressions
 ## `schema`
 
 - `enum` **ArrayColType**
