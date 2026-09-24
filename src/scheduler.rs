@@ -3,8 +3,11 @@
 
 use std::{
     collections::HashMap,
-    fmt, io,
+    fmt,
+    future::Future,
+    io,
     path::{Path, PathBuf},
+    pin::Pin,
     sync::{Arc, OnceLock},
     time::{Duration, Instant},
 };
@@ -12,11 +15,13 @@ use std::{
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use tokio_cron_scheduler::{JobScheduler, JobSchedulerError};
+use tokio_util::{sync::CancellationToken, task::TaskTracker};
 use tracing::Instrument;
 use uuid::Uuid;
 
 use crate::{
     app::{AppContext, Hooks},
+    boot::{drain_or_force_quit, shutdown_signal},
     environment::Environment,
     task::{Tasks, Vars},
 };
@@ -336,8 +341,33 @@ impl Scheduler {
     ///
     /// When could not add job to the scheduler
     pub async fn run(self, app_context: &AppContext) -> Result<()> {
+        let shutdown = app_context.shutdown.clone();
+        let run = self.run_until(app_context, shutdown.clone());
+        tokio::pin!(run);
+
+        tokio::select! {
+            result = run.as_mut() => result,
+            () = shutdown_signal() => {
+                shutdown.cancel();
+                drain_or_force_quit(run).await.unwrap_or(Ok(()))
+            }
+        }
+    }
+
+    /// Runs the scheduled jobs until `shutdown` is cancelled, then waits for
+    /// every active job to finish.
+    ///
+    /// The wait has no time limit. Callers that serve an operator must wrap
+    /// this future in [`drain_or_force_quit`] so a stuck job cannot block
+    /// process exit.
+    pub(crate) async fn run_until(
+        self,
+        app_context: &AppContext,
+        shutdown: CancellationToken,
+    ) -> Result<()> {
         let mut sched = JobScheduler::new().await?;
         let app_context = Arc::new(app_context.clone());
+        let active_jobs = TaskTracker::new();
 
         for (job_name, job) in &self.jobs {
             let execution = if job.shell {
@@ -370,38 +400,67 @@ impl Scheduler {
             if job.run_on_start {
                 let execution = execution.clone();
                 let job_name = job_name.clone();
+                let active_jobs = active_jobs.clone();
+                let shutdown = shutdown.clone();
                 sched
                     .add(tokio_cron_scheduler::Job::new_one_shot_async(
                         Duration::from_secs(0),
                         move |uuid, _l| {
                             let execution = execution.clone();
                             let job_name = job_name.clone();
-                            Box::pin(execute_job(job_name, uuid, execution))
+                            tracked_job(&active_jobs, &shutdown, job_name, uuid, execution)
                         },
                     )?)
                     .await?;
             }
 
             let job_name = job_name.clone();
+            let active_jobs = active_jobs.clone();
+            let shutdown = shutdown.clone();
             sched
                 .add(tokio_cron_scheduler::Job::new_async(
                     cron_syntax.as_str(),
                     move |uuid, mut _l| {
                         let execution = execution.clone();
                         let job_name = job_name.clone();
-                        Box::pin(execute_job(job_name, uuid, execution))
+                        tracked_job(&active_jobs, &shutdown, job_name, uuid, execution)
                     },
                 )?)
                 .await?;
         }
 
+        if shutdown.is_cancelled() {
+            return Ok(());
+        }
+
         sched.start().await?;
 
-        tokio::signal::ctrl_c().await?;
-        sched.shutdown().await?;
+        shutdown.cancelled().await;
+        active_jobs.close();
+        let shutdown_result = sched.shutdown().await;
+        active_jobs.wait().await;
+        shutdown_result?;
 
         Ok(())
     }
+}
+
+fn tracked_job(
+    active_jobs: &TaskTracker,
+    shutdown: &CancellationToken,
+    job_name: String,
+    uuid: Uuid,
+    execution: JobExecution,
+) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+    let active_job = active_jobs.token();
+    if active_jobs.is_closed() || shutdown.is_cancelled() {
+        return Box::pin(async {});
+    }
+
+    Box::pin(async move {
+        let _active_job = active_job;
+        execute_job(job_name, uuid, execution).await;
+    })
 }
 
 async fn execute_job(job_name: String, uuid: Uuid, execution: JobExecution) {
@@ -476,6 +535,7 @@ mod tests {
     use insta::assert_debug_snapshot;
     use rstest::rstest;
     use tests_cfg::db::AppHook;
+    use tokio::sync::Notify;
     use tokio::time::{self, Duration};
     use tree_fs::TreeBuilder;
 
@@ -483,6 +543,13 @@ mod tests {
     use crate::{task::TaskInfo, tests_cfg, Result as LocoResult};
 
     struct MarkTask;
+
+    struct WaitTask;
+
+    struct WaitTaskState {
+        started: Notify,
+        release: Notify,
+    }
 
     #[async_trait::async_trait]
     impl crate::task::Task for MarkTask {
@@ -499,6 +566,26 @@ mod tests {
                 .get::<Arc<AtomicBool>>()
                 .expect("test marker should be registered")
                 .store(true, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::task::Task for WaitTask {
+        fn task(&self) -> TaskInfo {
+            TaskInfo {
+                name: "wait".to_string(),
+                detail: "wait for test release".to_string(),
+            }
+        }
+
+        async fn run(&self, app_context: &AppContext, _vars: &Vars) -> LocoResult<()> {
+            let state = app_context
+                .shared_store
+                .get::<Arc<WaitTaskState>>()
+                .expect("test state should be registered");
+            state.started.notify_one();
+            state.release.notified().await;
             Ok(())
         }
     }
@@ -668,6 +755,58 @@ jobs:
         .await;
 
         assert!(marker.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn shutdown_waits_for_active_jobs() {
+        let (mut scheduler, _config_tree) = setup_scheduler_config();
+        scheduler.jobs = HashMap::from([(
+            "wait".to_string(),
+            Job {
+                run: "wait".to_string(),
+                shell: false,
+                run_on_start: true,
+                cron: "0 0 0 1 1 * 2099".to_string(),
+                tags: None,
+                output: None,
+            },
+        )]);
+
+        let mut tasks = Tasks::default();
+        tasks.register(WaitTask);
+        scheduler.tasks = Arc::new(tasks);
+
+        let app_context = tests_cfg::app::get_app_context().await;
+        let state = Arc::new(WaitTaskState {
+            started: Notify::new(),
+            release: Notify::new(),
+        });
+        app_context.shared_store.insert(Arc::clone(&state));
+
+        let shutdown = CancellationToken::new();
+        let scheduler_shutdown = shutdown.clone();
+        let mut handle =
+            tokio::spawn(
+                async move { scheduler.run_until(&app_context, scheduler_shutdown).await },
+            );
+
+        time::timeout(Duration::from_secs(2), state.started.notified())
+            .await
+            .expect("task should start");
+        shutdown.cancel();
+        assert!(
+            time::timeout(Duration::from_millis(100), &mut handle)
+                .await
+                .is_err(),
+            "scheduler should wait for the active task"
+        );
+
+        state.release.notify_one();
+        time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("scheduler should stop after the task finishes")
+            .unwrap()
+            .unwrap();
     }
 
     #[tokio::test]

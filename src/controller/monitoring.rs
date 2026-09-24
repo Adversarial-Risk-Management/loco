@@ -42,6 +42,13 @@ pub async fn health() -> Result<Response> {
 /// # Errors
 /// All errors are logged, and the readiness status is returned as a JSON response.
 pub async fn readiness(State(ctx): State<AppContext>) -> (StatusCode, Response) {
+    if ctx.shutdown.is_cancelled() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            format::json(Health { ok: false }).into_response(),
+        );
+    }
+
     // Check database connection
     #[cfg(feature = "with-db")]
     if let Err(error) = &ctx.db.ping().await {
@@ -170,6 +177,43 @@ mod tests {
             .unwrap();
         let res_json: Value = serde_json::from_slice(&body).expect("Valid JSON response");
         assert_eq!(res_json["ok"], true);
+    }
+
+    #[tokio::test]
+    async fn shutdown_fails_readiness_but_not_health() {
+        let ctx = tests_cfg::app::get_app_context().await;
+        ctx.shutdown.cancel();
+
+        let router = axum::Router::new()
+            .route("/_readiness", get(monitoring::readiness))
+            .route("/_health", get(monitoring::health))
+            .with_state(ctx);
+
+        let readiness = router
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/_readiness")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            readiness.status(),
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        );
+
+        let health = router
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/_health")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(health.status(), axum::http::StatusCode::OK);
     }
 
     #[cfg(not(feature = "with-db"))]

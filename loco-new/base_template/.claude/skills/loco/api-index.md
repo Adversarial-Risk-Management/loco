@@ -30,7 +30,7 @@ since they restate the trait's own API.
 - `variant` **LockfileError**
 ## `app`
 
-- `struct` **AppContext**` { environment: Environment, db: DatabaseConnection, queue_provider: Option<Arc<Queue>>, config: Config, mailer: Option<EmailSender>, storage: Arc<Storage>, cache: Arc<Cache>, shared_store: Arc<SharedStore> }` — Represents the application context for a web server
+- `struct` **AppContext**` { environment: Environment, db: DatabaseConnection, queue_provider: Option<Arc<Queue>>, config: Config, mailer: Option<EmailSender>, storage: Arc<Storage>, cache: Arc<Cache>, shared_store: Arc<SharedStore>, shutdown: CancellationToken }` — Represents the application context for a web server
 - `struct` **AppContextBuilder** — Builder for [`AppContext`]
 - `trait` **Hooks** — A trait that defines hooks for customizing and extending the behavior of a
 - `trait` **Initializer** — An initializer
@@ -66,7 +66,7 @@ since they restate the trait's own API.
 - `fn` **initializers**`(_ctx: &AppContext) -> Pin<Box<dyn Future + Send>>` — Provide a list of initializers
 - `fn` **load_config**`(env: &Environment) -> Pin<Box<dyn Future + Send>>` — Loads the configuration settings for the application based on the given environment
 - `fn` **middlewares**`(ctx: &AppContext) -> Vec<Box<dyn MiddlewareLayer>>` — Provide a list of middlewares
-- `fn` **on_shutdown**`(_ctx: &AppContext) -> Pin<Box<dyn Future + Send>>` — Called when the application is shutting down
+- `fn` **on_shutdown**`(_ctx: &AppContext) -> Pin<Box<dyn Future + Send>>` — Called after the application stops accepting work and active work has
 - `fn` **register_tasks**`(tasks: &mut Tasks)` — Registers custom tasks with the provided [`Tasks`] object
 - `fn` **routes**`(_ctx: &AppContext) -> AppRoutes` — Defines the application's routing configuration
 - `fn` **seed**`(_ctx: &AppContext, path: &Path) -> Pin<Box<dyn Future + Send>>` — Seeds the database with initial data

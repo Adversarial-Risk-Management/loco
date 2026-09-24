@@ -13,10 +13,11 @@ use async_trait::async_trait;
 use axum::extract::FromRef;
 use axum::Router as AxumRouter;
 use dashmap::DashMap;
+use tokio_util::sync::CancellationToken;
 
 use crate::{
     bgworker::{self, Queue},
-    boot::{shutdown_signal, BootResult, ServeParams, StartMode},
+    boot::{BootResult, ServeParams, StartMode},
     cache::{self},
     config::Config,
     controller::{
@@ -271,6 +272,8 @@ pub struct AppContext {
     pub cache: Arc<cache::Cache>,
     /// Shared store for arbitrary application data
     pub shared_store: Arc<SharedStore>,
+    /// Resolves when the application starts shutting down.
+    pub shutdown: CancellationToken,
 }
 
 /// Builder for [`AppContext`].
@@ -291,6 +294,7 @@ pub struct AppContextBuilder {
     storage: Option<Arc<Storage>>,
     cache: Option<Arc<cache::Cache>>,
     shared_store: Option<Arc<SharedStore>>,
+    shutdown: CancellationToken,
 }
 
 impl AppContext {
@@ -310,6 +314,7 @@ impl AppContext {
             storage: None,
             cache: None,
             shared_store: None,
+            shutdown: CancellationToken::new(),
         }
     }
 
@@ -324,6 +329,7 @@ impl AppContext {
             storage: None,
             cache: None,
             shared_store: None,
+            shutdown: CancellationToken::new(),
         }
     }
 
@@ -358,6 +364,7 @@ impl AppContext {
             storage: Some(self.storage),
             cache: Some(self.cache),
             shared_store: Some(self.shared_store),
+            shutdown: self.shutdown,
         }
     }
 }
@@ -408,6 +415,7 @@ impl AppContextBuilder {
             shared_store: self
                 .shared_store
                 .unwrap_or_else(|| Arc::new(SharedStore::default())),
+            shutdown: self.shutdown,
         }
     }
 }
@@ -480,11 +488,7 @@ pub trait Hooks: Send {
             listener,
             app.into_make_service_with_connect_info::<SocketAddr>(),
         )
-        .with_graceful_shutdown(async move {
-            shutdown_signal().await;
-            tracing::info!("shutting down...");
-            Self::on_shutdown(&cloned_ctx).await;
-        })
+        .with_graceful_shutdown(cloned_ctx.shutdown.cancelled_owned())
         .await?;
 
         Ok(())
@@ -595,9 +599,8 @@ pub trait Hooks: Send {
         crate::db::dump_tables(&ctx.db, base, None).await
     }
 
-    /// Called when the application is shutting down.
-    /// This function allows users to perform any necessary cleanup or final
-    /// actions before the application stops completely.
+    /// Called after the application stops accepting work and active work has
+    /// drained. Use this hook for final cleanup, such as flushing telemetry.
     async fn on_shutdown(_ctx: &AppContext) {}
 }
 
@@ -907,6 +910,11 @@ mod tests {
         );
         assert!(after.mailer.is_some(), "mailer was dropped");
         assert_eq!(after.environment, before.environment);
+        after.shutdown.cancel();
+        assert!(
+            before.shutdown.is_cancelled(),
+            "shutdown token was replaced"
+        );
         assert!(
             after
                 .shared_store
