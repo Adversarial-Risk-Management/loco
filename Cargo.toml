@@ -72,9 +72,21 @@ db-sqlite = [
 multi-tenancy = ["with-db"]
 # Storage features
 all_storage = ["storage_aws_s3", "storage_azure", "storage_gcp"]
-storage_aws_s3 = ["opendal/services-s3"]
-storage_azure = ["opendal/services-azblob"]
-storage_gcp = ["opendal/services-gcs"]
+storage_aws_s3 = [
+    "opendal/services-s3",
+    "opendal/http-transport-reqwest",
+    "opendal/auto-register-services",
+]
+storage_azure = [
+    "opendal/services-azblob",
+    "opendal/http-transport-reqwest",
+    "opendal/auto-register-services",
+]
+storage_gcp = [
+    "opendal/services-gcs",
+    "opendal/http-transport-reqwest",
+    "opendal/auto-register-services",
+]
 # Cache feature
 cache_inmem = ["dep:moka"]
 cache_redis = ["dep:bb8-redis", "dep:bb8"]
