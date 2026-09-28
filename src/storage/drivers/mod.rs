@@ -17,6 +17,8 @@ pub mod opendal_adapter;
 
 #[cfg(all(test, feature = "storage_aws_s3"))]
 mod aws_presign_tests;
+#[cfg(all(test, feature = "storage_aws_s3"))]
+mod http_transport_tests;
 
 use super::{stream::BytesStream, StorageError, StorageResult};
 
