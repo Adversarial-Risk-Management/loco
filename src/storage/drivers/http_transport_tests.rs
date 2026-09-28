@@ -1,11 +1,11 @@
 //! The HTTP-backed drivers reach the network.
 //!
 //! opendal 0.58 ships no HTTP client unless a transport is installed, and loco
-//! enables opendal without its default features, so a driver that forgets to
-//! install one fails every request with "default HTTP transport is not
-//! installed" before anything is sent. These tests point a real driver at a
-//! local endpoint and check the request arrives, which no in-memory or
-//! filesystem test can show.
+//! enables opendal without its default features, so unless the `storage_*`
+//! features turn the transport back on, every request fails with "default HTTP
+//! transport is not installed" before anything is sent. These tests point a
+//! real driver at a local endpoint and check the request arrives, which no
+//! in-memory or filesystem test can show.
 
 use std::{
     path::Path,
@@ -79,7 +79,7 @@ async fn mock_endpoint() -> (String, Arc<AtomicUsize>) {
 }
 
 #[tokio::test]
-async fn s3_driver_uploads_through_the_installed_transport() {
+async fn s3_driver_uploads_over_http() {
     let (endpoint, requests) = mock_endpoint().await;
     let store = aws::with_credentials_and_endpoint(
         "loco-transport-probe",

@@ -1,6 +1,6 @@
 use opendal::{services::Azblob, Operator};
 
-use super::{install_http_transport, StoreDriver};
+use super::StoreDriver;
 use crate::storage::{drivers::opendal_adapter::OpendalAdapter, StorageResult};
 
 /// Create new Azure storage using authentication from the environment.
@@ -27,7 +27,6 @@ pub fn new(
         .account_name(account_name)
         .endpoint(endpoint);
 
-    install_http_transport();
     // opendal 0.58: Operator::new returns a finished Operator (no .finish()).
     Ok(Box::new(OpendalAdapter::new(Operator::new(azure)?)))
 }
@@ -60,6 +59,5 @@ pub fn with_credentials(
         .endpoint(endpoint)
         .account_key(access_key);
 
-    install_http_transport();
     Ok(Box::new(OpendalAdapter::new(Operator::new(azure)?)))
 }

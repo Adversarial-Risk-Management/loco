@@ -1,6 +1,6 @@
 use opendal::{services::Gcs, Operator};
 
-use super::{install_http_transport, StoreDriver};
+use super::StoreDriver;
 use crate::storage::{drivers::opendal_adapter::OpendalAdapter, StorageResult};
 
 /// Create new GCP storage using Application Default Credentials.
@@ -17,7 +17,6 @@ use crate::storage::{drivers::opendal_adapter::OpendalAdapter, StorageResult};
 pub fn new(bucket_name: &str) -> StorageResult<Box<dyn StoreDriver>> {
     let gcs = Gcs::default().bucket(bucket_name);
 
-    install_http_transport();
     Ok(Box::new(OpendalAdapter::new(Operator::new(gcs)?)))
 }
 
@@ -40,7 +39,6 @@ pub fn with_credentials(
         .bucket(bucket_name)
         .credential_path(credential_path);
 
-    install_http_transport();
     // opendal 0.58: Operator::new returns a finished Operator (no .finish()).
     Ok(Box::new(OpendalAdapter::new(Operator::new(gcs)?)))
 }

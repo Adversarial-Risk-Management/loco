@@ -72,16 +72,29 @@ db-sqlite = [
 multi-tenancy = ["with-db"]
 # Storage features
 all_storage = ["storage_aws_s3", "storage_azure", "storage_gcp"]
-# The HTTP-backed services also need opendal's reqwest transport. opendal 0.58
-# made the HTTP client optional, and with `default-features = false` nothing
-# installs one, so every request fails with "default HTTP transport is not
-# installed". Each driver installs it when built (see
-# `storage::drivers::install_http_transport`). `http-transport-reqwest` is
-# opendal's own default: reqwest's rustls with its bundled aws-lc-rs provider,
-# so it works without the app installing a process-wide crypto provider.
-storage_aws_s3 = ["opendal/services-s3", "opendal/http-transport-reqwest"]
-storage_azure = ["opendal/services-azblob", "opendal/http-transport-reqwest"]
-storage_gcp = ["opendal/services-gcs", "opendal/http-transport-reqwest"]
+# The HTTP-backed services also need an HTTP client. opendal 0.58 made it
+# optional, and with `default-features = false` nothing installs one, so every
+# request fails with "default HTTP transport is not installed". These restore
+# two of opendal's defaults: `http-transport-reqwest` (reqwest on rustls with
+# its bundled aws-lc-rs provider, so the app need not install a crypto
+# provider) and `auto-register-services`, whose process constructor installs
+# that transport before `main`. It takes the process-wide default slot (first
+# install wins), so an app that wants another transport sets it per operator.
+storage_aws_s3 = [
+    "opendal/services-s3",
+    "opendal/http-transport-reqwest",
+    "opendal/auto-register-services",
+]
+storage_azure = [
+    "opendal/services-azblob",
+    "opendal/http-transport-reqwest",
+    "opendal/auto-register-services",
+]
+storage_gcp = [
+    "opendal/services-gcs",
+    "opendal/http-transport-reqwest",
+    "opendal/auto-register-services",
+]
 # Cache feature
 cache_inmem = ["dep:moka"]
 cache_redis = ["dep:bb8-redis", "dep:bb8"]
