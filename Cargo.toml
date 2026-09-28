@@ -72,9 +72,16 @@ db-sqlite = [
 multi-tenancy = ["with-db"]
 # Storage features
 all_storage = ["storage_aws_s3", "storage_azure", "storage_gcp"]
-storage_aws_s3 = ["opendal/services-s3"]
-storage_azure = ["opendal/services-azblob"]
-storage_gcp = ["opendal/services-gcs"]
+# The HTTP-backed services also need opendal's reqwest transport. opendal 0.58
+# made the HTTP client optional, and with `default-features = false` nothing
+# installs one, so every request fails with "default HTTP transport is not
+# installed". Each driver installs it when built (see
+# `storage::drivers::install_http_transport`). `http-transport-reqwest` is
+# opendal's own default: reqwest's rustls with its bundled aws-lc-rs provider,
+# so it works without the app installing a process-wide crypto provider.
+storage_aws_s3 = ["opendal/services-s3", "opendal/http-transport-reqwest"]
+storage_azure = ["opendal/services-azblob", "opendal/http-transport-reqwest"]
+storage_gcp = ["opendal/services-gcs", "opendal/http-transport-reqwest"]
 # Cache feature
 cache_inmem = ["dep:moka"]
 cache_redis = ["dep:bb8-redis", "dep:bb8"]

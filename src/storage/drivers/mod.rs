@@ -17,6 +17,25 @@ pub mod opendal_adapter;
 
 #[cfg(all(test, feature = "storage_aws_s3"))]
 mod aws_presign_tests;
+#[cfg(all(test, feature = "storage_aws_s3"))]
+mod http_transport_tests;
+
+/// Install opendal's process-wide reqwest HTTP transport.
+///
+/// opendal 0.58 made the HTTP client optional, and loco enables opendal with
+/// `default-features = false`, so without this every request an HTTP-backed
+/// service (S3, Azure Blob, GCS) makes fails with "default HTTP transport is
+/// not installed". The first install wins and later calls do nothing, so each
+/// HTTP driver calls this when it is built, and an app that installed its own
+/// transport first keeps it.
+#[cfg(any(
+    feature = "storage_aws_s3",
+    feature = "storage_azure",
+    feature = "storage_gcp"
+))]
+pub(crate) fn install_http_transport() {
+    opendal::install_default();
+}
 
 use super::{stream::BytesStream, StorageError, StorageResult};
 

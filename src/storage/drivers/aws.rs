@@ -1,6 +1,6 @@
 use opendal::{services::S3, Operator};
 
-use super::{opendal_adapter::OpendalAdapter, StoreDriver};
+use super::{install_http_transport, opendal_adapter::OpendalAdapter, StoreDriver};
 use crate::storage::StorageResult;
 
 /// A set of AWS security credentials
@@ -27,6 +27,7 @@ pub struct Credential {
 /// When could not initialize the client instance
 pub fn new(bucket_name: &str, region: &str) -> StorageResult<Box<dyn StoreDriver>> {
     let s3 = S3::default().bucket(bucket_name).region(region);
+    install_http_transport();
     // opendal 0.58: Operator::new returns a finished Operator (no .finish()).
     Ok(Box::new(OpendalAdapter::new(Operator::new(s3)?)))
 }
@@ -68,6 +69,7 @@ pub fn with_credentials_and_endpoint(
     if let Some(token) = credentials.token {
         s3 = s3.session_token(&token);
     }
+    install_http_transport();
     Ok(Box::new(OpendalAdapter::new(Operator::new(s3)?)))
 }
 
@@ -100,5 +102,6 @@ pub fn with_credentials(
     if let Some(token) = credentials.token {
         s3 = s3.session_token(&token);
     }
+    install_http_transport();
     Ok(Box::new(OpendalAdapter::new(Operator::new(s3)?)))
 }
