@@ -2,8 +2,13 @@
 
 `Adversarial-Risk-Management/loco` is a fork of [`loco-rs/loco`](https://github.com/loco-rs/loco).
 This file documents how we carry our patches on top of upstream. It is the only
-fork-specific doc — upstream's `DEVELOPMENT.md`, `CONTRIBUTING.md`, and `CHANGELOG.md` are left
-untouched so they never conflict on sync.
+fork-specific doc — upstream's `DEVELOPMENT.md`, `CONTRIBUTING.md`, `CHANGELOG.md`, and
+`AGENTS.md` are left untouched so they never conflict on sync.
+
+Agent instructions for the fork live in fork-only files that upstream never has:
+`AGENTS.override.md` (read by Codex in place of `AGENTS.md`), `GEMINI.md` (a symlink to it, for
+Antigravity), `CLAUDE.md` (imports both it and `AGENTS.md`), and `.agents/skills/` (with
+`.claude/skills/` symlinks for Claude Code).
 
 ## Model
 
@@ -36,7 +41,7 @@ upstream's and would conflict) — the tag + the ledger below are the record.
 
 ## Syncing with upstream
 
-The `fork-sync` Claude Code skill (`.claude/skills/fork-sync/`) automates this; the manual steps:
+The `fork-sync` agent skill (`.agents/skills/fork-sync/`) automates this; the manual steps:
 
 1. `git fetch upstream`
 2. Fast-forward `master` to `upstream/master` (`git checkout master && git merge --ff-only
