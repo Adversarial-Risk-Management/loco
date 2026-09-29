@@ -239,7 +239,7 @@ pub async fn initialize_database(pool: &PgPool) -> Result<()> {
         sqlx::raw_sql(AssertSqlSafe(format!(
             r"
                 CREATE TABLE pg_loco_queue (
-                    id VARCHAR NOT NULL,
+                    id VARCHAR NOT NULL PRIMARY KEY,
                     name VARCHAR NOT NULL,
                     task_data JSONB NOT NULL,
                     status VARCHAR NOT NULL DEFAULT '{}',
@@ -253,6 +253,45 @@ pub async fn initialize_database(pool: &PgPool) -> Result<()> {
                 ",
             JobStatus::Queued
         )))
+        .execute(pool)
+        .await?;
+    }
+
+    create_indexes(pool).await
+}
+
+/// Creates the queue indexes that are missing, and adds the primary key to a
+/// table created without one. The builds use `CONCURRENTLY`, so job traffic
+/// continues while they run.
+async fn create_indexes(pool: &PgPool) -> Result<()> {
+    sqlx::query(
+        "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_pg_loco_queue_status_priority_run_at_id ON \
+         pg_loco_queue (status, priority DESC, run_at, id)",
+    )
+    .execute(pool)
+    .await?;
+
+    let primary_key_exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS (
+            SELECT FROM pg_index
+            WHERE indrelid = to_regclass('pg_loco_queue')
+            AND indisprimary
+        )",
+    )
+    .fetch_one(pool)
+    .await?;
+
+    if !primary_key_exists {
+        sqlx::query(
+            "CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS pg_loco_queue_pkey ON pg_loco_queue \
+             (id)",
+        )
+        .execute(pool)
+        .await?;
+        sqlx::query(
+            "ALTER TABLE pg_loco_queue ADD CONSTRAINT pg_loco_queue_pkey PRIMARY KEY USING INDEX \
+             pg_loco_queue_pkey",
+        )
         .execute(pool)
         .await?;
     }
@@ -795,6 +834,100 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn can_initialize_database_with_primary_key_and_dequeue_index() {
+        let (pool, _container) = setup_pg_test().await;
+
+        assert_eq!(get_indexes(&pool).await, expected_indexes());
+
+        let plan: Vec<String> = sqlx::query_scalar(
+            "EXPLAIN UPDATE pg_loco_queue SET status = 'completed', updated_at = NOW() WHERE id = \
+             'job'",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert!(
+            plan.iter()
+                .any(|line| line.contains("Index Scan using pg_loco_queue_pkey")),
+            "{plan:#?}"
+        );
+    }
+
+    async fn setup_pg_table_without_primary_key() -> (
+        PgPool,
+        testcontainers::ContainerAsync<testcontainers::GenericImage>,
+    ) {
+        let (pg_url, container) = setup_postgres_container().await;
+        let pool = PgPool::connect(&pg_url)
+            .await
+            .expect("Failed to connect to PostgreSQL");
+        sqlx::query(
+            "CREATE TABLE pg_loco_queue (
+                id VARCHAR NOT NULL,
+                name VARCHAR NOT NULL,
+                task_data JSONB NOT NULL,
+                status VARCHAR NOT NULL DEFAULT 'queued',
+                run_at TIMESTAMPTZ NOT NULL,
+                interval BIGINT,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                tags JSONB,
+                priority INT NOT NULL DEFAULT 0
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        (pool, container)
+    }
+
+    async fn get_indexes(pool: &PgPool) -> Vec<(String, bool, bool)> {
+        sqlx::query_as(
+            "SELECT i.relname::text, x.indisprimary, x.indisvalid
+             FROM pg_index x JOIN pg_class i ON i.oid = x.indexrelid
+             WHERE x.indrelid = 'pg_loco_queue'::regclass
+             ORDER BY i.relname",
+        )
+        .fetch_all(pool)
+        .await
+        .unwrap()
+    }
+
+    fn expected_indexes() -> Vec<(String, bool, bool)> {
+        vec![
+            (
+                "idx_pg_loco_queue_status_priority_run_at_id".to_string(),
+                false,
+                true,
+            ),
+            ("pg_loco_queue_pkey".to_string(), true, true),
+        ]
+    }
+
+    #[tokio::test]
+    async fn initialize_database_adds_primary_key_to_existing_table() {
+        let (pool, _container) = setup_pg_table_without_primary_key().await;
+        sqlx::query(
+            "INSERT INTO pg_loco_queue (id, name, task_data, run_at) VALUES ('job1', 'Test', \
+             '{}', NOW())",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        initialize_database(&pool)
+            .await
+            .expect("Failed to initialize database");
+        assert_eq!(get_indexes(&pool).await, expected_indexes());
+
+        initialize_database(&pool)
+            .await
+            .expect("Failed to initialize database again");
+        assert_eq!(get_indexes(&pool).await, expected_indexes());
+    }
+
+    #[tokio::test]
     async fn can_enqueue() {
         let (pool, _container) = setup_pg_test().await;
 
@@ -1327,7 +1460,7 @@ mod tests {
              ('job2', 'Test Job 2', '{}', 'processing', NOW(),NOW(), NOW() - INTERVAL '5 minutes'),
              ('job3', 'Test Job 3', '{}', 'completed', NOW(),NOW(),NOW() - INTERVAL '5 minutes'),
              ('job4', 'Test Job 4', '{}', 'queued', NOW(),NOW(), NOW()),
-             ('job4', 'Test Job 5', '{}', 'processing', NOW(), NOW(), NOW())"
+             ('job5', 'Test Job 5', '{}', 'processing', NOW(), NOW(), NOW())"
         )
         .execute(&pool)
         .await
