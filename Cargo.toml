@@ -229,7 +229,7 @@ rand = { version = "0.9", features = ["std"] }
 hmac = { version = "0.12", optional = true }
 sha2 = { version = "0.10", optional = true }
 base64 = { version = "0.22", optional = true }
-validator = { version = "0.20.0", features = ["derive"] }
+validator = { version = "0.21.0", features = ["derive"] }
 futures-util = "0.3"
 tower = { workspace = true }
 bytes = "1.11"
