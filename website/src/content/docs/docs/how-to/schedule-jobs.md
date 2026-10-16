@@ -46,12 +46,12 @@ Each job entry has:
 
 | Key | Required? | Notes |
 |---|---|---|
-| `run` | yes | A shell command (if `shell: true`) or a registered task name plus optional `KEY:VALUE` args (if `shell: false`, the default) |
+| `run` | yes | A shell command (if `shell: true`) or a registered task name plus optional `KEY:VALUE` args (if `shell: false`, the default). Task args follow shell quoting rules, such as `"MSG:hello world"`, but no shell runs, so `$VARS` are not expanded |
 | `schedule` | yes | English phrase or cron expression — see below |
 | `shell` | no, default `false` | `false` runs `run` as a task; `true` runs it as a shell command |
 | `run_on_start` | no, default `false` | Also fire once immediately when the scheduler starts |
 | `tags` | no | Group jobs so you can run them together with `--tag` |
-| `output` | no | Overrides `scheduler.output` for this job only |
+| `output` | no | Overrides `scheduler.output` for a shell job. Task output uses the scheduler process logger and stdout |
 
 ### Schedule syntax
 
@@ -96,7 +96,7 @@ If your jobs live in a dedicated `scheduler.yaml` rather than embedded in the en
 SCHEDULER_CONFIG=config/scheduler.yaml cargo loco start --all
 ```
 
-Each firing spawns a **subprocess** (`/bin/sh -c` on Unix, `cmd.exe /C` on Windows); `LOCO_ENV` is propagated to it, so a task job resolves the same config/environment as the parent process. On shutdown (Ctrl+C), the scheduler waits for running jobs before exiting.
+Task jobs run in the scheduler process with its existing `AppContext`. They do not need a shell and reuse the scheduler's database, cache, queue, logging, and tracing resources. Shell jobs spawn a subprocess (`/bin/sh -c` on Unix, `cmd.exe /C` on Windows) with `LOCO_ENV` propagated from the scheduler. Task jobs run on the async runtime, so a task must not block the thread; use `tokio::task::spawn_blocking` for synchronous work. On shutdown (Ctrl+C), the scheduler stops firing jobs and cancels task jobs that are still running; shell jobs run to completion.
 
 ## 5. Run a subset by name or tag
 

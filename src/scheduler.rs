@@ -5,16 +5,21 @@ use std::{
     collections::HashMap,
     fmt, io,
     path::{Path, PathBuf},
-    sync::OnceLock,
+    sync::{Arc, OnceLock},
     time::{Duration, Instant},
 };
 
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use tokio_cron_scheduler::{JobScheduler, JobSchedulerError};
+use tracing::Instrument;
 use uuid::Uuid;
 
-use crate::{app::Hooks, environment::Environment, task::Tasks};
+use crate::{
+    app::{AppContext, Hooks},
+    environment::Environment,
+    task::{parse_key_val, Tasks, Vars},
+};
 
 static RE_IS_CRON_SYNTAX: OnceLock<Regex> = OnceLock::new();
 
@@ -30,6 +35,9 @@ pub enum Error {
 
     #[error("task `{0}` not found")]
     TaskNotFound(String),
+
+    #[error("invalid task command `{run}`: {reason}")]
+    InvalidTaskCommand { run: String, reason: String },
 
     #[error("Scheduler config file not found in path: '{}'", path.display())]
     ConfigNotFound { path: PathBuf, error: io::Error },
@@ -117,12 +125,12 @@ impl fmt::Display for Scheduler {
 }
 
 /// Representing the scheduler itself.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Scheduler {
     pub jobs: HashMap<String, Job>,
-    binary_path: PathBuf,
     default_output: Output,
-    environment: Environment,
+    app_context: Arc<AppContext>,
+    tasks: Arc<Tasks>,
 }
 
 /// Specification used to filter all scheduler job with the given Spec.
@@ -155,28 +163,43 @@ pub struct JobDescription {
     pub environment: Environment,
 }
 
+#[derive(Clone)]
+enum JobExecution {
+    Task {
+        name: String,
+        vars: Vars,
+        tasks: Arc<Tasks>,
+        app_context: Arc<AppContext>,
+    },
+    Shell(JobDescription),
+}
+
+fn parse_task(run: &str) -> Result<(String, Vars)> {
+    let invalid = |reason: String| Error::InvalidTaskCommand {
+        run: run.to_string(),
+        reason,
+    };
+    let mut parts = shell_words::split(run)
+        .map_err(|err| invalid(err.to_string()))?
+        .into_iter();
+    let task = parts.next().unwrap_or_default();
+    let args = parts
+        .map(|arg| parse_key_val(&arg).map_err(invalid))
+        .collect::<Result<Vec<_>>>()?;
+
+    Ok((task, Vars::from_cli_args(args)))
+}
+
 impl Job {
-    /// Prepares the command for execution based on the job's configuration.
+    /// Prepares the shell command for a job configured with `shell: true`.
     #[must_use]
     pub fn prepare_command(
         &self,
-        binary_path: &Path,
         default_output: &Output,
         environment: &Environment,
     ) -> JobDescription {
-        let command = if self.shell {
-            self.run.clone()
-        } else {
-            [
-                binary_path.display().to_string(),
-                "task".to_string(),
-                self.run.clone(),
-            ]
-            .join(" ")
-        };
-
         JobDescription {
-            command,
+            command: self.run.clone(),
             output: self
                 .output
                 .clone()
@@ -216,7 +239,7 @@ impl Scheduler {
     /// # Errors
     ///
     /// When could not parse the given file content into a [`Config`] struct.
-    pub fn from_config<H: Hooks>(config: &Path, environment: &Environment) -> Result<Self> {
+    pub fn from_config<H: Hooks>(config: &Path, app_context: &AppContext) -> Result<Self> {
         let config_str =
             std::fs::read_to_string(config).map_err(|error| Error::ConfigNotFound {
                 path: config.to_path_buf(),
@@ -226,7 +249,7 @@ impl Scheduler {
         let config: Config = serde_yaml::from_str(&config_str)
             .map_err(|error| Error::InvalidConfigSchema { error })?;
 
-        Self::new::<H>(&config, environment)
+        Self::new::<H>(&config, app_context)
     }
 
     /// Creates a new scheduler instance from the provided configuration data.
@@ -237,7 +260,7 @@ impl Scheduler {
     /// # Errors
     ///
     /// When there is not job in the given config
-    pub fn new<H: Hooks>(data: &Config, environment: &Environment) -> Result<Self> {
+    pub fn new<H: Hooks>(data: &Config, app_context: &AppContext) -> Result<Self> {
         let mut tasks = Tasks::default();
         H::register_tasks(&mut tasks);
 
@@ -246,11 +269,11 @@ impl Scheduler {
             if job.shell {
                 jobs.insert(job_name.clone(), job.clone());
             } else {
-                let task_name = job.run.split_whitespace().next().unwrap_or("");
+                let (task_name, _) = parse_task(&job.run)?;
                 if tasks.names().iter().any(|name| name.as_str() == task_name) {
                     jobs.insert(job_name.clone(), job.clone());
                 } else {
-                    return Err(Error::TaskNotFound(task_name.to_string()));
+                    return Err(Error::TaskNotFound(task_name));
                 }
             }
         }
@@ -261,9 +284,9 @@ impl Scheduler {
 
         Ok(Self {
             jobs,
-            binary_path: std::env::current_exe()?,
             default_output: data.output.clone(),
-            environment: environment.clone(),
+            app_context: Arc::new(app_context.clone()),
+            tasks: Arc::new(tasks),
         })
     }
 
@@ -300,8 +323,19 @@ impl Scheduler {
         let mut sched = JobScheduler::new().await?;
 
         for (job_name, job) in &self.jobs {
-            let job_description =
-                job.prepare_command(&self.binary_path, &self.default_output, &self.environment);
+            let execution = if job.shell {
+                JobExecution::Shell(
+                    job.prepare_command(&self.default_output, &self.app_context.environment),
+                )
+            } else {
+                let (name, vars) = parse_task(&job.run)?;
+                JobExecution::Task {
+                    name,
+                    vars,
+                    tasks: Arc::clone(&self.tasks),
+                    app_context: Arc::clone(&self.app_context),
+                }
+            };
 
             let cron_syntax = if get_re_is_cron_syntax().is_match(&job.cron) {
                 job.cron.clone()
@@ -315,23 +349,15 @@ impl Scheduler {
             };
 
             if job.run_on_start {
-                let job_description = job_description.clone();
+                let execution = execution.clone();
                 let job_name = job_name.clone();
                 sched
                     .add(tokio_cron_scheduler::Job::new_one_shot_async(
                         Duration::from_secs(0),
                         move |uuid, _l| {
-                            let job_description = job_description.clone();
+                            let execution = execution.clone();
                             let job_name = job_name.clone();
-                            Box::pin(async move {
-                                // `job_description.run()` blocks the thread for the
-                                // whole child-process lifetime; keep it off the
-                                // async runtime's worker threads.
-                                let _ = tokio::task::spawn_blocking(move || {
-                                    execute_job(job_name.as_str(), uuid, &job_description);
-                                })
-                                .await;
-                            })
+                            Box::pin(execute_job(job_name, uuid, execution))
                         },
                     )?)
                     .await?;
@@ -342,17 +368,9 @@ impl Scheduler {
                 .add(tokio_cron_scheduler::Job::new_async(
                     cron_syntax.as_str(),
                     move |uuid, mut _l| {
-                        let job_description = job_description.clone();
+                        let execution = execution.clone();
                         let job_name = job_name.clone();
-                        Box::pin(async move {
-                            // `job_description.run()` blocks the thread for the whole
-                            // child-process lifetime; keep it off the async runtime's
-                            // worker threads.
-                            let _ = tokio::task::spawn_blocking(move || {
-                                execute_job(job_name.as_str(), uuid, &job_description);
-                            })
-                            .await;
-                        })
+                        Box::pin(execute_job(job_name, uuid, execution))
                     },
                 )?)
                 .await?;
@@ -367,35 +385,59 @@ impl Scheduler {
     }
 }
 
-fn execute_job(job_name: &str, uuid: Uuid, job_description: &JobDescription) {
+async fn execute_job(job_name: String, uuid: Uuid, execution: JobExecution) {
     let task_span = tracing::span!(
         tracing::Level::DEBUG,
         "run_job",
-        job_name,
+        job_name = job_name,
         job_id = ?uuid,
     );
-    let start = Instant::now();
-    let _guard = task_span.enter();
-    match job_description.run() {
-        Ok(output) => {
-            tracing::debug!(
+
+    async move {
+        let start = Instant::now();
+        let result = match execution {
+            JobExecution::Task {
+                name,
+                vars,
+                tasks,
+                app_context,
+            } => tasks
+                .run(&app_context, &name, &vars)
+                .await
+                .map(|()| None)
+                .map_err(|err| err.to_string()),
+            JobExecution::Shell(job_description) => {
+                match tokio::task::spawn_blocking(move || job_description.run()).await {
+                    Ok(Ok(output)) => Ok(output.status.code()),
+                    Ok(Err(err)) => Err(err.to_string()),
+                    Err(err) => Err(err.to_string()),
+                }
+            }
+        };
+        match result {
+            Ok(status_code) => tracing::debug!(
                 duration = ?start.elapsed(),
-                status_code = output.status.code(),
+                status_code,
                 "execute scheduler job finished"
-            );
-        }
-        Err(err) => {
-            tracing::error!(
+            ),
+            Err(error) => tracing::error!(
                 duration = ?start.elapsed(),
-                error = %err,
-                "failed to execute scheduler job in sub process"
-            );
+                error,
+                "failed to execute scheduler job"
+            ),
         }
     }
+    .instrument(task_span)
+    .await;
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+
     use insta::assert_debug_snapshot;
     use rstest::rstest;
     use tests_cfg::db::AppHook;
@@ -403,9 +445,30 @@ mod tests {
     use tree_fs::TreeBuilder;
 
     use super::*;
-    use crate::tests_cfg;
+    use crate::{task::TaskInfo, tests_cfg, Result as LocoResult};
 
-    fn setup_scheduler_config() -> (Scheduler, tree_fs::Tree) {
+    struct MarkTask;
+
+    #[async_trait::async_trait]
+    impl crate::task::Task for MarkTask {
+        fn task(&self) -> TaskInfo {
+            TaskInfo {
+                name: "mark".to_string(),
+                detail: "mark native task execution".to_string(),
+            }
+        }
+
+        async fn run(&self, app_context: &AppContext, vars: &Vars) -> LocoResult<()> {
+            app_context
+                .shared_store
+                .get::<Arc<AtomicBool>>()
+                .expect("test marker should be registered")
+                .store(vars.cli_arg("flag")? == "on", Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    async fn setup_scheduler_config() -> (Scheduler, tree_fs::Tree) {
         let tree = TreeBuilder::default()
             .add_file(
                 "scheduler.yaml",
@@ -440,39 +503,37 @@ jobs:
 
         let scheduler = Scheduler::from_config::<AppHook>(
             &tree.root.join("scheduler.yaml"),
-            &Environment::Development,
+            &tests_cfg::app::get_app_context().await,
         )
         .expect("Failed to create scheduler from config");
 
         (scheduler, tree)
     }
 
-    #[test]
-    pub fn can_display_scheduler() {
-        let (scheduler, _tree) = setup_scheduler_config();
+    #[tokio::test]
+    pub async fn can_display_scheduler() {
+        let (scheduler, _tree) = setup_scheduler_config().await;
         assert_debug_snapshot!(format!("{scheduler}"));
     }
 
-    #[test]
-    pub fn can_load_from_config_local_config() {
+    #[tokio::test]
+    pub async fn can_load_from_config_local_config() {
         // Succeeds as long as loading the config doesn't panic or error.
-        let (_, _tree) = setup_scheduler_config();
+        let (_, _tree) = setup_scheduler_config().await;
     }
 
     #[tokio::test]
     pub async fn can_load_from_env_config() {
         let app_context = tests_cfg::app::get_app_context().await;
-        let scheduler = Scheduler::new::<AppHook>(
-            &app_context.config.scheduler.unwrap(),
-            &Environment::Development,
-        );
+        let scheduler =
+            Scheduler::new::<AppHook>(&app_context.config.scheduler.clone().unwrap(), &app_context);
 
         assert!(scheduler.is_ok());
     }
 
-    #[test]
-    pub fn can_load_jobs_by_spec_tag_multiple_jobs() {
-        let (scheduler, _tree) = setup_scheduler_config();
+    #[tokio::test]
+    pub async fn can_load_jobs_by_spec_tag_multiple_jobs() {
+        let (scheduler, _tree) = setup_scheduler_config().await;
         let scheduler = scheduler.by_spec(&Spec {
             name: None,
             tag: Some("base".to_string()),
@@ -481,9 +542,9 @@ jobs:
         assert_eq!(scheduler.jobs.len(), 2);
     }
 
-    #[test]
-    pub fn can_load_jobs_by_spec_tag_single_jobs() {
-        let (scheduler, _tree) = setup_scheduler_config();
+    #[tokio::test]
+    pub async fn can_load_jobs_by_spec_tag_single_jobs() {
+        let (scheduler, _tree) = setup_scheduler_config().await;
         let scheduler = scheduler.by_spec(&Spec {
             name: None,
             tag: Some("echo".to_string()),
@@ -493,9 +554,9 @@ jobs:
         assert!(scheduler.jobs.contains_key("print_task"));
     }
 
-    #[test]
-    pub fn can_load_jobs_by_spec_with_job_name() {
-        let (scheduler, _tree) = setup_scheduler_config();
+    #[tokio::test]
+    pub async fn can_load_jobs_by_spec_with_job_name() {
+        let (scheduler, _tree) = setup_scheduler_config().await;
         let scheduler = scheduler.by_spec(&Spec {
             name: Some("write_to_file".to_string()),
             tag: None,
@@ -505,33 +566,79 @@ jobs:
         assert!(scheduler.jobs.contains_key("write_to_file"));
     }
 
-    #[rstest]
-    #[case("shell", "echo loco", true)]
-    #[case("task", "foo LOCO_ENV:test SCHEDULER:true", false)]
-    pub fn can_prepare_command(#[case] test_name: &str, #[case] run: &str, #[case] shell: bool) {
+    #[test]
+    pub fn can_prepare_command() {
         let job = Job {
-            run: run.to_string(),
-            shell,
+            run: "echo loco".to_string(),
+            shell: true,
             run_on_start: false,
             cron: "*/5 * * * * *".to_string(),
             tags: None,
             output: None,
         };
 
-        let prepare_command = job.prepare_command(
-            PathBuf::from("[BIN_PATH]").as_path(),
-            &Output::STDOUT,
-            &Environment::Test,
-        );
-        assert_debug_snapshot!(
-            format!("can_prepare_command_[{test_name}]"),
-            prepare_command
-        );
+        let prepare_command = job.prepare_command(&Output::STDOUT, &Environment::Test);
+        assert_debug_snapshot!("can_prepare_command_[shell]", prepare_command);
+    }
+
+    #[test]
+    fn can_parse_task_arguments() {
+        let (name, vars) =
+            parse_task(r#"foo URL:https://example.com "MSG:hello world" REFRESH:true"#).unwrap();
+
+        assert_eq!(name, "foo");
+        assert_eq!(vars.cli_arg("URL").unwrap(), "https://example.com");
+        assert_eq!(vars.cli_arg("MSG").unwrap(), "hello world");
+        assert_eq!(vars.cli_arg("REFRESH").unwrap(), "true");
+    }
+
+    #[rstest]
+    #[case("foo invalid")]
+    #[case(r#"foo "MSG:unterminated"#)]
+    fn rejects_invalid_task_commands(#[case] run: &str) {
+        assert!(matches!(
+            parse_task(run),
+            Err(Error::InvalidTaskCommand { run: got, .. }) if got == run
+        ));
+    }
+
+    #[tokio::test]
+    async fn executes_tasks_in_process() {
+        let (mut scheduler, _config_tree) = setup_scheduler_config().await;
+        let marker = Arc::new(AtomicBool::new(false));
+        scheduler
+            .app_context
+            .shared_store
+            .insert(Arc::clone(&marker));
+
+        let mut tasks = Tasks::default();
+        tasks.register(MarkTask);
+        scheduler.tasks = Arc::new(tasks);
+        scheduler.jobs = HashMap::from([(
+            "mark".to_string(),
+            Job {
+                run: "mark flag:on".to_string(),
+                shell: false,
+                run_on_start: true,
+                cron: "0 0 * * * * *".to_string(),
+                tags: None,
+                output: None,
+            },
+        )]);
+
+        let handle = tokio::spawn(async move {
+            scheduler.run().await.unwrap();
+        });
+
+        time::sleep(Duration::from_secs(3)).await;
+        handle.abort();
+
+        assert!(marker.load(Ordering::SeqCst));
     }
 
     #[tokio::test]
     pub async fn can_run() {
-        let (mut scheduler, _config_tree) = setup_scheduler_config();
+        let (mut scheduler, _config_tree) = setup_scheduler_config().await;
 
         let tree_fs = tree_fs::TreeBuilder::default()
             .drop(true)

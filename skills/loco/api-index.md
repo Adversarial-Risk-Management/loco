@@ -1043,12 +1043,13 @@ since they restate the trait's own API.
 - `variant` **IO**
 - `variant` **InvalidConfigSchema**
 - `variant` **InvalidCronSyntax**
+- `variant` **InvalidTaskCommand**
 - `variant` **Question**
 - `variant` **TaskNotFound**
 
 ### `Job`
 
-- `fn` **prepare_command**`(self: &Self, binary_path: &Path, default_output: &Output, environment: &Environment) -> JobDescription` — Prepares the command for execution based on the job's configuration
+- `fn` **prepare_command**`(self: &Self, default_output: &Output, environment: &Environment) -> JobDescription` — Prepares the shell command for a job configured with `shell: true`
 
 ### `JobDescription`
 
@@ -1062,8 +1063,8 @@ since they restate the trait's own API.
 ### `Scheduler`
 
 - `fn` **by_spec**`(self: Self, include_jobs: &Spec) -> Self` — Filters the scheduler's jobs based on the provided specification
-- `fn` **from_config**`(config: &Path, environment: &Environment) -> Result<Self>` — Creates a new scheduler instance from the given configuration file
-- `fn` **new**`(data: &Config, environment: &Environment) -> Result<Self>` — Creates a new scheduler instance from the provided configuration data
+- `fn` **from_config**`(config: &Path, app_context: &AppContext) -> Result<Self>` — Creates a new scheduler instance from the given configuration file
+- `fn` **new**`(data: &Config, app_context: &AppContext) -> Result<Self>` — Creates a new scheduler instance from the provided configuration data
 - `fn` **run**`(self: Self) -> Result<()>` — Runs the scheduled jobs according to their cron expressions
 ## `schema`
 
@@ -1402,6 +1403,7 @@ since they restate the trait's own API.
 - `struct` **TaskInfo**` { name: String, detail: String }` — Information about a task, including its name and details
 - `struct` **Tasks** — Managing and running tasks
 - `struct` **Vars**` { cli: BTreeMap<String, String> }` — Struct representing a collection of task arguments
+- `fn` **parse_key_val**`(arg: &str) -> Result<(String, String), String>` — Splits a `KEY:VALUE` argument at the first `:`
 
 ### `Task`
 
