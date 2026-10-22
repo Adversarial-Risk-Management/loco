@@ -39,7 +39,7 @@ sea-orm = { version = "2.0", features = [
   "macros",
 ] }
 chrono = { version = "0.4" }
-validator = { version = "0.20" }
+validator = { version = "0.21" }
 uuid = { version = "1.6", features = ["v4"] }
 # ts-rs derives the TypeScript bindings for the `dtos` (the typed JSON API
 # contract). Present for every db app; the SPA frontend consumes the exports,
