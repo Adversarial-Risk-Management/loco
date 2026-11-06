@@ -337,6 +337,7 @@ since they restate the trait's own API.
 - `fn` **clear_by_status**`(self: &Self, status: Vec<JobStatus>) -> Result<()>` — Clears jobs based on their status for the configured queue provider
 - `fn` **clear_jobs_older_than**`(self: &Self, age_days: i64, status: &Vec<JobStatus>) -> Result<()>` — Clears jobs older than a specified number of days for the configured queue provider
 - `fn` **describe**`(self: &Self) -> String`
+- `fn` **downcast_provider**`(self: &Self) -> Option<&T>` — Downcasts the configured provider to its concrete backend type
 - `fn` **dump**`(self: &Self, path: &Path, status: Option<&Vec<JobStatus>>, age_days: Option<i64>) -> Result<PathBuf>` — Dumps the list of jobs to a YAML-compatible JSON file at the specified path
 - `fn` **empty**`() -> Self` — A [`Queue`] with no configured provider. Replaces the old
 - `fn` **enqueue**`(self: &Self, class: String, queue: Option<String>, args: A, tags: Option<Vec<String>>, priority: Option<i32>) -> Result<Option<String>>` — Add a job to the queue
@@ -355,6 +356,7 @@ since they restate the trait's own API.
 
 ### `QueueProvider`
 
+- `fn` **as_any**`(self: &Self) -> &dyn Any` — Returns `self` as [`Any`] so the erased provider can be downcast back
 - `fn` **cancel_jobs_by_name**`(self: &Self, name: &str) -> Pin<Box<dyn Future + Send>>` — Cancels queued jobs by name
 - `fn` **clear**`(self: &Self) -> Pin<Box<dyn Future + Send>>` — Clears all jobs from this provider
 - `fn` **clear_by_status**`(self: &Self, status: Vec<JobStatus>) -> Pin<Box<dyn Future + Send>>` — Clears jobs matching any of the given statuses
@@ -1392,7 +1394,7 @@ since they restate the trait's own API.
 
 ### `Job`
 
-- `fn` **prepare_command**`(self: &Self, binary_path: &Path, default_output: &Output, environment: &Environment) -> JobDescription` — Prepares a command description based on the job's configuration
+- `fn` **prepare_command**`(self: &Self, default_output: &Output, environment: &Environment) -> JobDescription` — Prepares the shell command for a job configured with `shell: true`
 
 ### `JobDescription`
 
@@ -1406,8 +1408,8 @@ since they restate the trait's own API.
 ### `Scheduler`
 
 - `fn` **by_spec**`(self: Self, include_jobs: &Spec) -> Self` — Filters the scheduler's jobs based on the provided specification
-- `fn` **from_config**`(config: &Path, environment: &Environment) -> Result<Self>` — Creates a new scheduler instance from the given configuration file
-- `fn` **new**`(data: &Config, environment: &Environment) -> Result<Self>` — Creates a new scheduler instance from the provided configuration data
+- `fn` **from_config**`(config: &Path, app_context: &AppContext) -> Result<Self>` — Creates a new scheduler instance from the given configuration file
+- `fn` **new**`(data: &Config, app_context: &AppContext) -> Result<Self>` — Creates a new scheduler instance from the provided configuration data
 - `fn` **run**`(self: Self) -> Result<()>` — Runs the scheduled jobs according to their cron expressions
 ## `schema`
 
@@ -1671,6 +1673,7 @@ since they restate the trait's own API.
 ## `storage::drivers::gcp`
 
 - `fn` **new**`(bucket_name: &str, credential_path: &str) -> StorageResult<Box<dyn StoreDriver>>` — Create new GCP storage
+- `fn` **with_default_credentials**`(bucket_name: &str) -> StorageResult<Box<dyn StoreDriver>>` — Create GCP storage using Application Default Credentials
 ## `storage::drivers::local`
 
 - `struct` **LocalStore** — Filesystem storage on `tokio::fs`, rooted at a directory
@@ -1806,7 +1809,7 @@ since they restate the trait's own API.
 ## `testing::request`
 
 - `struct` **BootResultWrapper**
-- `struct` **RequestConfig**` { save_cookies: bool, default_content_type: Option<String>, default_scheme: String }` — Configuration for making requests in the test server
+- `struct` **RequestConfig**` { save_cookies: bool, default_content_type: Option<String> }` — Configuration for making requests in the test server
 - `struct` **RequestConfigBuilder** — Builder pattern for constructing [`RequestConfig`] instances
 - `const` **TEST_BINDING_SERVER** — The hostname to which the test server binds
 - `const` **TEST_PORT_SERVER** — The port on which the test server will run
@@ -1828,7 +1831,6 @@ since they restate the trait's own API.
 
 - `fn` **build**`(self: Self) -> RequestConfig` — Builds and returns a `RequestConfig` instance
 - `fn` **default_content_type**`(self: Self, content_type: S) -> Self` — Sets the default content type for requests
-- `fn` **default_scheme**`(self: Self, scheme: S) -> Self` — Sets the default scheme to use for requests
 - `fn` **new**`() -> Self` — Creates a new [`RequestConfigBuilder`] with default values
 - `fn` **save_cookies**`(self: Self, save: bool) -> Self` — Sets whether cookies should be saved for future requests
 ## `testing::selector`

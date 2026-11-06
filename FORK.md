@@ -1,0 +1,125 @@
+# Maintaining this fork
+
+`Adversarial-Risk-Management/loco` is a fork of [`loco-rs/loco`](https://github.com/loco-rs/loco).
+This file documents how we carry our patches on top of upstream. It is the only
+fork-specific doc — upstream's `DEVELOPMENT.md`, `CONTRIBUTING.md`, and `CHANGELOG.md` are left
+untouched so they never conflict on sync.
+
+## Model
+
+- **`master` mirrors upstream `master` exactly.** No fork commits ever land on it; syncing is a
+  fast-forward.
+- **One branch per upstream version line carries the patches** — `0.16.x-arm`, `1.0.x-arm`, … Each
+  starts at an upstream **release tag** (`1.3.x-arm` starts even with `v1.3.1`) and carries one
+  commit per patch, kept linear so any single patch can be cherry-picked (e.g. backported from
+  `1.0.x-arm` to `0.16.x-arm`) in isolation. The newest line branch is the integration branch we
+  build and release from.
+- **One branch per patch for review.** A new patch gets its own branch and PR targeting the
+  active version-line branch, plus a row in the ledger below. Squash-merge keeps it one commit.
+- **Never commit fork-only changes straight to `master`** — it must stay a pure upstream mirror.
+- **`git fetch upstream` only tracks upstream `master`** (narrowed refspec) so we don't mirror
+  hundreds of upstream branches locally.
+
+## Versioning / releases
+
+Fork releases are **git tags**, not Cargo version bumps:
+
+```
+v<upstream-version>-arm.<N>
+```
+
+e.g. `v0.16.4-arm.1`, `v1.2.0-arm.1`. Tags are cut on the **version-line branch** tip. The
+workspace `Cargo.toml` version stays at upstream's value; downstream consumers pin the fork by
+git tag or rev. Reset `N` to `1` on each new upstream version; bump `N` for additional fork-only
+changes on the same upstream base. Do **not** record releases in `CHANGELOG.md` (that file is
+upstream's and would conflict) — the tag + the ledger below are the record.
+
+## Syncing with upstream
+
+The `fork-sync` Claude Code skill (`.claude/skills/fork-sync/`) automates this; the manual steps:
+
+1. `git fetch upstream`
+2. Fast-forward `master` to `upstream/master` (`git checkout master && git merge --ff-only
+   upstream/master`). If it won't fast-forward, something fork-only landed on `master` — fix
+   that instead of merging.
+3. Same upstream version line (e.g. upstream tags `v1.0.1`): **merge the new release tag into
+   `N.x-arm`** (`git merge v1.0.1`) — append-only, no force-push, existing patch commits stay
+   cherry-pickable — dropping any patch upstream has absorbed (record it in the ledger). Rebasing
+   the patch stack onto the tag is the alternative when a linear history is worth a force-push.
+   New upstream version
+   line: start `M.x-arm` from the upstream release tag (`git checkout -b 1.2.x-arm v1.2.0`) and
+   cherry-pick each still-needed patch commit from the previous line, one commit per patch.
+4. Rebase open patch branches in the ledger onto the active line branch; run `cargo fmt --all`
+   and `cargo clippy --workspace --all-features -- -D warnings -W clippy::pedantic -W
+   clippy::nursery -W rust-2018-idioms` on each (this is the CI `style` gate; since 1.2 it runs
+   on the toolchain pinned as `RUST_TOOLCHAIN` in `.github/workflows/loco-rs-ci.yml`, so use
+   that, e.g. `cargo +1.98 clippy ...`). A patch that changes `loco-rs`'s public API must also
+   regenerate the agent-skill API index (`cargo +nightly run -p xtask -- agent-skill`, which
+   rewrites `skills/loco/api-index.md` and its copy under `loco-new/base_template/`) and fold
+   it into the patch commit — the `docs` workflow runs `agent-skill --check` on every PR.
+   Force-push (`--force-with-lease`).
+5. Squash-merge any patch branch that is ready into the active line branch.
+6. Tag `v<upstream-version>-arm.<N>` on the line-branch tip and push the tag.
+7. Update the ledger.
+
+The fork is configured for **squash-merge only**, so each merged patch is a single clean commit
+on the line branch that is easy to rebase, cherry-pick across version lines, and drop when
+upstream absorbs it.
+
+## Patch ledger
+
+Current base: **upstream v1.3.1** (synced 2026-11-06). Patches carried on top, in commit order:
+
+| Patch | Branch | Local PR | Upstream PR | Status |
+|---|---|---|---|---|
+| Fork docs + tooling | `fork-meta` | [#5](https://github.com/Adversarial-Risk-Management/loco/pull/5) | — | carried (re-applied on 1.3 as one commit) |
+| GCP storage with Application Default Credentials: `gcp::with_default_credentials(bucket)`; `gcp::new(bucket, credential_path)` stays the explicit-file constructor. Carried as the upstream PR commit, unchanged | `feat/gcp-default-credentials` | — | [#1886](https://github.com/loco-rs/loco/pull/1886) | carried (new on 1.3; replaces #14, drops when #1886 lands) |
+| Testing deps: axum-test 21 (upstream pins 17; also drops the now-unrepresentable `RequestConfig.default_scheme`). Carried as the upstream PR commit; the fork commit also fixes the 1.3 session request test for the new `TestServer` API | `deps/axum-test-21` | — | [#1830](https://github.com/loco-rs/loco/pull/1830) | carried (new on 1.3; replaces the axum-test 20 patch from #8, drops when #1830 lands) |
+| Queue provider downcast: `QueueProvider::as_any` + `Queue::downcast_provider::<T>()`, restoring app access to the queue backend (e.g. `PgQueue.pool`) that the 1.0 `Queue` enum removal took away | `feat/queue-provider-downcast` | — | candidate | carried (re-applied on 1.3) |
+| Testing: Postgres per-test DB teardown uses `DROP DATABASE ... WITH (FORCE)` (PG 13+), so app-held pools outside loco's own (e.g. a session store on a different sqlx major) can't fail cleanup with SQLSTATE 55006 | `fix/testing-drop-db-force` | — | candidate | carried (re-applied on 1.3) |
+| loco-gen `:encrypted` field qualifier (string/text only, `^` only with deterministic, scaffold rejects it): migration/model output prints the `loco_encryption::impl_encryptable_fields!` block and config hint. The encryption runtime lives in the platform crate `loco-encryption`, not in the fork | `encryption-gen` | [#20](https://github.com/Adversarial-Risk-Management/loco/pull/20) | — | carried (re-applied on 1.3 / Tera 2 generators; supersedes [#19](https://github.com/Adversarial-Risk-Management/loco/pull/19), kept unmerged as the extraction source) |
+| validator 0.21 (upstream pins 0.20). Downstream crates derive `Validate` from their own `validator` dependency, and `JsonValidate` / `Validatable` need the same crate version as loco, so a consumer cannot take 0.21 alone. Also bumps the `loco-new` template, its snapshots, the examples and the add-a-database doc | `deps/validator-0.21` | [#32](https://github.com/Adversarial-Risk-Management/loco/pull/32) | — | carried (re-applied on 1.3; upstream 1.3 still pins 0.20) |
+| Scheduler runs registered tasks in process with the app's `AppContext` (jobs with `shell: true` still spawn a shell). Task arguments are split with shell quoting and reach the task as `Vars::from_args`, as `cargo loco task` passes them; quoting is validated at scheduler setup | `push-tqkmmxzrnypn-1.2` | [#26](https://github.com/Adversarial-Risk-Management/loco/pull/26) | — | carried (ported on 1.3 onto upstream's native cron loop and `shlex` arguments, [#1887](https://github.com/loco-rs/loco/pull/1887), and raw task args, [#1892](https://github.com/loco-rs/loco/pull/1892); drops `shell-words` and the `key:value`-only argument check) |
+| Coordinated graceful shutdown: SIGINT/SIGTERM through one app-wide token; HTTP, queue and scheduler ingress stop before active work drains; readiness fails during shutdown while health stays live; `Hooks::on_shutdown` runs once after the drain | `push-nsllxrnnyrmu-1.2` | [#27](https://github.com/Adversarial-Risk-Management/loco/pull/27) | — | open (targets `1.2.x-arm`; not yet ported to 1.3) |
+
+### Dropped on the v1.3.1 sync
+
+Revivable from the `v1.2.0-arm.*` tags / `1.2.x-arm` if ever needed:
+
+| Patch | Was | Why dropped |
+|---|---|---|
+| Default auth for GCP/Azure storage drivers (`new()` uses ambient creds; `with_credentials(...)` for explicit) | #14 | Replaced by the upstream PR [#1886](https://github.com/loco-rs/loco/pull/1886) commit. **API change for consumers:** GCP ADC is now `gcp::with_default_credentials(bucket)`, and `gcp::new(bucket, credential_path)` takes the key file again. Azure has no ambient-credential constructor: `azure::new(container, account_name, access_key, endpoint)` is upstream's |
+| axum-test 20 | #8 (residual) | Replaced by axum-test 21 from upstream PR [#1830](https://github.com/loco-rs/loco/pull/1830) |
+| Agent-skill `sea-orm-index.md` regenerated for sea-orm 2.0.4 | #29 | Upstream regenerated the index in [#1877](https://github.com/loco-rs/loco/pull/1877) |
+| Storage: opendal reqwest HTTP transport for S3, Azure Blob and GCS | #28 / upstream [#1847](https://github.com/loco-rs/loco/pull/1847) | Landed in 1.3 with the same `opendal/http-transport-reqwest` + `opendal/auto-register-services` features |
+| Postgres queue primary key and dequeue index | #30 / upstream issue [#1849](https://github.com/loco-rs/loco/issues/1849) | Landed in 1.3 via upstream [#1890](https://github.com/loco-rs/loco/pull/1890), with a different migration. Upstream runs a plain `ALTER TABLE pg_loco_queue ADD PRIMARY KEY (id)` in the setup transaction (not `CONCURRENTLY`), so it locks the table while it builds; it is skipped when a primary key already exists. It adds `pg_loco_queue_dequeue (priority DESC, run_at, id) WHERE status = 'queued'` and `pg_loco_queue_status_updated_at`. Databases that booted on `v1.2.0-arm.2+` keep the fork's primary key and the now-redundant `idx_pg_loco_queue_status_priority_run_at_id`; drop that index manually |
+
+### Dropped on the v1.2.0 sync
+
+Revivable from the `v1.1.0-arm.*` tags / `1.1.x-arm` if ever needed:
+
+| Patch | Was | Why dropped |
+|---|---|---|
+| `perform_all_later` / `Queue::enqueue_batch` batch enqueueing | #3 (re-applied on 1.0/1.1) | Landed in 1.2 via upstream [#1821](https://github.com/loco-rs/loco/pull/1821). **The upstream API differs from ours:** `perform_all_later_with_priority(ctx, jobs)` takes `Vec<(A, Option<i32>)>` — a priority per job — instead of `(ctx, args_list, priority)`, and `Queue::enqueue_batch` / `QueueProvider::enqueue_batch` take `jobs: Vec<(args, Option<i32>)>` with no separate `priority` argument. Port old calls as `perform_all_later_with_priority(&ctx, args.into_iter().map(\|a\| (a, Some(p))).collect())`; `perform_all_later(ctx, args_list)` is unchanged. In `BackgroundQueue` mode with no queue provider it now returns `Error::QueueProviderMissing` instead of logging and fabricating ids (so does `perform_later_with_priority`) |
+| 1.1 style-gate fixes (`fix(ci): make the 1.1 fork pass style checks`) | 1.1.x-arm-only commit | Upstream 1.2 pins CI to Rust 1.98 and passes `clippy --workspace` as-is. Its one still-needed hunk — opendal 0.58's `Operator::new` without `.finish()` in the GCP/Azure drivers — is folded into the storage patch |
+
+### Dropped on the v1.0.0 sync
+
+Revivable from the `v0.16.4-arm.*` tags if ever needed:
+
+| Patch | Was | Why dropped |
+|---|---|---|
+| Allow running scheduler and server without worker | #1 / upstream [#1742](https://github.com/loco-rs/loco/pull/1742) | Landed in 1.0 (`--scheduler` flag; identical `StartMode` resolution semantics) |
+| Expose worker queue / job IDs | #2 / upstream [#1624](https://github.com/loco-rs/loco/pull/1624) | Job-ID portion landed in 1.0 (`perform_later` → `Result<String>`); the query surface had no consumer and is superseded by the downcast patch |
+| Multiple recipients in mailer | #4 | Landed in 1.0 via upstream [#1764](https://github.com/loco-rs/loco/pull/1764) (`MultiArgs`/`MultiEmail`, plus `headers` on single-recipient `Args`). Caveat: upstream does **not** auto-register `MultiMailerWorker` — register it in `Hooks::connect_workers` if `mail_multi` is ever adopted in `BackgroundQueue` mode |
+| Clippy fixes for Rust 1.96 (loco, loco-new) | #6, #10, #12 | 1.0 passes the style gate on current stable (verified on 1.97) |
+| Testing dep bumps besides axum-test | #8 | testcontainers 0.27 / rstest 0.26 landed upstream; the scraper/reqwest deltas were loco-internal |
+| Runtime dep majors (thiserror 2, tower 0.5, heck 0.5, jsonwebtoken 10, rand 0.10, toml 1) | #9 | thiserror/tower/heck landed upstream; the jsonwebtoken 10.3/10.4, rand 0.9/0.10 and toml 0.8/1 deltas are loco-internal and semver-resolvable |
+| loco-new deps (rand 0.9, thin-vec) | #11 | Superseded by upstream 1.0's loco-new |
+| Cap `time` below 0.3.52 | #15 | Upstream 1.0 resolves time 0.3.54 alongside cookie 0.18.1 — the incompatibility is gone |
+| Bump rand | #16 | loco-internal; upstream 1.0 pins rand 0.9 |
+
+The unmerged pre-1.0 branches `feature/expose-worker-job-ids`, `feat/mailer-multi`, and
+`feat/work-queue-pagination` are superseded per the table above and can be closed.
+
+Keep this table current whenever a patch is added, merged, or upstreamed.
